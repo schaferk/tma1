@@ -183,9 +183,10 @@ func main() {
 		Model:    cfg.LLMModel,
 	}
 	srv := handler.New(cfg.GreptimeDBHTTPPort, cfg.Port, webFileSystem(), logger, tw, bc, llmCfg, handler.ServerConfig{
-		DataDir:     cfg.DataDir,
-		DataTTL:     cfg.DataTTL,
-		LogLevelVar: &logLevel,
+		DataDir:          cfg.DataDir,
+		DataTTL:          cfg.DataTTL,
+		QueryConcurrency: cfg.QueryConcurrency,
+		LogLevelVar:      &logLevel,
 	})
 	httpSrv := &http.Server{
 		Addr:         cfg.Host + ":" + cfg.Port,

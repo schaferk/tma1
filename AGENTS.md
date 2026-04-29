@@ -219,6 +219,7 @@ make test            # Run tests with race detector
 | `TMA1_LLM_API_KEY` | (empty) | API key for LLM provider (enables prompt deep evaluation) |
 | `TMA1_LLM_PROVIDER` | `anthropic` | LLM provider: `anthropic` or `openai` |
 | `TMA1_LLM_MODEL` | (auto) | Model override (default: `claude-sonnet-4-20250514` / `gpt-4o-mini`) |
+| `TMA1_QUERY_CONCURRENCY` | `4` | Max concurrent SQL queries from dashboard. Lower (e.g. `2`) if GreptimeDB OOMs on 30d. Range `1`–`32`. Hot-reloadable via `/api/settings`. |
 
 ## Key design decisions
 

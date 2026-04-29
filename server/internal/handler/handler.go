@@ -33,14 +33,16 @@ type Server struct {
 	mu                sync.RWMutex
 	dataDir           string
 	dataTTL           string
+	queryConcurrency  int
 	logLevelVar       *slog.LevelVar
 }
 
 // ServerConfig holds additional configuration for the Server.
 type ServerConfig struct {
-	DataDir     string
-	DataTTL     string
-	LogLevelVar *slog.LevelVar
+	DataDir          string
+	DataTTL          string
+	QueryConcurrency int
+	LogLevelVar      *slog.LevelVar
 }
 
 // New creates a new Server.
@@ -61,6 +63,7 @@ func New(greptimeHTTPPort int, tma1Port string, webFS http.FileSystem, logger *s
 		llmConfig:         llm,
 		dataDir:           sc.DataDir,
 		dataTTL:           sc.DataTTL,
+		queryConcurrency:  clampQueryConcurrency(sc.QueryConcurrency),
 		logLevelVar:       sc.LogLevelVar,
 	}
 }
