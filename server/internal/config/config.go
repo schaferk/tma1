@@ -44,6 +44,11 @@ type Config struct {
 
 	// LLMModel overrides the default model for the LLM provider.
 	LLMModel string
+
+	// QueryConcurrency caps the number of in-flight SQL queries from the dashboard.
+	// Excess queries queue client-side. Default 4. Lower this if GreptimeDB hits
+	// memory limits on wide ranges (30d).
+	QueryConcurrency int
 }
 
 // Load reads config from environment variables, with sensible defaults.
@@ -66,6 +71,7 @@ func Load() (*Config, error) {
 		LLMAPIKey:           env("TMA1_LLM_API_KEY", ""),
 		LLMProvider:         env("TMA1_LLM_PROVIDER", "anthropic"),
 		LLMModel:            env("TMA1_LLM_MODEL", ""),
+		QueryConcurrency:    envInt("TMA1_QUERY_CONCURRENCY", 4),
 	}
 
 	return cfg, nil

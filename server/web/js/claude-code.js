@@ -968,7 +968,9 @@ async function cc_loadToolsTable() {
 
 async function cc_loadToolTrends() {
   try {
-    var bucket = currentTimeRange === '1h' ? '5 minutes' : (currentTimeRange === '7d' || currentTimeRange === '30d' ? '1 hour' : '15 minutes');
+    var bucket = currentTimeRange === '1h' ? '5 minutes'
+      : (currentTimeRange === '60d' ? '2 hours'
+      : (currentTimeRange === '7d' || currentTimeRange === '30d' ? '1 hour' : '15 minutes'));
     var res = await query(
       "SELECT date_bin('" + bucket + "'::INTERVAL, timestamp) AS t, " +
       "json_get_string(log_attributes, 'tool_name') AS tool, " +

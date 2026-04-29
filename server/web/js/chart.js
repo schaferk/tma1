@@ -137,18 +137,62 @@ function renderChart(containerId, data, seriesDefs, yFmt, onClickBucket) {
 }
 
 // ===================================================================
-// Shared Activity Heatmap
+// Shared Activity Heatmap (GitHub-style contribution graph)
 // ===================================================================
 
 function heatmapConfig() {
   var config = {
-    '1h':  { bucket: '5 minutes',  interval: '1 hour',  cols: 12, rowCount: 1 },
-    '6h':  { bucket: '15 minutes', interval: '6 hours', cols: 24, rowCount: 1 },
-    '24h': { bucket: '1 hour',     interval: '1 day',   cols: 24, rowCount: 1 },
-    '7d':  { bucket: '1 hour',     interval: '7 days',  cols: 24, rowCount: 7 },
-    '30d': { bucket: '1 hour',     interval: '30 days', cols: 24, rowCount: 30 },
+    '1h':  { bucket: '5 minutes',  interval: '1 hour',   mode: 'strip',    range: '1h',  cols: 12, slotMs: 5 * 60 * 1000,  rangeMs: 60 * 60 * 1000 },
+    '6h':  { bucket: '15 minutes', interval: '6 hours',  mode: 'strip',    range: '6h',  cols: 24, slotMs: 15 * 60 * 1000, rangeMs: 6 * 3600 * 1000 },
+    '24h': { bucket: '1 hour',     interval: '1 day',    mode: 'strip',    range: '24h', cols: 24, slotMs: 3600 * 1000,    rangeMs: 24 * 3600 * 1000 },
+    '7d':  { bucket: '1 hour',     interval: '7 days',   mode: 'calendar', range: '7d',  days: 7 },
+    '30d': { bucket: '1 hour',     interval: '30 days',  mode: 'calendar', range: '30d', days: 30 },
+    '60d': { bucket: '2 hours',    interval: '60 days',  mode: 'calendar', range: '60d', days: 60 },
   };
   return config[currentTimeRange] || config['24h'];
+}
+
+function ahCellColor(cnt, max, palette) {
+  if (!cnt || max === 0) return palette[0];
+  var ratio = cnt / max;
+  if (ratio < 0.25) return palette[1];
+  if (ratio < 0.50) return palette[2];
+  if (ratio < 0.75) return palette[3];
+  return palette[4];
+}
+
+function ahLocale() {
+  return currentLocale === 'zh' ? 'zh-CN' : currentLocale === 'es' ? 'es' : 'en';
+}
+
+// Sunday-first for en, Monday-first for zh/es
+function ahWeekStart() { return currentLocale === 'en' ? 0 : 1; }
+
+function ahStartOfDay(ms) {
+  var d = new Date(ms);
+  return new Date(d.getFullYear(), d.getMonth(), d.getDate()).getTime();
+}
+
+function ahDayKey(ms) {
+  var d = new Date(ms);
+  return d.getFullYear() + '-' + (d.getMonth() + 1) + '-' + d.getDate();
+}
+
+function ahFormatDate(ms, locale) {
+  return new Date(ms).toLocaleDateString(locale, { month: 'short', day: 'numeric' });
+}
+
+function ahLegendHTML(palette) {
+  var html = '<div class="ah-legend">' + t('heatmap.less');
+  palette.forEach(function(c) { html += '<div class="ah-legend-cell" style="background:' + c + '"></div>'; });
+  html += t('heatmap.more') + '</div>';
+  return html;
+}
+
+function ahSubtitleHTML(range, extra) {
+  var s = t('activity.range.' + range);
+  if (extra) s += ' \u00b7 ' + extra;
+  return '<div class="ah-subtitle">' + s + '</div>';
 }
 
 function renderHeatmap(elementId, data) {
@@ -158,147 +202,183 @@ function renderHeatmap(elementId, data) {
     el.innerHTML = '<div class="chart-empty">' + t('empty.no_activity') + '</div>';
     return;
   }
-
-  var tc = getThemeColors();
-  var heatColors = tc.heatmap;
-  var counts = {};
-  var maxCnt = 0;
-  var now = new Date();
-  var locale = currentLocale === 'zh' ? 'zh-CN' : currentLocale === 'es' ? 'es' : 'en';
-
-  function cellColor(cnt) {
-    if (!cnt) return heatColors[0];
-    var ratio = cnt / maxCnt;
-    if (ratio < 0.25) return heatColors[1];
-    if (ratio < 0.50) return heatColors[2];
-    if (ratio < 0.75) return heatColors[3];
-    return heatColors[4];
-  }
-
-  var html;
-
-  if (currentTimeRange === '7d' || currentTimeRange === '30d') {
-    var numDays = currentTimeRange === '30d' ? 30 : 7;
-    var rangeAgo = new Date(now.getTime() - numDays * 24 * 3600 * 1000);
-    data.forEach(function(d) {
-      var dt = new Date(tsToMs(d.t));
-      var dayIdx = Math.floor((dt.getTime() - rangeAgo.getTime()) / (24 * 3600 * 1000));
-      var hour = dt.getHours();
-      var key = dayIdx + ':' + hour;
-      var cnt = Number(d.cnt) || 0;
-      counts[key] = (counts[key] || 0) + cnt;
-      if (counts[key] > maxCnt) maxCnt = counts[key];
-    });
-
-    var dayLabels = [];
-    for (var i = 0; i < numDays; i++) {
-      var d = new Date(rangeAgo.getTime() + i * 24 * 3600 * 1000);
-      dayLabels.push(currentTimeRange === '30d'
-        ? (d.getMonth() + 1) + '/' + d.getDate()
-        : d.toLocaleDateString(locale, { weekday: 'short' }));
-    }
-
-    html = '<div class="heatmap-grid" style="grid-template-columns:40px repeat(24, 1fr)">';
-    html += '<div class="heatmap-label"></div>';
-    for (var h = 0; h < 24; h++) {
-      html += '<div class="heatmap-label" style="justify-content:center">' + (h % 3 === 0 ? h : '') + '</div>';
-    }
-    for (var day = 0; day < numDays; day++) {
-      html += '<div class="heatmap-label">' + dayLabels[day] + '</div>';
-      for (var h2 = 0; h2 < 24; h2++) {
-        var cnt = counts[day + ':' + h2] || 0;
-        html += '<div class="heatmap-cell" style="background:' + cellColor(cnt) + '" title="' + dayLabels[day] + ' ' + h2 + ':00 \u2014 ' + cnt + '"></div>';
-      }
-    }
-    html += '</div>';
-
-  } else if (currentTimeRange === '24h') {
-    var dayStart = new Date(now.getTime() - 24 * 3600 * 1000);
-    data.forEach(function(d) {
-      var dt = new Date(tsToMs(d.t));
-      var hour = Math.floor((dt.getTime() - dayStart.getTime()) / (3600 * 1000));
-      if (hour < 0 || hour >= 24) return;
-      var key = '0:' + hour;
-      var cnt = Number(d.cnt) || 0;
-      counts[key] = (counts[key] || 0) + cnt;
-      if (counts[key] > maxCnt) maxCnt = counts[key];
-    });
-
-    html = '<div class="heatmap-grid" style="grid-template-columns:40px repeat(24, 1fr)">';
-    html += '<div class="heatmap-label"></div>';
-    for (var dh = 0; dh < 24; dh++) {
-      var dhLabel = new Date(dayStart.getTime() + dh * 3600 * 1000);
-      html += '<div class="heatmap-label" style="justify-content:center">' + (dh % 3 === 0 ? dhLabel.getHours() + 'h' : '') + '</div>';
-    }
-    html += '<div class="heatmap-label"></div>';
-    for (var dh2 = 0; dh2 < 24; dh2++) {
-      var dhCnt = counts['0:' + dh2] || 0;
-      var dhLabel2 = new Date(dayStart.getTime() + dh2 * 3600 * 1000);
-      html += '<div class="heatmap-cell" style="background:' + cellColor(dhCnt) + '" title="' + dhLabel2.getHours() + ':00 \u2014 ' + dhCnt + '"></div>';
-    }
-    html += '</div>';
-
-  } else if (currentTimeRange === '6h') {
-    var rangeStart6h = new Date(now.getTime() - 6 * 3600 * 1000);
-    data.forEach(function(d) {
-      var dt = new Date(tsToMs(d.t));
-      var slot = Math.floor((dt.getTime() - rangeStart6h.getTime()) / (15 * 60 * 1000));
-      if (slot < 0 || slot >= 24) return;
-      var key = '0:' + slot;
-      var cnt = Number(d.cnt) || 0;
-      counts[key] = (counts[key] || 0) + cnt;
-      if (counts[key] > maxCnt) maxCnt = counts[key];
-    });
-
-    html = '<div class="heatmap-grid" style="grid-template-columns:40px repeat(24, 1fr)">';
-    html += '<div class="heatmap-label"></div>';
-    for (var q = 0; q < 24; q++) {
-      var qTime = new Date(rangeStart6h.getTime() + q * 15 * 60 * 1000);
-      var qLabel = q % 4 === 0;
-      html += '<div class="heatmap-label" style="justify-content:center;font-size:9px">' +
-        (qLabel ? qTime.getHours() + ':' + String(qTime.getMinutes()).padStart(2, '0') : '') + '</div>';
-    }
-    html += '<div class="heatmap-label"></div>';
-    for (var q2 = 0; q2 < 24; q2++) {
-      var qCnt = counts['0:' + q2] || 0;
-      var qTime2 = new Date(rangeStart6h.getTime() + q2 * 15 * 60 * 1000);
-      html += '<div class="heatmap-cell" style="background:' + cellColor(qCnt) + '" title="' +
-        qTime2.getHours() + ':' + String(qTime2.getMinutes()).padStart(2, '0') + ' \u2014 ' + qCnt + '"></div>';
-    }
-    html += '</div>';
-
+  var cfg = heatmapConfig();
+  if (cfg.mode === 'calendar') {
+    renderCalendarHeatmap(el, data, cfg);
   } else {
-    var rangeStart1h = new Date(now.getTime() - 3600 * 1000);
-    data.forEach(function(d) {
-      var dt = new Date(tsToMs(d.t));
-      var slot = Math.floor((dt.getTime() - rangeStart1h.getTime()) / (5 * 60 * 1000));
-      if (slot < 0 || slot >= 12) return;
-      var key = '0:' + slot;
-      var cnt = Number(d.cnt) || 0;
-      counts[key] = (counts[key] || 0) + cnt;
-      if (counts[key] > maxCnt) maxCnt = counts[key];
-    });
+    renderStripHeatmap(el, data, cfg);
+  }
+}
 
-    html = '<div class="heatmap-grid" style="grid-template-columns:40px repeat(12, 1fr)">';
-    html += '<div class="heatmap-label"></div>';
-    for (var m = 0; m < 12; m++) {
-      var mTime = new Date(rangeStart1h.getTime() + m * 5 * 60 * 1000);
-      var mLabel = m % 2 === 0;
-      html += '<div class="heatmap-label" style="justify-content:center;font-size:9px">' +
-        (mLabel ? ':' + String(mTime.getMinutes()).padStart(2, '0') : '') + '</div>';
-    }
-    html += '<div class="heatmap-label"></div>';
-    for (var m2 = 0; m2 < 12; m2++) {
-      var mCnt = counts['0:' + m2] || 0;
-      var mTime2 = new Date(rangeStart1h.getTime() + m2 * 5 * 60 * 1000);
-      html += '<div class="heatmap-cell" style="background:' + cellColor(mCnt) + '" title="' +
-        mTime2.getHours() + ':' + String(mTime2.getMinutes()).padStart(2, '0') + ' \u2014 ' + mCnt + '"></div>';
-    }
-    html += '</div>';
+function renderCalendarHeatmap(el, data, cfg) {
+  var palette = getThemeColors().heatmap;
+  var locale = ahLocale();
+  var weekStart = ahWeekStart();
+  var days = cfg.days;
+  var DAY_MS = 86400000;
+
+  // Build day list (last N days, ending today, anchored to local midnight)
+  var todayStart = ahStartOfDay(Date.now());
+  var firstDay = todayStart - (days - 1) * DAY_MS;
+
+  // Aggregate hourly buckets to local-day counts
+  var counts = {};
+  for (var i = 0; i < days; i++) {
+    counts[ahDayKey(firstDay + i * DAY_MS)] = 0;
+  }
+  data.forEach(function(b) {
+    var dStart = ahStartOfDay(tsToMs(b.t));
+    var key = ahDayKey(dStart);
+    if (!(key in counts)) return;
+    counts[key] += Number(b.cnt) || 0;
+  });
+
+  // Stats
+  var max = 0, total = 0, active = 0, peakDayKey = null, peakDayMs = 0, peakCount = 0;
+  Object.keys(counts).forEach(function(k) {
+    var c = counts[k];
+    total += c;
+    if (c > 0) active++;
+    if (c > max) max = c;
+    if (c > peakCount) { peakCount = c; peakDayKey = k; }
+  });
+  if (peakDayKey) {
+    // Convert YYYY-M-D back to ms (local) for formatting
+    var parts = peakDayKey.split('-');
+    peakDayMs = new Date(Number(parts[0]), Number(parts[1]) - 1, Number(parts[2])).getTime();
   }
 
-  html += '<div class="heatmap-legend">' + t('heatmap.less') + ' ';
-  heatColors.forEach(function(c) { html += '<div class="heatmap-legend-cell" style="background:' + c + '"></div>'; });
-  html += ' ' + t('heatmap.more') + '</div>';
-  el.innerHTML = html;
+  // Traditional month-calendar layout: 7 cols (weekdays horizontal) × N rows (weeks).
+  // 7d → 1 week row; 30d → ~5 rows; 60d → ~9 rows.
+  var refSun = new Date(2024, 0, 7); // a known Sunday
+  var dayNames = [];
+  for (var wi = 0; wi < 7; wi++) {
+    var wd = new Date(refSun.getTime() + ((wi + weekStart) % 7) * DAY_MS);
+    dayNames.push(wd.toLocaleDateString(locale, { weekday: 'short' }));
+  }
+
+  var dowAligned = function(ms) {
+    var dow = new Date(ms).getDay();
+    return (dow - weekStart + 7) % 7;
+  };
+  var firstDow = dowAligned(firstDay);
+  var totalCells = firstDow + days;
+  var weeks = Math.ceil(totalCells / 7);
+
+  var headerRow = '';
+  for (var hi = 0; hi < 7; hi++) {
+    headerRow += '<div class="ah-time-label" style="grid-column:' + (hi + 1) + ';grid-row:1;text-align:center">' + dayNames[hi] + '</div>';
+  }
+
+  var cellHtml = '';
+  for (var weekIdx = 0; weekIdx < weeks; weekIdx++) {
+    for (var dayIdx = 0; dayIdx < 7; dayIdx++) {
+      var dayOffset = weekIdx * 7 + dayIdx - firstDow;
+      var gridCol = dayIdx + 1;
+      var gridRow = weekIdx + 2; // header is row 1
+      if (dayOffset < 0 || dayOffset >= days) {
+        cellHtml += '<div class="ah-cell empty" style="grid-column:' + gridCol + ';grid-row:' + gridRow + '"></div>';
+        continue;
+      }
+      var ddMs = firstDay + dayOffset * DAY_MS;
+      var ddCnt = counts[ahDayKey(ddMs)] || 0;
+      var ddTip = ahFormatDate(ddMs, locale) + ' \u2014 ' + fmtNum(ddCnt);
+      cellHtml += '<div class="ah-cell" style="background:' + ahCellColor(ddCnt, max, palette) +
+        ';grid-column:' + gridCol + ';grid-row:' + gridRow + '" title="' + ddTip + '"></div>';
+    }
+  }
+
+  var grid = '<div class="ah-grid" style="grid-template-columns:repeat(7, 22px);grid-template-rows:auto repeat(' + weeks + ', 22px)">' +
+    headerRow + cellHtml + '</div>';
+
+  // Date range string for subtitle (e.g., "3/31 - 4/29" or "Mar 31 - Apr 29")
+  var rangeStr = ahFormatDate(firstDay, locale) + ' \u2013 ' + ahFormatDate(todayStart, locale);
+
+  var peakStr = peakDayKey
+    ? ahFormatDate(peakDayMs, locale) + ' (' + fmtNum(peakCount) + ')'
+    : '\u2014';
+  var summary = '<div class="ah-summary">' +
+    '<span class="ah-stat-num">' + fmtNum(total) + '</span> ' + t('activity.events') +
+    '<span class="ah-sep">\u00b7</span>' +
+    '<span class="ah-stat-num">' + active + ' / ' + days + '</span> ' + t('activity.active_days') +
+    '<span class="ah-sep">\u00b7</span>' +
+    t('activity.peak_day') + ' <span class="ah-stat-num">' + peakStr + '</span>' +
+    '</div>';
+
+  el.innerHTML = '<div class="activity-heatmap ah-calendar">' +
+    summary +
+    ahSubtitleHTML(cfg.range, rangeStr) +
+    grid +
+    ahLegendHTML(palette) +
+    '</div>';
+}
+
+function renderStripHeatmap(el, data, cfg) {
+  var palette = getThemeColors().heatmap;
+  var slots = cfg.cols;
+  var slotMs = cfg.slotMs;
+  var rangeMs = cfg.rangeMs;
+
+  var now = Date.now();
+  var rangeStart = now - rangeMs;
+  var counts = new Array(slots);
+  for (var z = 0; z < slots; z++) counts[z] = 0;
+
+  data.forEach(function(b) {
+    var ts = tsToMs(b.t);
+    var idx = Math.floor((ts - rangeStart) / slotMs);
+    if (idx < 0 || idx >= slots) return;
+    counts[idx] += Number(b.cnt) || 0;
+  });
+
+  var max = 0, total = 0, active = 0, peakIdx = -1, peakCount = 0;
+  for (var i = 0; i < slots; i++) {
+    var c = counts[i];
+    total += c;
+    if (c > 0) active++;
+    if (c > max) max = c;
+    if (c > peakCount) { peakCount = c; peakIdx = i; }
+  }
+
+  var labelEvery = cfg.range === '24h' ? 3 : cfg.range === '6h' ? 4 : 2;
+
+  function slotLabel(idx) {
+    var dt = new Date(rangeStart + idx * slotMs);
+    if (cfg.range === '24h') return dt.getHours() + 'h';
+    return dt.getHours() + ':' + String(dt.getMinutes()).padStart(2, '0');
+  }
+
+  var labelRow = '';
+  for (var li = 0; li < slots; li++) {
+    labelRow += '<div class="ah-time-label" style="grid-column:' + (li + 1) + ';grid-row:1;text-align:center">' +
+      (li % labelEvery === 0 ? slotLabel(li) : '') + '</div>';
+  }
+
+  var cellRow = '';
+  for (var ci = 0; ci < slots; ci++) {
+    var tip = slotLabel(ci) + ' \u2014 ' + counts[ci];
+    cellRow += '<div class="ah-cell" style="background:' + ahCellColor(counts[ci], max, palette) +
+      ';grid-column:' + (ci + 1) + ';grid-row:2" title="' + tip + '"></div>';
+  }
+
+  var grid = '<div class="ah-grid" style="grid-template-columns:repeat(' + slots + ', 22px);grid-template-rows:auto 22px;align-items:center">' +
+    labelRow + cellRow + '</div>';
+
+  var activeWord = cfg.range === '24h' ? t('activity.active_hours') : t('activity.active_slots');
+  var peakWord = cfg.range === '24h' ? t('activity.peak_hour') : t('activity.peak_slot');
+  var peakValue = peakIdx >= 0 ? slotLabel(peakIdx) + ' (' + fmtNum(peakCount) + ')' : '\u2014';
+  var summary = '<div class="ah-summary">' +
+    '<span class="ah-stat-num">' + fmtNum(total) + '</span> ' + t('activity.events') +
+    '<span class="ah-sep">\u00b7</span>' +
+    '<span class="ah-stat-num">' + active + ' / ' + slots + '</span> ' + activeWord +
+    '<span class="ah-sep">\u00b7</span>' +
+    peakWord + ' <span class="ah-stat-num">' + peakValue + '</span>' +
+    '</div>';
+
+  el.innerHTML = '<div class="activity-heatmap ah-strip">' +
+    summary +
+    ahSubtitleHTML(cfg.range) +
+    grid +
+    ahLegendHTML(palette) +
+    '</div>';
 }

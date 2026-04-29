@@ -2,6 +2,7 @@ package handler
 
 import (
 	"encoding/json"
+	"fmt"
 	"log/slog"
 	"net/http"
 	"regexp"
@@ -13,22 +14,42 @@ import (
 // validTTL matches GreptimeDB TTL values — same pattern as greptimedb.validTTL.
 var validTTL = regexp.MustCompile(`^\d+[smhdwMy]$`)
 
+// queryConcurrency hard bounds. 1 prevents deadlock; 32 prevents pathological
+// fan-out that itself can OOM GreptimeDB.
+const (
+	queryConcurrencyMin     = 1
+	queryConcurrencyMax     = 32
+	queryConcurrencyDefault = 4
+)
+
+func clampQueryConcurrency(n int) int {
+	if n < queryConcurrencyMin {
+		return queryConcurrencyDefault
+	}
+	if n > queryConcurrencyMax {
+		return queryConcurrencyMax
+	}
+	return n
+}
+
 type settingsResponse struct {
-	LLMAPIKeySet  bool     `json:"llm_api_key_set"`
-	LLMAPIKeyHint string   `json:"llm_api_key_hint"`
-	LLMProvider   string   `json:"llm_provider"`
-	LLMModel      string   `json:"llm_model"`
-	LogLevel      string   `json:"log_level"`
-	DataTTL       string   `json:"data_ttl"`
-	EnvOverrides  []string `json:"env_overrides"`
+	LLMAPIKeySet     bool     `json:"llm_api_key_set"`
+	LLMAPIKeyHint    string   `json:"llm_api_key_hint"`
+	LLMProvider      string   `json:"llm_provider"`
+	LLMModel         string   `json:"llm_model"`
+	LogLevel         string   `json:"log_level"`
+	DataTTL          string   `json:"data_ttl"`
+	QueryConcurrency int      `json:"query_concurrency"`
+	EnvOverrides     []string `json:"env_overrides"`
 }
 
 type settingsRequest struct {
-	LLMAPIKey   string `json:"llm_api_key"`
-	LLMProvider string `json:"llm_provider"`
-	LLMModel    string `json:"llm_model"`
-	LogLevel    string `json:"log_level"`
-	DataTTL     string `json:"data_ttl"`
+	LLMAPIKey        string `json:"llm_api_key"`
+	LLMProvider      string `json:"llm_provider"`
+	LLMModel         string `json:"llm_model"`
+	LogLevel         string `json:"log_level"`
+	DataTTL          string `json:"data_ttl"`
+	QueryConcurrency int    `json:"query_concurrency"`
 }
 
 func redactKey(key string) string {
@@ -45,16 +66,18 @@ func (s *Server) handleGetSettings(w http.ResponseWriter, _ *http.Request) {
 	s.mu.RLock()
 	llm := s.llmConfig
 	dataTTL := s.dataTTL
+	queryConcurrency := s.queryConcurrency
 	s.mu.RUnlock()
 
 	resp := settingsResponse{
-		LLMAPIKeySet:  llm.APIKey != "",
-		LLMAPIKeyHint: redactKey(llm.APIKey),
-		LLMProvider:   llm.Provider,
-		LLMModel:      llm.Model,
-		LogLevel:      s.logLevel(),
-		DataTTL:       dataTTL,
-		EnvOverrides:  config.EnvOverrides(),
+		LLMAPIKeySet:     llm.APIKey != "",
+		LLMAPIKeyHint:    redactKey(llm.APIKey),
+		LLMProvider:      llm.Provider,
+		LLMModel:         llm.Model,
+		LogLevel:         s.logLevel(),
+		DataTTL:          dataTTL,
+		QueryConcurrency: queryConcurrency,
+		EnvOverrides:     config.EnvOverrides(),
 	}
 	writeJSON(w, http.StatusOK, resp)
 }
@@ -85,6 +108,14 @@ func (s *Server) handleSaveSettings(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Validate query concurrency. 0 means "unset" — fall through to existing value.
+	if req.QueryConcurrency != 0 && (req.QueryConcurrency < queryConcurrencyMin || req.QueryConcurrency > queryConcurrencyMax) {
+		writeJSON(w, http.StatusBadRequest, map[string]string{
+			"error": fmt.Sprintf("query_concurrency must be between %d and %d", queryConcurrencyMin, queryConcurrencyMax),
+		})
+		return
+	}
+
 	// Read current file settings to preserve fields not sent.
 	current := config.LoadSettings(s.dataDir)
 
@@ -109,6 +140,9 @@ func (s *Server) handleSaveSettings(w http.ResponseWriter, r *http.Request) {
 	}
 	if !s.isEnvLocked("data_ttl") && req.DataTTL != "" {
 		settings.DataTTL = req.DataTTL
+	}
+	if !s.isEnvLocked("query_concurrency") && req.QueryConcurrency != 0 {
+		settings.QueryConcurrency = req.QueryConcurrency
 	}
 
 	// Save to file.
@@ -142,6 +176,13 @@ func (s *Server) handleSaveSettings(w http.ResponseWriter, r *http.Request) {
 	if !s.isEnvLocked("data_ttl") && settings.DataTTL != "" {
 		s.mu.Lock()
 		s.dataTTL = settings.DataTTL
+		s.mu.Unlock()
+	}
+
+	// Hot-reload query concurrency. Frontend re-fetches /api/settings to pick it up.
+	if !s.isEnvLocked("query_concurrency") && settings.QueryConcurrency > 0 {
+		s.mu.Lock()
+		s.queryConcurrency = clampQueryConcurrency(settings.QueryConcurrency)
 		s.mu.Unlock()
 	}
 

@@ -8,12 +8,16 @@ import (
 
 // Settings holds user-configurable settings persisted to ~/.tma1/settings.json.
 // Env vars take priority over file settings.
+//
+// New fields must default safely when missing — older settings.json files will
+// unmarshal them as zero values, and ApplySettings must skip those.
 type Settings struct {
-	LLMAPIKey   string `json:"llm_api_key"`
-	LLMProvider string `json:"llm_provider"`
-	LLMModel    string `json:"llm_model"`
-	LogLevel    string `json:"log_level"`
-	DataTTL     string `json:"data_ttl"`
+	LLMAPIKey        string `json:"llm_api_key"`
+	LLMProvider      string `json:"llm_provider"`
+	LLMModel         string `json:"llm_model"`
+	LogLevel         string `json:"log_level"`
+	DataTTL          string `json:"data_ttl"`
+	QueryConcurrency int    `json:"query_concurrency,omitempty"`
 }
 
 // LoadSettings reads settings from dataDir/settings.json.
@@ -63,6 +67,9 @@ func EnvOverrides() []string {
 	if os.Getenv("TMA1_DATA_TTL") != "" {
 		overrides = append(overrides, "data_ttl")
 	}
+	if os.Getenv("TMA1_QUERY_CONCURRENCY") != "" {
+		overrides = append(overrides, "query_concurrency")
+	}
 	return overrides
 }
 
@@ -83,5 +90,10 @@ func ApplySettings(cfg *Config, s Settings) {
 	}
 	if os.Getenv("TMA1_DATA_TTL") == "" && s.DataTTL != "" {
 		cfg.DataTTL = s.DataTTL
+	}
+	// Only apply if persisted explicitly. Older settings.json files have 0 here;
+	// the env-default from config.Load already populated cfg.QueryConcurrency.
+	if os.Getenv("TMA1_QUERY_CONCURRENCY") == "" && s.QueryConcurrency > 0 {
+		cfg.QueryConcurrency = s.QueryConcurrency
 	}
 }

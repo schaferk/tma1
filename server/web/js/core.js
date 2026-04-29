@@ -5,12 +5,12 @@ var API = '/api/query';
 var currentTimeRange = '24h';
 
 function intervalSQL() {
-  var m = { '15m': '15 minutes', '30m': '30 minutes', '1h': '1 hour', '6h': '6 hours', '24h': '1 day', '7d': '7 days', '30d': '30 days' };
+  var m = { '15m': '15 minutes', '30m': '30 minutes', '1h': '1 hour', '6h': '6 hours', '24h': '1 day', '7d': '7 days', '30d': '30 days', '60d': '60 days' };
   return m[currentTimeRange] || '1 day';
 }
 
 function chartBucket() {
-  var m = { '15m': '1 minute', '30m': '1 minute', '1h': '5 minutes', '6h': '5 minutes', '24h': '5 minutes', '7d': '15 minutes', '30d': '1 hour' };
+  var m = { '15m': '1 minute', '30m': '1 minute', '1h': '5 minutes', '6h': '5 minutes', '24h': '5 minutes', '7d': '15 minutes', '30d': '1 hour', '60d': '2 hours' };
   return m[currentTimeRange] || '5 minutes';
 }
 
@@ -18,25 +18,56 @@ function chartBucket() {
 // Typical agent usage: ~1k events/day. These limits should cover all but
 // the most extreme workloads, while keeping browser performance reasonable.
 function sessionQueryLimit() {
-  var m = { '1h': 5000, '6h': 10000, '24h': 20000, '7d': 50000, '30d': 100000 };
+  var m = { '1h': 5000, '6h': 10000, '24h': 20000, '7d': 50000, '30d': 100000, '60d': 200000 };
   return m[currentTimeRange] || 20000;
 }
 
-async function query(sql) {
-  var r = await fetch(API, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ sql: sql }),
+// Limit in-flight SQL queries to avoid GreptimeDB memory spikes on wide ranges.
+// Excess queries wait in FIFO; nothing is dropped.
+var QUERY_CONCURRENCY = 4; // overridden by /api/settings on init
+var queryInFlight = 0;
+var queryQueue = [];
+
+function queryAcquire() {
+  return new Promise(function(resolve) {
+    if (queryInFlight < QUERY_CONCURRENCY) {
+      queryInFlight++;
+      resolve();
+    } else {
+      queryQueue.push(resolve);
+    }
   });
-  if (!r.ok) {
-    var msg = 'HTTP ' + r.status;
-    try {
-      var body = await r.text();
-      if (body) msg += ': ' + body.slice(0, 200);
-    } catch { /* keep status-only message */ }
-    throw new Error(msg);
+}
+
+function queryRelease() {
+  if (queryQueue.length > 0) {
+    var next = queryQueue.shift();
+    next();
+  } else {
+    queryInFlight--;
   }
-  return r.json();
+}
+
+async function query(sql) {
+  await queryAcquire();
+  try {
+    var r = await fetch(API, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ sql: sql }),
+    });
+    if (!r.ok) {
+      var msg = 'HTTP ' + r.status;
+      try {
+        var body = await r.text();
+        if (body) msg += ': ' + body.slice(0, 200);
+      } catch { /* keep status-only message */ }
+      throw new Error(msg);
+    }
+    return await r.json();
+  } finally {
+    queryRelease();
+  }
 }
 
 function rows(res) {

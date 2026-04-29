@@ -156,7 +156,7 @@ function parseHash() {
   var h = location.hash.replace('#', '');
   if (!h) return { view: null, tab: null, range: null, sessionId: null };
   var parts = h.split('/');
-  var validRanges = ['15m', '30m', '1h', '6h', '24h', '7d', '30d'];
+  var validRanges = ['15m', '30m', '1h', '6h', '24h', '7d', '30d', '60d'];
   var range = null;
   if (parts.length > 0 && validRanges.includes(parts[parts.length - 1])) {
     range = parts.pop();
@@ -219,7 +219,17 @@ async function switchView(viewId, skipHash) {
   if (!skipHash) updateHash();
 }
 
+async function loadServerSettings() {
+  try {
+    var resp = await fetch('/api/settings');
+    if (!resp.ok) return;
+    var data = await resp.json();
+    if (data.query_concurrency > 0) QUERY_CONCURRENCY = data.query_concurrency;
+  } catch { /* keep client-side defaults */ }
+}
+
 async function initViews() {
+  await loadServerSettings();
   dataSources = await detectDataSources();
   var hasCCView = dataSources.hasClaudeLogs || dataSources.ccMetrics.length > 0;
   var viewTabsEl = document.getElementById('view-tabs');

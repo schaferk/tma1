@@ -63,6 +63,13 @@ body {
   color: var(--text);
   min-height: 100vh;
 }
+
+/* Constrain top-level sections on wide screens so panels don't sprawl */
+header, .cards, .tabs, .tab-content {
+  max-width: 1440px;
+  margin-left: auto;
+  margin-right: auto;
+}
 a { color: var(--blue); text-decoration: none; }
 a:hover { text-decoration: underline; }
 
@@ -465,30 +472,50 @@ tr.active-trace td { background: var(--bg-hover); }
   font-size: 13px; color: var(--red);
 }
 
-/* --- Heatmap --- */
-.heatmap-grid {
-  display: grid; gap: 2px;
-  /* grid-template-columns set inline by JS based on time range */
+/* --- Activity Heatmap (GitHub-style contribution graph) --- */
+.activity-heatmap {
+  display: flex; flex-direction: column; gap: 12px;
+  align-items: flex-start;
+  width: 100%;
 }
-.heatmap-cell {
-  aspect-ratio: 1; border-radius: 2px; min-width: 8px; min-height: 8px;
+.ah-summary {
+  font-family: monospace; font-size: 13px;
+  color: var(--text-muted); line-height: 1.4;
+}
+.ah-summary .ah-stat-num {
+  color: var(--text); font-weight: 600; font-size: 18px;
+  margin-right: 4px;
+}
+.ah-summary .ah-sep {
+  margin: 0 12px; color: var(--text-dim);
+}
+.ah-subtitle {
+  font-size: 12px; color: var(--text-muted); font-family: monospace;
+}
+.ah-grid {
+  display: grid; gap: 4px;
+  /* grid-template-* set inline by JS */
+}
+.ah-cell {
+  width: 22px; height: 22px; border-radius: 4px;
   position: relative;
 }
-.heatmap-cell:hover::after {
+.ah-cell:hover::after {
   content: attr(title); position: absolute; bottom: 100%; left: 50%;
   transform: translateX(-50%); background: var(--bg-card); border: 1px solid var(--border-strong);
   border-radius: 4px; padding: 2px 6px; font-size: 10px; color: var(--text);
-  white-space: nowrap; z-index: 10; pointer-events: none;
+  white-space: nowrap; z-index: 10; pointer-events: none; margin-bottom: 4px;
 }
-.heatmap-label {
-  font-size: 10px; color: var(--text-muted); display: flex; align-items: center;
-  justify-content: flex-end; padding-right: 4px;
+.ah-cell.empty { background: transparent; pointer-events: none; }
+.ah-time-label {
+  font-size: 11px; color: var(--text-muted); font-family: monospace;
+  white-space: nowrap; line-height: 1.4;
 }
-.heatmap-legend {
-  display: flex; align-items: center; gap: 4px; margin-top: 8px;
-  font-size: 10px; color: var(--text-muted);
+.ah-legend {
+  display: flex; align-items: center; gap: 5px;
+  font-size: 11px; color: var(--text-muted);
 }
-.heatmap-legend-cell {
+.ah-legend-cell {
   width: 12px; height: 12px; border-radius: 2px;
 }
 
