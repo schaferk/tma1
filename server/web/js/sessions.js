@@ -48,7 +48,8 @@ async function sess_loadCards() {
     try {
       var dRes = await query(
         "SELECT MIN(ts) AS start_ts, MAX(ts) AS end_ts FROM tma1_hook_events" +
-        " WHERE ts > NOW() - INTERVAL '" + iv + "' GROUP BY session_id"
+        " WHERE session_id IN (SELECT DISTINCT session_id FROM tma1_hook_events" +
+        " WHERE ts > NOW() - INTERVAL '" + iv + "') GROUP BY session_id"
       );
       var dRows = rowsToObjects(dRes);
       if (dRows.length > 0) {
@@ -72,26 +73,26 @@ async function sess_loadList() {
   var iv = intervalSQL();
   var source = document.getElementById('sess-source-filter').value;
   var keyword = (document.getElementById('sess-keyword-filter').value || '').trim();
-  var where = "ts > NOW() - INTERVAL '" + iv + "'";
-  if (source) where += " AND agent_source = '" + escapeSQLString(source) + "'";
 
-  var sessionFilter = '';
+  // Two-step aggregation: window only narrows which sessions to show. MIN/MAX/counts
+  // are computed over the whole session so cross-window sessions show real start/end.
+  var activeWhere = "ts > NOW() - INTERVAL '" + iv + "'";
+  if (source) activeWhere += " AND agent_source = '" + escapeSQLString(source) + "'";
   if (keyword) {
-    sessionFilter = " AND session_id IN (" +
-      "SELECT DISTINCT session_id FROM tma1_hook_events WHERE " + where +
-      " AND (tool_name LIKE '%" + escapeSQLString(keyword) + "%'" +
+    activeWhere += " AND (tool_name LIKE '%" + escapeSQLString(keyword) + "%'" +
       " OR tool_input LIKE '%" + escapeSQLString(keyword) + "%'" +
-      " OR tool_result LIKE '%" + escapeSQLString(keyword) + "%'))";
+      " OR tool_result LIKE '%" + escapeSQLString(keyword) + "%')";
   }
+  var activeSidSubquery = "SELECT DISTINCT session_id FROM tma1_hook_events WHERE " + activeWhere;
 
   var sql =
     "SELECT session_id, agent_source, MIN(ts) AS start_ts, MAX(ts) AS end_ts, " +
     "SUM(CASE WHEN event_type = 'PreToolUse' THEN 1 ELSE 0 END) AS tool_calls, " +
     "SUM(CASE WHEN event_type = 'SubagentStart' THEN 1 ELSE 0 END) AS subagents, " +
     "MAX(cwd) AS cwd " +
-    "FROM tma1_hook_events WHERE " + where + sessionFilter + " " +
+    "FROM tma1_hook_events WHERE session_id IN (" + activeSidSubquery + ") " +
     "GROUP BY session_id, agent_source " +
-    "ORDER BY MIN(ts) DESC " +
+    "ORDER BY MAX(ts) DESC " +
     "LIMIT " + (sessPageSize + 1) + " OFFSET " + (sessPage * sessPageSize);
 
   var res = await query(sql);
