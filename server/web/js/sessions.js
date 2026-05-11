@@ -46,9 +46,18 @@ async function sess_loadCards() {
 
   if (total > 0) {
     try {
+      // Two-step: fetch active session IDs (capped) then aggregate with a literal IN list,
+      // avoiding GreptimeDB subquery planner memory issues (cf. prompts.js pr_sourceSessionIDs).
+      var idsRes = await query(
+        "SELECT session_id FROM tma1_hook_events WHERE ts > NOW() - INTERVAL '" + iv +
+        "' GROUP BY session_id ORDER BY MAX(ts) DESC LIMIT 500"
+      );
+      var idRows = rowsToObjects(idsRes);
+      if (idRows.length === 0) return total > 0;
+      var idList = idRows.map(function(r) { return "'" + escapeSQLString(r.session_id) + "'"; }).join(',');
       var dRes = await query(
         "SELECT MIN(ts) AS start_ts, MAX(ts) AS end_ts FROM tma1_hook_events" +
-        " WHERE ts > NOW() - INTERVAL '" + iv + "' GROUP BY session_id"
+        " WHERE session_id IN (" + idList + ") GROUP BY session_id"
       );
       var dRows = rowsToObjects(dRes);
       if (dRows.length > 0) {
@@ -72,24 +81,39 @@ async function sess_loadList() {
   var iv = intervalSQL();
   var source = document.getElementById('sess-source-filter').value;
   var keyword = (document.getElementById('sess-keyword-filter').value || '').trim();
-  var where = "ts > NOW() - INTERVAL '" + iv + "'";
-  if (source) where += " AND agent_source = '" + escapeSQLString(source) + "'";
 
-  var sessionFilter = '';
+  // Step 1: fetch active session IDs in the window. Two-step (instead of an IN-subquery)
+  // avoids GreptimeDB planner memory issues — same approach as prompts.js pr_sourceSessionIDs.
+  var activeWhere = "ts > NOW() - INTERVAL '" + iv + "'";
+  if (source) activeWhere += " AND agent_source = '" + escapeSQLString(source) + "'";
   if (keyword) {
-    sessionFilter = " AND session_id IN (" +
-      "SELECT DISTINCT session_id FROM tma1_hook_events WHERE " + where +
-      " AND (tool_name LIKE '%" + escapeSQLString(keyword) + "%'" +
+    activeWhere += " AND (tool_name LIKE '%" + escapeSQLString(keyword) + "%'" +
       " OR tool_input LIKE '%" + escapeSQLString(keyword) + "%'" +
-      " OR tool_result LIKE '%" + escapeSQLString(keyword) + "%'))";
+      " OR tool_result LIKE '%" + escapeSQLString(keyword) + "%')";
   }
+  var idsRes = await query(
+    "SELECT session_id FROM tma1_hook_events WHERE " + activeWhere +
+    " GROUP BY session_id ORDER BY MAX(ts) DESC LIMIT 500"
+  );
+  var idRows = rowsToObjects(idsRes);
 
+  var tbody = document.getElementById('sess-table-body');
+  if (!idRows.length) {
+    tbody.innerHTML = '<tr><td colspan="8" class="loading">' + t('empty.no_data') + '</td></tr>';
+    sessHasNext = false;
+    renderSessPagination();
+    return;
+  }
+  var idList = idRows.map(function(r) { return "'" + escapeSQLString(r.session_id) + "'"; }).join(',');
+
+  // Step 2: aggregate full-session stats over those IDs (no time predicate so cross-window
+  // sessions report their real MIN/MAX). ORDER BY MIN(ts) DESC matches the displayed "Time" column.
   var sql =
     "SELECT session_id, agent_source, MIN(ts) AS start_ts, MAX(ts) AS end_ts, " +
     "SUM(CASE WHEN event_type = 'PreToolUse' THEN 1 ELSE 0 END) AS tool_calls, " +
     "SUM(CASE WHEN event_type = 'SubagentStart' THEN 1 ELSE 0 END) AS subagents, " +
     "MAX(cwd) AS cwd " +
-    "FROM tma1_hook_events WHERE " + where + sessionFilter + " " +
+    "FROM tma1_hook_events WHERE session_id IN (" + idList + ") " +
     "GROUP BY session_id, agent_source " +
     "ORDER BY MIN(ts) DESC " +
     "LIMIT " + (sessPageSize + 1) + " OFFSET " + (sessPage * sessPageSize);
@@ -122,7 +146,6 @@ async function sess_loadList() {
     } catch (e) { /* tma1_messages may not exist */ }
   }
 
-  var tbody = document.getElementById('sess-table-body');
   if (!data.length) {
     tbody.innerHTML = '<tr><td colspan="8" class="loading">' + t('empty.no_data') + '</td></tr>';
     renderSessPagination();
