@@ -98,6 +98,24 @@ func TestToolsListReturnsAllRegisteredTools(t *testing.T) {
 	}
 }
 
+func TestSessionStateToolSchemaWiresVerbose(t *testing.T) {
+	// Plan §Phase 0.1 promises `verbose=true` → raw action list. Earlier
+	// the field was in the schema but documented as "Ignored in Phase
+	// 0.1", which kept agents from using it. Lock the wiring so neither
+	// the field nor the description regress.
+	def := SessionStateTool{}.Definition()
+	props := def.InputSchema.Properties
+	for _, want := range []string{"session_id", "verbose", "action_limit"} {
+		if _, ok := props[want]; !ok {
+			t.Errorf("schema missing property %q (have %v)", want, props)
+		}
+	}
+	if strings.Contains(strings.ToLower(props["verbose"].Description), "ignored") ||
+		strings.Contains(strings.ToLower(props["verbose"].Description), "reserved") {
+		t.Errorf("verbose description still implies it's a stub: %q", props["verbose"].Description)
+	}
+}
+
 func TestToolsCallSurfacesMissingBundler(t *testing.T) {
 	params, _ := json.Marshal(CallToolParams{Name: "get_context_bundle"})
 	resp := roundTrip(t, newTestServer(), Request{

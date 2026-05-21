@@ -29,6 +29,19 @@ type ToolCount struct {
 	Count int
 }
 
+// ActionEntry is one raw hook event in a session — the unit the
+// verbose=true variant of get_session_state returns. Lightweight by
+// design: file_path / command_prefix / success are pulled from the
+// derived ingest-side columns so the payload is bounded and quick.
+type ActionEntry struct {
+	Timestamp     time.Time `json:"ts"`
+	EventType     string    `json:"event_type"`
+	ToolName      string    `json:"tool_name,omitempty"`
+	FilePath      string    `json:"file_path,omitempty"`
+	CommandPrefix string    `json:"command_prefix,omitempty"`
+	Success       *bool     `json:"success,omitempty"`
+}
+
 // LatestSessionForCWD returns the most recent session_id that emitted a hook
 // event from the given cwd. Returns "" if no match (no agent active in this
 // project yet).
@@ -215,6 +228,61 @@ func extractFilesFromRows(rows [][]any, lastActivity time.Time) ([]string, strin
 		return recent, ranked[0].path
 	}
 	return recent, ""
+}
+
+// GetRecentActions returns the most recent PreToolUse / PostToolUse /
+// PostToolUseFailure entries for sessionID, newest first. limit is
+// clamped to [1, 200] (default 50). Use this to back the verbose=true
+// variant of get_session_state — the plan's "合并原 plan 的
+// get_recent_actions" channel.
+func (b *Bundler) GetRecentActions(ctx context.Context, sessionID string, limit int) ([]ActionEntry, error) {
+	if strings.TrimSpace(sessionID) == "" {
+		return nil, nil
+	}
+	if limit <= 0 {
+		limit = 50
+	}
+	if limit > 200 {
+		limit = 200
+	}
+	sql := fmt.Sprintf(
+		`SELECT CAST(ts AS BIGINT) AS ts_ms, event_type, tool_name,
+		        tool_file_path, tool_command_prefix, tool_success
+		 FROM tma1_hook_events
+		 WHERE session_id = '%s'
+		   AND event_type IN ('PreToolUse','PostToolUse','PostToolUseFailure')
+		 ORDER BY ts DESC LIMIT %d`,
+		escapeSQL(sessionID), limit,
+	)
+	_, rows, err := b.client.Query(ctx, sql)
+	if err != nil {
+		return nil, err
+	}
+	out := make([]ActionEntry, 0, len(rows))
+	for _, r := range rows {
+		entry := ActionEntry{
+			Timestamp:     time.UnixMilli(int64At(r, 0)),
+			EventType:     stringAt(r, 1),
+			ToolName:      stringAt(r, 2),
+			FilePath:      stringAt(r, 3),
+			CommandPrefix: stringAt(r, 4),
+		}
+		// tool_success is BOOLEAN NULL. GreptimeDB returns null/missing
+		// as nil so the *bool stays nil for events that don't carry the
+		// signal (PreToolUse always; PostToolUse only when the
+		// extractor flipped event_type to PostToolUseFailure).
+		if len(r) > 5 && r[5] != nil {
+			switch v := r[5].(type) {
+			case bool:
+				entry.Success = &v
+			case float64:
+				b := v != 0
+				entry.Success = &b
+			}
+		}
+		out = append(out, entry)
+	}
+	return out, nil
 }
 
 func escapeSQL(s string) string {

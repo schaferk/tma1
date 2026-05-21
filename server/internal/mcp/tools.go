@@ -61,7 +61,8 @@ func (t SessionStateTool) Definition() Tool {
 		Name: "get_session_state",
 		Description: "Get the current (or specified) session's tool history, token " +
 			"usage, and recent focus files. Use this when you need to recall what " +
-			"you've already done in this session.",
+			"you've already done in this session. Set verbose=true to also receive " +
+			"a chronological list of recent tool calls.",
 		InputSchema: InputSchema{
 			Type: "object",
 			Properties: map[string]Property{
@@ -71,7 +72,11 @@ func (t SessionStateTool) Definition() Tool {
 				},
 				"verbose": {
 					Type:        "boolean",
-					Description: "Reserved for future use (raw tool-call list). Ignored in Phase 0.1.",
+					Description: "When true, the response includes an `actions` array with the most recent PreToolUse / PostToolUse / PostToolUseFailure entries (default cap: 50).",
+				},
+				"action_limit": {
+					Type:        "integer",
+					Description: "Optional cap on the verbose action list. 1-200, default 50. Ignored when verbose is false.",
 				},
 			},
 		},
@@ -110,6 +115,21 @@ func (t SessionStateTool) Call(ctx context.Context, args map[string]any) (CallTo
 	}
 
 	payload := map[string]any{"session": state}
+
+	// verbose=true → include raw action list (Plan §Phase 0.1: "verbose=true
+	// 返回 raw action list — 合并原 plan 的 get_recent_actions"). Failure
+	// to fetch actions doesn't fail the call; the agent still gets state.
+	if verbose, _ := args["verbose"].(bool); verbose {
+		limit := intArg(args, "action_limit", 50)
+		actions, err := t.Bundler.GetRecentActions(ctx, sessionID, limit)
+		if err != nil {
+			payload["actions_error"] = err.Error()
+		} else {
+			payload["actions"] = actions
+			payload["action_count"] = len(actions)
+		}
+	}
+
 	out, err := json.MarshalIndent(payload, "", "  ")
 	if err != nil {
 		return CallToolResult{}, fmt.Errorf("marshal session: %w", err)

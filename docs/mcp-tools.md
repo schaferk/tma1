@@ -45,7 +45,15 @@ during the session.
 | Arg | Type | Default | Description |
 |-----|------|---------|-------------|
 | `session_id` | string | active session for cwd | Session to inspect |
-| `verbose` | boolean | false | Reserved — currently ignored |
+| `verbose` | boolean | false | When true, include a chronological `actions` array of recent PreToolUse / PostToolUse / PostToolUseFailure entries |
+| `action_limit` | integer | 50 | Cap on the verbose action list (clamped to 1-200). Ignored when verbose is false |
+
+The verbose variant is the Phase 0.1 "raw action list" channel (it
+folds in what was originally proposed as a separate `get_recent_actions`
+tool). Each action carries `ts`, `event_type`, `tool_name`,
+`file_path` (when applicable), `command_prefix` (Bash / exec_command),
+and `success` (only on PostToolUseFailure — `true` on PostToolUse,
+absent on PreToolUse).
 
 ## get_anomalies
 
