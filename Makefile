@@ -1,4 +1,5 @@
 MAKEFILE_DIR:=$(shell dirname $(realpath $(firstword $(MAKEFILE_LIST))))
+GO_PACKAGES:=./cmd/... ./internal/... ./web
 
 .PHONY: build build-linux build-windows vet lint lint-js test check install install-hooks clean run dev sync-skills
 
@@ -29,16 +30,16 @@ build-windows:
 	cd server && CGO_ENABLED=0 GOOS=windows GOARCH=amd64 go build -o ./bin/tma1-server.exe ./cmd/tma1-server
 
 vet:
-	cd server && go vet ./...
+	cd server && go vet $(GO_PACKAGES)
 
 lint:
-	cd server && golangci-lint run ./...
+	cd server && golangci-lint run $(GO_PACKAGES)
 
 lint-js:
 	cd server/web && npx eslint js/
 
 test:
-	cd server && go test -race -count=1 ./...
+	cd server && go test -race -count=1 $(GO_PACKAGES)
 
 # Run all checks CI runs (vet, lint, test, lint-js). Used by the pre-push hook.
 check: vet lint test lint-js

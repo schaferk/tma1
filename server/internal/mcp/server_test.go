@@ -51,9 +51,6 @@ func TestInitializeReturnsProtocolVersion(t *testing.T) {
 		ID:      1,
 		Method:  "initialize",
 	})
-	if resp == nil {
-		t.Fatal("expected response, got nil")
-	}
 	if resp.Error != nil {
 		t.Fatalf("unexpected error: %+v", resp.Error)
 	}
@@ -135,9 +132,6 @@ func TestUnknownToolReturnsToolError(t *testing.T) {
 		Method:  "tools/call",
 		Params:  params,
 	})
-	if resp == nil {
-		t.Fatal("expected response, got nil")
-	}
 	// MCP convention: unknown tool returns IsError=true in the result, not a JSON-RPC error.
 	raw, _ := json.Marshal(resp.Result)
 	var result CallToolResult

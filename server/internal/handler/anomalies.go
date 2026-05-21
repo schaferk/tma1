@@ -537,5 +537,22 @@ func (s *Server) querySQL(ctx context.Context, sql string) ([]byte, error) {
 	if resp.StatusCode != http.StatusOK {
 		return nil, fmt.Errorf("HTTP %d: %s", resp.StatusCode, body)
 	}
+	if err := greptimeResponseError(body); err != nil {
+		return nil, err
+	}
 	return body, nil
+}
+
+func greptimeResponseError(body []byte) error {
+	var r struct {
+		Code  int    `json:"code"`
+		Error string `json:"error"`
+	}
+	if err := json.Unmarshal(body, &r); err != nil {
+		return fmt.Errorf("parse response: %w", err)
+	}
+	if r.Code != 0 || r.Error != "" {
+		return fmt.Errorf("greptimedb error %d: %s", r.Code, r.Error)
+	}
+	return nil
 }

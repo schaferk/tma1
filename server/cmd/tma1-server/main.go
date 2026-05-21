@@ -456,10 +456,11 @@ func runInstall(args []string) error {
 	logger := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelInfo}))
 
 	inst := &hooks.ClaudeCodeInstaller{
-		DataDir:    cfg.DataDir,
-		Port:       port,
-		ProjectDir: project,
-		Logger:     logger,
+		DataDir:            cfg.DataDir,
+		Port:               port,
+		GreptimeDBHTTPPort: cfg.GreptimeDBHTTPPort,
+		ProjectDir:         project,
+		Logger:             logger,
 	}
 	rep, installErr := inst.Install()
 

@@ -18,6 +18,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"strconv"
 	"strings"
 )
 
@@ -26,11 +27,17 @@ var embeddedSkills embed.FS
 
 // ClaudeCodeInstaller knows how to set up TMA1 hooks for Claude Code.
 type ClaudeCodeInstaller struct {
-	DataDir    string // ~/.tma1
-	Port       int    // tma1-server HTTP port
-	ProjectDir string // project root (where CLAUDE.md / .gitignore live)
-	Logger     *slog.Logger
+	DataDir            string // ~/.tma1
+	Port               int    // tma1-server HTTP port
+	GreptimeDBHTTPPort int    // GreptimeDB HTTP port; only persisted to MCP env when != default
+	ProjectDir         string // project root (where CLAUDE.md / .gitignore live)
+	Logger             *slog.Logger
 }
+
+// defaultGreptimeDBHTTPPort mirrors config.envInt("TMA1_GREPTIMEDB_HTTP_PORT", 14000).
+// Kept as a constant so installMCPServer can decide whether the user's
+// configured port deserves an explicit env override in the MCP entry.
+const defaultGreptimeDBHTTPPort = 14000
 
 // Install runs all three steps. Returns the list of touched paths and the
 // first error encountered (subsequent steps are still attempted on failure
@@ -200,10 +207,46 @@ func (i *ClaudeCodeInstaller) installSettings(scriptPath string) (string, bool, 
 	if err != nil {
 		return settingsPath, false, err
 	}
-	if err := os.WriteFile(settingsPath, append(out, '\n'), 0o644); err != nil {
+	if err := writeFileAtomic(settingsPath, append(out, '\n'), 0o644); err != nil {
 		return settingsPath, false, err
 	}
 	return settingsPath, true, nil
+}
+
+// writeFileAtomic writes data to path via a temp-file + rename so a crash or
+// signal between truncate and full write can't leave the target half-written.
+// Critical for ~/.claude.json (OAuth + project history) and ~/.claude/settings.json
+// (hook registrations) — losing either silently breaks the user's CC install.
+//
+// The temp file lives in the same directory as the target so the rename is
+// guaranteed to be on the same filesystem (atomic).
+func writeFileAtomic(path string, data []byte, perm os.FileMode) error {
+	dir := filepath.Dir(path)
+	tmp, err := os.CreateTemp(dir, ".tma1-write-*")
+	if err != nil {
+		return err
+	}
+	tmpName := tmp.Name()
+	cleanup := func() { _ = os.Remove(tmpName) }
+	if _, err := tmp.Write(data); err != nil {
+		_ = tmp.Close()
+		cleanup()
+		return err
+	}
+	if err := tmp.Chmod(perm); err != nil {
+		_ = tmp.Close()
+		cleanup()
+		return err
+	}
+	if err := tmp.Close(); err != nil {
+		cleanup()
+		return err
+	}
+	if err := os.Rename(tmpName, path); err != nil {
+		cleanup()
+		return err
+	}
+	return nil
 }
 
 // installMCPServer registers `tma1` as an MCP stdio server under the
@@ -240,6 +283,16 @@ func (i *ClaudeCodeInstaller) installMCPServer() (string, bool, error) {
 		"command": binary,
 		"args":    []any{"mcp-serve"},
 	}
+	// Propagate non-default GreptimeDB port so the CC-spawned mcp-serve child
+	// — which runs in CC's environment, not the parent tma1-server's — talks
+	// to the same DB. Without this, a user who ran the server with
+	// TMA1_GREPTIMEDB_HTTP_PORT=14555 would have the MCP child silently fall
+	// back to 14000 and return empty results.
+	if i.GreptimeDBHTTPPort != 0 && i.GreptimeDBHTTPPort != defaultGreptimeDBHTTPPort {
+		desired["env"] = map[string]any{
+			"TMA1_GREPTIMEDB_HTTP_PORT": strconv.Itoa(i.GreptimeDBHTTPPort),
+		}
+	}
 
 	if cur, ok := servers["tma1"].(map[string]any); ok && mcpEntryEqual(cur, desired) {
 		return cfgPath, false, nil
@@ -252,7 +305,7 @@ func (i *ClaudeCodeInstaller) installMCPServer() (string, bool, error) {
 	if err != nil {
 		return cfgPath, false, err
 	}
-	if err := os.WriteFile(cfgPath, append(out, '\n'), 0o644); err != nil {
+	if err := writeFileAtomic(cfgPath, append(out, '\n'), 0o644); err != nil {
 		return cfgPath, false, err
 	}
 	return cfgPath, true, nil
@@ -280,8 +333,11 @@ func tma1BinaryPath(dataDir string) (string, error) {
 }
 
 // mcpEntryEqual compares two MCP server entries on the fields we manage.
-// Slices are compared element-wise after a JSON round-trip to normalise
-// any int/float64 weirdness from map[string]any.
+// args and env are compared via JSON round-trip so int/float64 weirdness
+// from map[string]any doesn't trigger false negatives.
+//
+// env must be part of the comparison: otherwise an installer rerun with a
+// different GreptimeDBHTTPPort would silently keep the stale entry.
 func mcpEntryEqual(a, b map[string]any) bool {
 	at, _ := a["type"].(string)
 	bt, _ := b["type"].(string)
@@ -295,7 +351,12 @@ func mcpEntryEqual(a, b map[string]any) bool {
 	}
 	aj, _ := json.Marshal(a["args"])
 	bj, _ := json.Marshal(b["args"])
-	return string(aj) == string(bj)
+	if string(aj) != string(bj) {
+		return false
+	}
+	ae, _ := json.Marshal(a["env"])
+	be, _ := json.Marshal(b["env"])
+	return string(ae) == string(be)
 }
 
 // hookCommand returns the shell command CC will invoke for each hook.

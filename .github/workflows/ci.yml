@@ -18,17 +18,18 @@ jobs:
 
       - name: Vet
         working-directory: server
-        run: go vet ./...
+        run: go vet ./cmd/... ./internal/... ./web
 
       - name: Lint
         uses: golangci/golangci-lint-action@v7
         with:
           version: v2.11.3
           working-directory: server
+          args: ./cmd/... ./internal/... ./web
 
       - name: Test
         working-directory: server
-        run: go test -race -count=1 ./...
+        run: go test -race -count=1 ./cmd/... ./internal/... ./web
 
       - name: Build
         working-directory: server

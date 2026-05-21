@@ -18,48 +18,60 @@ import (
 
 // fileChangedDedup tracks last FileChanged timestamp per session+path to suppress duplicates.
 // Key: "sessionID\x00filePath", Value: time.Time of last event.
+//
+// GC runs from Server.runFileChangedDedupGC (started by StartBackgroundTasks)
+// rather than init(): an init-spawned goroutine can't be stopped from tests
+// and leaks across instances.
 var fileChangedDedup sync.Map
 
-func init() {
-	go func() {
-		for {
-			time.Sleep(5 * time.Minute)
+// runFileChangedDedupGC trims entries older than 2 minutes every 5 minutes.
+// Stops when ctx is cancelled.
+func (s *Server) runFileChangedDedupGC(ctx context.Context) {
+	ticker := time.NewTicker(5 * time.Minute)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
 			cutoff := time.Now().Add(-2 * time.Minute)
 			fileChangedDedup.Range(func(key, value any) bool {
-				if t, ok := value.(time.Time); ok && t.Before(cutoff) {
+				if ts, ok := value.(time.Time); ok && ts.Before(cutoff) {
 					fileChangedDedup.Delete(key)
 				}
 				return true
 			})
 		}
-	}()
+	}
 }
 
 const (
-	maxHookBody    = 1 << 20 // 1 MB
-	maxToolInput   = 2048
-	maxToolResult  = 4096
-	maxHookMessage = 4096
-	maxMetadata    = 8192
+	maxHookBody              = 1 << 20 // 1 MB
+	maxToolInput             = 2048
+	maxToolResult            = 4096
+	maxHookMessage           = 4096
+	maxMetadata              = 8192
+	hookInjectionTimeout     = 300 * time.Millisecond
+	sessionStartIndexTimeout = 150 * time.Millisecond
 )
 
 // knownHookFields are the fields extracted into dedicated columns.
 // Everything else goes into the metadata JSON column.
 var knownHookFields = map[string]bool{
-	"session_id":      true,
-	"hook_event_name": true,
-	"tool_name":       true,
-	"tool_input":      true,
-	"tool_use_id":     true,
-	"tool_response":   true,
-	"agent_id":        true,
-	"agent_type":      true,
+	"session_id":        true,
+	"hook_event_name":   true,
+	"tool_name":         true,
+	"tool_input":        true,
+	"tool_use_id":       true,
+	"tool_response":     true,
+	"agent_id":          true,
+	"agent_type":        true,
 	"notification_type": true,
-	"message":         true,
-	"title":           true,
-	"cwd":             true,
-	"transcript_path": true,
-	"permission_mode": true,
+	"message":           true,
+	"title":             true,
+	"cwd":               true,
+	"transcript_path":   true,
+	"permission_mode":   true,
 }
 
 // hookPayload holds the parsed hook event with known fields + extra metadata.
@@ -267,7 +279,7 @@ func (s *Server) handleHooks(w http.ResponseWriter, r *http.Request) {
 		// fire-and-forget: the next bundle query will pick up the row.
 		if s.projectSensor != nil && payload.CWD != "" {
 			if payload.HookEventName == "SessionStart" {
-				s.projectSensor.IndexAndWait(payload.CWD, 300*time.Millisecond)
+				s.projectSensor.IndexAndWait(payload.CWD, sessionStartIndexTimeout)
 			} else {
 				s.projectSensor.Index(payload.CWD)
 			}
@@ -314,7 +326,7 @@ func (s *Server) generateInjection(ctx context.Context, payload hookPayload, raw
 
 	// Bound the bundle query so a slow GreptimeDB cannot exceed the hook
 	// script's curl timeout.
-	ctx, cancel := context.WithTimeout(ctx, 400*time.Millisecond)
+	ctx, cancel := context.WithTimeout(ctx, hookInjectionTimeout)
 	defer cancel()
 
 	switch payload.HookEventName {
@@ -613,10 +625,14 @@ func (s *Server) insertHookEvent(p hookPayload, agentSource, toolInput, toolResu
 		return
 	}
 	defer resp.Body.Close()
-	_, _ = io.ReadAll(resp.Body)
+	body, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
 
 	if resp.StatusCode != http.StatusOK {
 		s.logger.Debug("hook event insert non-200", "status", resp.StatusCode, "event", p.HookEventName)
+		return
+	}
+	if err := greptimeResponseError(body); err != nil {
+		s.logger.Debug("hook event insert failed", "error", err, "event", p.HookEventName)
 	}
 }
 

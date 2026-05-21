@@ -125,10 +125,8 @@ func TestExtractFilesFocusesOnRecentEdits(t *testing.T) {
 	if focus != "/repo/focus.rs" {
 		t.Errorf("focus = %q, want /repo/focus.rs", focus)
 	}
-	// recent should include both old and focus + notes (dedup), oldest path may be dropped.
-	if len(recent) == 0 || recent[0] != "/repo/old.rs" {
-		// extractFiles preserves input order which is most-recent first as fed.
-		// Older was passed first in our rows above, so it shows first. Just ensure recent contains focus.
+	if len(recent) == 0 {
+		t.Fatal("recent files should not be empty")
 	}
 	found := false
 	for _, p := range recent {

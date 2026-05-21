@@ -2,6 +2,7 @@ package git
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
@@ -78,6 +79,23 @@ func (s *GreptimeStore) Write(ctx context.Context, c Change) error {
 	body, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
 	if resp.StatusCode != http.StatusOK {
 		return fmt.Errorf("git store: HTTP %d: %s", resp.StatusCode, strings.TrimSpace(string(body)))
+	}
+	if err := greptimeResponseError(body); err != nil {
+		return fmt.Errorf("git store: %w", err)
+	}
+	return nil
+}
+
+func greptimeResponseError(body []byte) error {
+	var r struct {
+		Code  int    `json:"code"`
+		Error string `json:"error"`
+	}
+	if err := json.Unmarshal(body, &r); err != nil {
+		return fmt.Errorf("parse response: %w", err)
+	}
+	if r.Code != 0 || r.Error != "" {
+		return fmt.Errorf("greptimedb error %d: %s", r.Code, r.Error)
 	}
 	return nil
 }

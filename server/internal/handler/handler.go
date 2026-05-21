@@ -111,6 +111,7 @@ func (s *Server) StartBackgroundTasks(ctx context.Context) {
 	if s.gitSensor != nil {
 		s.gitSensor.Start(ctx)
 	}
+	go s.runFileChangedDedupGC(ctx)
 }
 
 // Router returns the chi router with all routes registered.

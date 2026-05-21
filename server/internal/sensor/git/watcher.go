@@ -28,11 +28,11 @@ const (
 // projectWatcher watches one project root. It blends fsnotify (file
 // modifications) with a periodic git poll (commit / branch movement).
 type projectWatcher struct {
-	cfg     projectWatcherConfig
-	logger  *slog.Logger
-	cancel  context.CancelFunc
-	ctx     context.Context
-	wg      sync.WaitGroup
+	cfg    projectWatcherConfig
+	logger *slog.Logger
+	cancel context.CancelFunc
+	ctx    context.Context
+	wg     sync.WaitGroup
 
 	// recentEvents tracks the last fsnotify time per path for debouncing.
 	mu           sync.Mutex
@@ -162,8 +162,8 @@ func (w *projectWatcher) runGitPoll() {
 
 	// Capture baseline so we don't emit a "git_commit" on startup for the
 	// existing HEAD.
-	w.lastGitSHA = readGitHead(w.cfg.Root)
-	w.lastGitBranch = readGitBranch(w.cfg.Root)
+	w.lastGitSHA = readGitHead(w.ctx, w.cfg.Root)
+	w.lastGitBranch = readGitBranch(w.ctx, w.cfg.Root)
 
 	t := time.NewTicker(gitPollInterval)
 	defer t.Stop()
@@ -178,8 +178,8 @@ func (w *projectWatcher) runGitPoll() {
 }
 
 func (w *projectWatcher) pollGit() {
-	sha := readGitHead(w.cfg.Root)
-	branch := readGitBranch(w.cfg.Root)
+	sha := readGitHead(w.ctx, w.cfg.Root)
+	branch := readGitBranch(w.ctx, w.cfg.Root)
 	if sha == "" {
 		return
 	}
@@ -200,7 +200,7 @@ func (w *projectWatcher) pollGit() {
 
 	// New commit on current branch.
 	if sha != w.lastGitSHA && w.lastGitSHA != "" {
-		msg := readGitSubject(w.cfg.Root, sha)
+		msg := readGitSubject(w.ctx, w.cfg.Root, sha)
 		w.emit(Change{
 			Timestamp:   time.Now().UTC(),
 			Project:     w.cfg.Project,
@@ -223,10 +223,7 @@ func (w *projectWatcher) emit(c Change) {
 // shouldRecordFsEvent returns true for Write/Create/Remove/Rename. Chmod is
 // dropped — it generates a lot of noise on macOS (editors touch perms).
 func shouldRecordFsEvent(ev fsnotify.Event) bool {
-	if ev.Op&(fsnotify.Write|fsnotify.Create|fsnotify.Remove|fsnotify.Rename) == 0 {
-		return false
-	}
-	return true
+	return ev.Op&(fsnotify.Write|fsnotify.Create|fsnotify.Remove|fsnotify.Rename) != 0
 }
 
 func classifyFsOp(op fsnotify.Op) string {
@@ -305,9 +302,12 @@ func addRecursive(fsw *fsnotify.Watcher, root string) error {
 	})
 }
 
-// readGitHead returns the SHA of HEAD or "" on failure.
-func readGitHead(root string) string {
-	out, err := exec.Command("git", "-C", root, "rev-parse", "HEAD").Output()
+// readGitHead returns the SHA of HEAD or "" on failure. The context lets a
+// shutdown actually unblock a hung `git rev-parse` (e.g. against an NFS root
+// or behind a stale index.lock) — without it, w.wg.Wait() in stop() would
+// deadlock until git eventually returned.
+func readGitHead(ctx context.Context, root string) string {
+	out, err := exec.CommandContext(ctx, "git", "-C", root, "rev-parse", "HEAD").Output()
 	if err != nil {
 		return ""
 	}
@@ -315,8 +315,8 @@ func readGitHead(root string) string {
 }
 
 // readGitBranch returns the current branch name or "" on detached HEAD/failure.
-func readGitBranch(root string) string {
-	out, err := exec.Command("git", "-C", root, "rev-parse", "--abbrev-ref", "HEAD").Output()
+func readGitBranch(ctx context.Context, root string) string {
+	out, err := exec.CommandContext(ctx, "git", "-C", root, "rev-parse", "--abbrev-ref", "HEAD").Output()
 	if err != nil {
 		return ""
 	}
@@ -328,11 +328,11 @@ func readGitBranch(root string) string {
 }
 
 // readGitSubject returns the commit subject (first line of message) for sha.
-func readGitSubject(root, sha string) string {
+func readGitSubject(ctx context.Context, root, sha string) string {
 	if sha == "" {
 		return ""
 	}
-	out, err := exec.Command("git", "-C", root, "log", "-1", "--pretty=%s", sha).Output()
+	out, err := exec.CommandContext(ctx, "git", "-C", root, "log", "-1", "--pretty=%s", sha).Output()
 	if err != nil {
 		return ""
 	}

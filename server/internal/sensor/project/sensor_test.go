@@ -2,6 +2,7 @@ package project
 
 import (
 	"context"
+	"errors"
 	"os"
 	"path/filepath"
 	"sync"
@@ -24,6 +25,23 @@ func (w *stubWriter) count() int {
 	w.mu.Lock()
 	defer w.mu.Unlock()
 	return len(w.events)
+}
+
+type failOnceWriter struct {
+	mu     sync.Mutex
+	calls  int
+	events []State
+}
+
+func (w *failOnceWriter) Write(_ context.Context, s State) error {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	w.calls++
+	if w.calls == 1 {
+		return errors.New("temporary write failure")
+	}
+	w.events = append(w.events, s)
+	return nil
 }
 
 func TestSensorIndexIdempotentWithinTTL(t *testing.T) {
@@ -78,5 +96,25 @@ func TestSensorIndexIgnoresEmptyCwd(t *testing.T) {
 	time.Sleep(50 * time.Millisecond)
 	if w.count() != 0 {
 		t.Errorf("expected no writes for empty cwd, got %d", w.count())
+	}
+}
+
+func TestSensorIndexRetriesAfterWriteFailure(t *testing.T) {
+	root := t.TempDir()
+	_ = os.MkdirAll(filepath.Join(root, ".git"), 0o755)
+
+	w := &failOnceWriter{}
+	s := NewSensor(w, nil)
+
+	s.IndexAndWait(root, time.Second)
+	s.IndexAndWait(root, time.Second)
+
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	if w.calls != 2 {
+		t.Fatalf("expected retry after failed write, calls=%d", w.calls)
+	}
+	if len(w.events) != 1 {
+		t.Fatalf("expected second write to succeed, events=%d", len(w.events))
 	}
 }

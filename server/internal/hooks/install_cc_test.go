@@ -262,6 +262,60 @@ func TestInstallMCPServerRefusesMalformedFile(t *testing.T) {
 	}
 }
 
+func TestInstallMCPServerPersistsCustomGreptimeDBPort(t *testing.T) {
+	// When the user runs tma1-server with TMA1_GREPTIMEDB_HTTP_PORT=14555,
+	// the CC-spawned mcp-serve child won't inherit that env. The installer
+	// must persist the port in the MCP entry's env so the child reads the
+	// same DB the parent server uses.
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+
+	inst := &ClaudeCodeInstaller{
+		DataDir:            filepath.Join(home, ".tma1"),
+		Port:               14318,
+		GreptimeDBHTTPPort: 14555,
+		Logger:             slog.Default(),
+	}
+	path, changed, err := inst.installMCPServer()
+	if err != nil {
+		t.Fatalf("installMCPServer: %v", err)
+	}
+	if !changed {
+		t.Fatal("expected changed=true on first install with custom port")
+	}
+	got := readClaudeConfig(t, path)
+	servers, _ := got["mcpServers"].(map[string]any)
+	tma1, ok := servers["tma1"].(map[string]any)
+	if !ok {
+		t.Fatalf("tma1 entry missing: %+v", servers)
+	}
+	env, ok := tma1["env"].(map[string]any)
+	if !ok {
+		t.Fatalf("expected env block with custom port, got: %+v", tma1)
+	}
+	if env["TMA1_GREPTIMEDB_HTTP_PORT"] != "14555" {
+		t.Errorf("env port wrong: %v", env)
+	}
+
+	// Idempotent: re-running with the same port must NOT report a change.
+	_, changed2, err := inst.installMCPServer()
+	if err != nil {
+		t.Fatalf("second install: %v", err)
+	}
+	if changed2 {
+		t.Error("expected no-op on second install with identical port")
+	}
+
+	// Default port → no env block (don't clutter the file when nothing's overridden).
+	inst.GreptimeDBHTTPPort = 14000
+	_, _, _ = inst.installMCPServer()
+	got = readClaudeConfig(t, path)
+	tma1 = got["mcpServers"].(map[string]any)["tma1"].(map[string]any)
+	if _, hasEnv := tma1["env"]; hasEnv {
+		t.Errorf("default port should not emit env block: %+v", tma1)
+	}
+}
+
 func TestInstallMCPServerCreatesFileWhenAbsent(t *testing.T) {
 	home := t.TempDir()
 	t.Setenv("HOME", home)

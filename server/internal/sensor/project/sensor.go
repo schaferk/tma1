@@ -49,10 +49,11 @@ func (s *Sensor) Index(cwd string) {
 	if root == "" {
 		return
 	}
-	if !s.claimSlot(root) {
+	claimedAt, ok := s.claimSlot(root)
+	if !ok {
 		return
 	}
-	go s.indexAndWrite(context.Background(), root)
+	go s.indexAndWrite(context.Background(), root, claimedAt)
 }
 
 // IndexAndWait runs the index synchronously, bounded by timeout. SessionStart
@@ -68,28 +69,44 @@ func (s *Sensor) IndexAndWait(cwd string, timeout time.Duration) {
 	if root == "" {
 		return
 	}
-	if !s.claimSlot(root) {
+	claimedAt, ok := s.claimSlot(root)
+	if !ok {
 		return
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), timeout)
 	defer cancel()
-	s.indexAndWrite(ctx, root)
+	s.indexAndWrite(ctx, root, claimedAt)
 }
 
-// claimSlot returns true when the caller should index, false when the TTL
-// gate is still in effect. On success it marks the slot before releasing
-// the lock so concurrent callers don't double-index the same project.
-func (s *Sensor) claimSlot(root string) bool {
+// claimSlot returns the reservation timestamp and true when the caller should
+// index, or false when the TTL gate is still in effect.
+//
+// The timestamp is stored before releasing the lock so concurrent callers
+// don't double-index the same project. If the write fails, indexAndWrite
+// clears that exact reservation so the next hook can retry instead of being
+// suppressed for IndexTTL.
+func (s *Sensor) claimSlot(root string) (time.Time, bool) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if last, ok := s.lastAt[root]; ok && time.Since(last) < IndexTTL {
-		return false
+		return time.Time{}, false
 	}
-	s.lastAt[root] = time.Now()
-	return true
+	now := time.Now()
+	s.lastAt[root] = now
+	return now, true
 }
 
-func (s *Sensor) indexAndWrite(ctx context.Context, root string) {
+// clearClaim deletes a failed reservation if no newer caller has claimed the
+// same root since. This keeps a timeout/failure from poisoning the TTL gate.
+func (s *Sensor) clearClaim(root string, claimedAt time.Time) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if last, ok := s.lastAt[root]; ok && last.Equal(claimedAt) {
+		delete(s.lastAt, root)
+	}
+}
+
+func (s *Sensor) indexAndWrite(ctx context.Context, root string, claimedAt time.Time) {
 	state := Index(projectLabel(root), root)
 	if _, hasDeadline := ctx.Deadline(); !hasDeadline {
 		var cancel context.CancelFunc
@@ -97,6 +114,7 @@ func (s *Sensor) indexAndWrite(ctx context.Context, root string) {
 		defer cancel()
 	}
 	if err := s.writer.Write(ctx, state); err != nil {
+		s.clearClaim(root, claimedAt)
 		s.logger.Debug("project sensor: write failed", "err", err, "project", state.Project)
 	}
 }
