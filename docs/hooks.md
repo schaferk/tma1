@@ -54,6 +54,27 @@ The installer recognises legacy entries (no `id` field) by command path
 and rewrites them in place — it won't add a second TMA1 entry that runs
 the same script twice.
 
+### Why every matcher is `""`
+
+The plan calls for `PostToolUse` to register with
+`matcher: "Edit|Write|Bash|Read"`. The shipped installer uses `""`
+(all tools) for every event and pushes the dispatch decision to the
+server. The trade-off:
+
+- **Pro**: extending support to a new tool — e.g. a future
+  `WebFetch` rule — needs no change to the user's `settings.json`. The
+  server-side rule decides what's interesting; no client-side config
+  drift.
+- **Con**: every tool's PostToolUse fires a hook event the server
+  promptly returns empty for. The script costs a curl + JSON ingest +
+  empty response — typically < 5 ms on localhost, but it does show up
+  in `hookTelemetry` flush logs as the per-event call count.
+
+When the cost becomes a real concern (e.g. heavy `Read` storms), the
+right fix is filtering server-side in `generateInjection` rather than
+narrowing matchers — keeps the data path and the dispatch logic in one
+place.
+
 ## Important runtime details
 
 ### Stop hook loop guard
@@ -93,6 +114,19 @@ Set `TMA1_DISABLE_INJECTION=1` on the `tma1-server` process to make all
 hook responses empty. CC keeps firing hooks (the script still POSTs,
 the server still writes events to GreptimeDB), but nothing is injected
 into the agent's context.
+
+### Opt-in: `.tma1-context.md` file callback
+
+The plan lists a `.tma1-context.md` "file callback" as the fallback
+for non-MCP agents (Aider, Cursor) that read context via their own
+Read tool rather than via MCP. The implementation ships it but
+**leaves it off by default**, gated behind `TMA1_ENABLE_FILE_CALLBACK=1`.
+
+Why off: dogfooding showed it was net-negative for MCP-equipped users
+— writing the file on every hook fired the git sensor's own watcher,
+producing self-noise the attribution layer then had to filter back
+out. Set the env var when running a CC-less agent that genuinely needs
+the file.
 
 ### Cache invalidation on every event
 

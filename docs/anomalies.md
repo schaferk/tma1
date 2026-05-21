@@ -94,6 +94,22 @@ A rule that fails its gate is a candidate for severity adjustment,
 suppression-window tightening, or removal. The bar for adding new
 rules is gate compliance first; precision second; volume third.
 
+## Dashboard delivery: polling, not SSE
+
+The plan originally called for SSE broadcast of anomaly toasts. The
+implementation polls `/api/anomalies` every 10 s from both the
+Anomalies dashboard tab and the Agent Canvas overlay. The Detector
+caches its result for 30 s per session (`anomalyCache.ttl`), so the
+client-side poll cadence amortises against the cache: most polls
+short-circuit on the cached set, and the worst-case staleness is
+~10 s — well under the human review threshold.
+
+Why polling won: the SSE path required a second broadcast channel
+parallel to `/api/hooks/stream` (which is reserved for tool events),
+with its own subscriber lifecycle and reconnect logic. Anomalies fire
+at < 5 / kind / day per the validation budget — a steady-state poll is
+cheaper than maintaining the push channel.
+
 ## Tuning knobs
 
 | Env var | Default | Effect |
