@@ -1200,3 +1200,139 @@ tr.active-trace td { background: var(--bg-hover); }
   header, .tabs, .tab-content { padding-left: 16px; padding-right: 16px; }
   .waterfall-label { width: 140px !important; }
 }
+
+/* ─── Anomalies ─────────────────────────────────────────────────────── */
+
+/* Spacing inside a <details> wrapping the anom rows (used in sessions
+   detail panel — visually aligns with sibling .sess-section blocks). */
+.anom-detail-list { padding-top: 4px; }
+
+/* Compact section header (matches sess-detail-toolbar typography). */
+.anom-section-title {
+  font-size: 11px;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  color: var(--text-muted);
+  padding: 8px 0 6px;
+  margin-top: 4px;
+  border-top: 1px solid var(--border);
+}
+.anom-section-title .count { color: var(--text-dim); font-weight: 400; }
+
+/* Compact row used inside the session insights panel (320px wide). */
+.anom-row {
+  display: block;
+  padding: 6px 8px;
+  margin-bottom: 4px;
+  background: var(--bg-card);
+  border-left: 3px solid var(--border-strong);
+  border-radius: 3px;
+  font-size: 12px;
+  line-height: 1.45;
+  cursor: pointer;
+  transition: background 0.1s;
+}
+.anom-row:hover { background: var(--bg-hover); }
+.anom-row.sev-high { border-left-color: var(--red); }
+.anom-row.sev-medium { border-left-color: var(--orange); }
+.anom-row.sev-low { border-left-color: var(--text-dim); }
+
+.anom-row-head {
+  display: flex;
+  gap: 6px;
+  align-items: baseline;
+  margin-bottom: 2px;
+}
+.anom-pill {
+  font-size: 9px;
+  font-weight: 600;
+  letter-spacing: 0.05em;
+  padding: 1px 5px;
+  border-radius: 3px;
+  text-transform: uppercase;
+  flex-shrink: 0;
+}
+.anom-pill.sev-high { background: var(--red-bg, rgba(248,81,73,0.12)); color: var(--red); }
+.anom-pill.sev-medium { background: rgba(240,136,62,0.12); color: var(--orange); }
+.anom-pill.sev-low { background: var(--bg-hover); color: var(--text-dim); }
+
+/* Session-id chip in the top-level Anomalies tab — click jumps into the
+   session detail overlay. Styled like a faint monospace link. */
+.anom-sess-link {
+  margin-left: auto;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 10px;
+  color: var(--text-dim);
+  cursor: pointer;
+  padding: 1px 6px;
+  border: 1px solid transparent;
+  border-radius: 3px;
+  transition: color 0.1s, border-color 0.1s, background 0.1s;
+}
+.anom-sess-link:hover {
+  color: var(--blue);
+  border-color: var(--border);
+  background: var(--bg);
+}
+
+.anom-kind {
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 11px;
+  color: var(--text);
+  font-weight: 500;
+}
+.anom-evidence {
+  color: var(--text-muted);
+  font-size: 11px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  display: -webkit-box;
+  -webkit-line-clamp: 2;
+  -webkit-box-orient: vertical;
+}
+
+/* Expanded detail (revealed when .open). Hidden by default. */
+.anom-detail {
+  display: none;
+  margin-top: 4px;
+  padding-top: 4px;
+  border-top: 1px dashed var(--border);
+  font-size: 11px;
+  color: var(--text-muted);
+}
+.anom-row.open .anom-detail { display: block; }
+.anom-row.open .anom-evidence { display: block; -webkit-line-clamp: unset; }
+.anom-detail .anom-suggestion { color: var(--blue); margin-bottom: 2px; }
+.anom-detail .anom-files code {
+  font-size: 10px;
+  background: var(--bg);
+  padding: 1px 4px;
+  border-radius: 2px;
+  margin-right: 4px;
+  word-break: break-all;
+}
+
+/* Top-level Anomalies tab — same row primitive but a touch larger spacing. */
+#view-anomalies #anom-list .anom-row { font-size: 13px; padding: 8px 12px; }
+#view-anomalies #anom-list .anom-evidence { font-size: 12px; -webkit-line-clamp: 3; }
+#view-anomalies #anom-list .anom-detail { font-size: 12px; }
+#view-anomalies #anom-list .anom-kind { font-size: 12px; }
+
+/* The toolbar above #anom-list reuses .sess-detail-toolbar styling but
+   sits in a non-sessions view, so respec the gap. */
+#view-anomalies .filter-row {
+  display: flex;
+  gap: 8px;
+  align-items: center;
+  padding: 0 0 12px;
+}
+#view-anomalies .filter-row select,
+#view-anomalies .filter-row .filter-btn {
+  background: var(--bg-card);
+  border: 1px solid var(--border);
+  color: var(--text);
+  padding: 5px 10px;
+  border-radius: 6px;
+  font-size: 12px;
+}
+#view-anomalies .filter-row .filter-btn:hover { background: var(--bg-hover); border-color: var(--blue); cursor: pointer; }

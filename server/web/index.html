@@ -1273,6 +1273,43 @@
     </div>
   </div><!-- /view-sessions -->
 
+  <!-- ========================= ANOMALIES VIEW ========================= -->
+  <div id="view-anomalies" style="display:none">
+    <div class="cards">
+      <div class="card">
+        <div class="label">Total</div>
+        <div class="value" id="anom-val-total">&mdash;</div>
+      </div>
+      <div class="card">
+        <div class="label">HIGH</div>
+        <div class="value" id="anom-val-high" style="color:#e11d48">&mdash;</div>
+      </div>
+      <div class="card">
+        <div class="label">MEDIUM</div>
+        <div class="value" id="anom-val-medium" style="color:#f59e0b">&mdash;</div>
+      </div>
+      <div class="card">
+        <div class="label">Sessions affected</div>
+        <div class="value" id="anom-val-sessions">&mdash;</div>
+      </div>
+    </div>
+    <div class="section">
+      <div class="filter-row" style="margin-bottom:8px">
+        <select id="anom-filter-sev" onchange="anom_render()">
+          <option value="">All severities</option>
+          <option value="high">HIGH only</option>
+          <option value="medium">MEDIUM only</option>
+          <option value="low">LOW only</option>
+        </select>
+        <button class="filter-btn" onclick="anom_load()">Refresh</button>
+        <label style="margin-left:auto;font-size:0.9em;color:#666">
+          <input type="checkbox" id="anom-autorefresh" checked /> auto-refresh (10s)
+        </label>
+      </div>
+      <div id="anom-list" style="display:flex;flex-direction:column;gap:8px"></div>
+    </div>
+  </div><!-- /view-anomalies -->
+
   <!-- ========================= PROMPTS VIEW ========================= -->
   <div id="view-prompts" style="display:none">
     <div class="cards">
@@ -1503,6 +1540,7 @@
   <script src="/js/sessions.js"></script>
   <script src="/js/agent-canvas.js"></script>
   <script src="/js/prompts.js"></script>
+  <script src="/js/anomalies.js"></script>
   <script src="/js/views.js"></script>
 </body>
 </html>

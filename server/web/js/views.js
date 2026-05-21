@@ -172,6 +172,8 @@ async function switchView(viewId, skipHash) {
   document.getElementById('view-traces').style.display = 'none';
   document.getElementById('view-sessions').style.display = 'none';
   document.getElementById('view-prompts').style.display = 'none';
+  var anomEl = document.getElementById('view-anomalies');
+  if (anomEl) anomEl.style.display = 'none';
   document.getElementById('setup-notice').style.display = 'none';
 
   currentView = viewId;
@@ -204,6 +206,12 @@ async function switchView(viewId, skipHash) {
       hasData = await pr_loadCards();
       await pr_checkLLM();
       if (hasData) pr_loadOverview();
+    } else if (viewId === 'anomalies') {
+      // No "no-data" gating here — the view itself shows "No anomalies"
+      // when empty, which is a useful signal in its own right.
+      hasData = true;
+      await anom_load();
+      anom_startAutorefresh();
     } else if (viewId === 'traces') {
       await loadPricing();
       hasData = await loadMetrics();
@@ -243,6 +251,9 @@ async function initViews() {
   if (dataSources.hasGenAITraces) views.push({ id: 'traces', label: t('view.otel_genai') });
   if (dataSources.hasHookEvents) views.push({ id: 'sessions', label: t('view.sessions') });
   if (dataSources.hasMessages) views.push({ id: 'prompts', label: t('view.prompts') });
+  // Anomalies tab shows whenever there's hook event data — the anomaly
+  // engine derives from tma1_hook_events.
+  if (dataSources.hasHookEvents) views.push({ id: 'anomalies', label: 'Anomalies' });
 
   if (views.length === 0) {
     document.getElementById('setup-notice').style.display = 'block';
