@@ -21,7 +21,12 @@ func (d *Detector) logEmits(sessionID string, anomalies []Anomaly) {
 	}
 	for _, a := range anomalies {
 		a := a // capture
-		go d.insertEmit(sessionID, a)
+		fn := func() { d.insertEmit(sessionID, a) }
+		if d.submit != nil {
+			d.submit(fn)
+		} else {
+			go fn()
+		}
 	}
 }
 

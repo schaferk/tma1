@@ -10,6 +10,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/tma1-ai/tma1/server/internal/pathutil"
 )
 
 // Severity levels in increasing urgency.
@@ -62,6 +64,17 @@ type Detector struct {
 	client *Client
 	cache  *anomalyCache
 	logger *slog.Logger
+	// submit, when set, dispatches per-anomaly INSERTs via a bounded
+	// queue (Server wires it to a writeq.Sem). nil falls back to a raw
+	// `go fn()` so tests + standalone callers still work.
+	submit func(func()) bool
+}
+
+// SetSubmit installs a bounded dispatcher for the emit-log INSERTs. The
+// returned bool from submit isn't consulted by the Detector — callers
+// log drops via their own queue's counter.
+func (d *Detector) SetSubmit(submit func(func()) bool) {
+	d.submit = submit
 }
 
 // NewDetector returns a Detector targeting localhost:<httpPort>.
@@ -219,9 +232,9 @@ func (d *Detector) resolverReReadHappened(ctx context.Context, sessionID string,
 		 WHERE session_id = '%s'
 		   AND event_type = 'PreToolUse' AND tool_name = 'Read'
 		   AND ts > %d
-		   AND (tool_file_path = '%s' OR tool_input LIKE '%%"file_path":"%s"%%')`,
+		   AND (tool_file_path = '%s' OR tool_input LIKE '%%"file_path":"%s"%%' ESCAPE '!')`,
 		escapeSQL(sessionID), lastEmitted.UnixMilli(),
-		escapeSQL(fp), escapeSQL(fp),
+		escapeSQL(fp), escapeSQLLike(fp),
 	)
 	_, rows, err := d.client.Query(ctx, sql)
 	if err != nil || len(rows) == 0 {
@@ -292,11 +305,11 @@ func (d *Detector) ruleBuildBrokenAfterMyEdit(ctx context.Context, sessionID str
 			 WHERE session_id = '%s'
 			   AND event_type = 'PostToolUseFailure' AND tool_name = 'Bash'
 			   AND ts BETWEEN %d AND %d
-			   AND (tool_input LIKE '%%%s%%' OR tool_result LIKE '%%%s%%')`,
+			   AND (tool_input LIKE '%%%s%%' ESCAPE '!' OR tool_result LIKE '%%%s%%' ESCAPE '!')`,
 			escapeSQL(sessionID),
 			lastEdit.Add(-10*time.Minute).UnixMilli(),
 			lastEdit.Add(10*time.Minute).UnixMilli(),
-			escapeSQL(base), escapeSQL(base),
+			escapeSQLLike(base), escapeSQLLike(base),
 		)
 		_, fRows, err := d.client.Query(ctx, failuresSQL)
 		if err != nil || len(fRows) == 0 {
@@ -715,18 +728,14 @@ func isDocFile(base string) bool {
 
 // basename returns the last path segment of p, used to keep the LIKE
 // pattern short and likely to match how build tools print errors.
+// Uses pathutil so a Windows agent's file_path lifts the right name.
 func basename(p string) string {
-	for i := len(p) - 1; i >= 0; i-- {
-		if p[i] == '/' {
-			return p[i+1:]
-		}
-	}
-	return p
+	return pathutil.Basename(p)
 }
 
 // projectBasename: basename of the .git-preferred project root for cwd.
 func projectBasename(cwd string) string {
-	cwd = strings.TrimRight(cwd, "/")
+	cwd = strings.TrimRight(cwd, `/\`)
 	if cwd == "" {
 		return ""
 	}
@@ -734,10 +743,7 @@ func projectBasename(cwd string) string {
 	if root == "" {
 		return ""
 	}
-	if i := strings.LastIndex(root, "/"); i >= 0 {
-		return root[i+1:]
-	}
-	return root
+	return pathutil.Basename(root)
 }
 
 // ───────────────────────────────────────────────────────────────────────

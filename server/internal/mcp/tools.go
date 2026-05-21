@@ -8,6 +8,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/tma1-ai/tma1/server/internal/pathutil"
 	"github.com/tma1-ai/tma1/server/internal/perception"
 )
 
@@ -323,9 +324,9 @@ func (t ExternalChangesTool) Call(ctx context.Context, args map[string]any) (Cal
 		return CallToolResult{Content: []ContentBlock{{Type: "text", Text: string(out)}}}, nil
 	}
 
-	sinceMin := 30
-	if v, ok := args["since_min"].(float64); ok && v > 0 {
-		sinceMin = int(v)
+	sinceMin := intArg(args, "since_min", 30)
+	if sinceMin <= 0 {
+		sinceMin = 30
 	}
 	since := time.Now().Add(-time.Duration(sinceMin) * time.Minute)
 
@@ -401,25 +402,16 @@ func (t BuildStatusTool) Call(ctx context.Context, _ map[string]any) (CallToolRe
 	return CallToolResult{Content: []ContentBlock{{Type: "text", Text: string(out)}}}, nil
 }
 
-// projectFromCwd mirrors perception.BuildBundle's project derivation: take
-// the basename of ResolveProjectRoot(cwd). Kept here so MCP doesn't have to
-// import an additional helper.
+// projectFromCwd mirrors perception.BuildBundle's project derivation:
+// basename of ResolveProjectRoot(cwd). pathutil.Basename handles both
+// POSIX and Windows separators so MCP responds the same for agents on
+// either OS.
 func projectFromCwd(cwd string) string {
 	root := perception.ResolveProjectRoot(cwd)
 	if root == "" {
 		return ""
 	}
-	idx := -1
-	for i := len(root) - 1; i >= 0; i-- {
-		if root[i] == '/' {
-			idx = i
-			break
-		}
-	}
-	if idx >= 0 {
-		return root[idx+1:]
-	}
-	return root
+	return pathutil.Basename(root)
 }
 
 // AnomaliesTool exposes the perception Detector directly so an agent can

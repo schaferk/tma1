@@ -249,9 +249,17 @@ func (s *Server) handleHooks(w http.ResponseWriter, r *http.Request) {
 	if !skipPersist {
 		// Async INSERT into GreptimeDB — never blocks the response. Skipped
 		// in test mode (greptimeHTTPPort == 0) to keep test data out of the
-		// real database.
+		// real database. writeSem caps concurrent in-flight writes so a
+		// burst (subagent storm, replay) can't fork-bomb the process; drops
+		// are logged once at WARN so they show up in telemetry.
 		if s.greptimeHTTPPort > 0 {
-			go s.insertHookEvent(payload, agentSource, toolInput, toolResult)
+			if !s.writeSem.Go(func() {
+				s.insertHookEvent(payload, agentSource, toolInput, toolResult)
+			}) {
+				s.logger.Warn("write semaphore full, dropping hook insert",
+					"event", payload.HookEventName,
+					"dropped_total", s.writeSem.Dropped())
+			}
 		}
 
 		// Broadcast to SSE subscribers for live canvas.

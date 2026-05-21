@@ -7,6 +7,8 @@ import (
 	"log/slog"
 	"strings"
 	"time"
+
+	"github.com/tma1-ai/tma1/server/internal/pathutil"
 )
 
 // Bundle is the complete perception snapshot returned to agents.
@@ -128,14 +130,11 @@ func (b *Bundler) BuildBundle(ctx context.Context, sessionID, cwd string) *Bundl
 // "/Users/dennis/programming/go/tma1/server" → "tma1"
 // "/Users/dennis/programming/go/tma1"        → "tma1"
 func projectName(cwd string) string {
-	root := ResolveProjectRoot(strings.TrimRight(cwd, "/"))
+	root := ResolveProjectRoot(strings.TrimRight(cwd, `/\`))
 	if root == "" {
 		return ""
 	}
-	if idx := strings.LastIndex(root, "/"); idx >= 0 {
-		return root[idx+1:]
-	}
-	return root
+	return pathutil.Basename(root)
 }
 
 // RenderSummary returns a markdown summary suitable for hook injection.
@@ -321,24 +320,39 @@ func relativeAge(t time.Time) string {
 func oneLine(s string, maxLen int) string {
 	s = strings.ReplaceAll(s, "\r\n", "\n")
 	s = strings.ReplaceAll(s, "\n", " · ")
-	// Collapse multiple spaces (keep " · " separators intact).
-	for strings.Contains(s, "  ") {
-		s = strings.ReplaceAll(s, "  ", " ")
+	// Single-pass whitespace collapse: emit each rune unless the
+	// previous one was already a space. Replaces the prior O(n²)
+	// `for strings.Contains(s, "  ")` loop.
+	var b strings.Builder
+	b.Grow(len(s))
+	prevSpace := false
+	for _, r := range s {
+		if r == ' ' || r == '\t' {
+			if !prevSpace {
+				b.WriteByte(' ')
+				prevSpace = true
+			}
+			continue
+		}
+		b.WriteRune(r)
+		prevSpace = false
 	}
-	s = strings.TrimSpace(s)
-	if len(s) > maxLen {
-		s = s[:maxLen] + "…"
+	out := strings.TrimSpace(b.String())
+	if len(out) > maxLen {
+		out = out[:maxLen] + "…"
 	}
-	return s
+	return out
 }
 
-// shortPath collapses long absolute paths to "…/parent/file" for terser output.
+// shortPath collapses long absolute paths to "…/parent/file" for terser
+// output. Splits on both '/' and '\' so a Windows agent's path renders
+// the same as a POSIX one.
 func shortPath(p string) string {
 	const maxLen = 60
 	if len(p) <= maxLen {
 		return p
 	}
-	parts := strings.Split(p, "/")
+	parts := pathutil.Split(p)
 	if len(parts) <= 3 {
 		return p
 	}

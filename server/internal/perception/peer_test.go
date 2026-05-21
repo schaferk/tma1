@@ -34,13 +34,17 @@ func TestPeerCwdFilter(t *testing.T) {
 		{"", ""},
 		{"   ", ""},
 		// Absolute path: anchored prefix, not basename. /foo must not match /foobar.
-		{"/Users/dennis/tma1", "AND (cwd = '/Users/dennis/tma1' OR cwd LIKE '/Users/dennis/tma1/%') "},
+		{"/Users/dennis/tma1", "AND (cwd = '/Users/dennis/tma1' OR cwd LIKE '/Users/dennis/tma1/%' ESCAPE '!') "},
 		// Trailing slash normalized.
-		{"/Users/dennis/tma1/", "AND (cwd = '/Users/dennis/tma1' OR cwd LIKE '/Users/dennis/tma1/%') "},
-		// Bare name falls back to legacy basename LIKE.
-		{"tma1", "AND cwd LIKE '%/tma1%' "},
+		{"/Users/dennis/tma1/", "AND (cwd = '/Users/dennis/tma1' OR cwd LIKE '/Users/dennis/tma1/%' ESCAPE '!') "},
+		// Bare name falls back to legacy basename LIKE (with ESCAPE).
+		{"tma1", "AND cwd LIKE '%/tma1%' ESCAPE '!' "},
 		// SQL injection in the input gets escaped (single quote doubled).
-		{"foo'bar", "AND cwd LIKE '%/foo''bar%' "},
+		{"foo'bar", "AND cwd LIKE '%/foo''bar%' ESCAPE '!' "},
+		// LIKE wildcards in project name are neutralised, not over-matched.
+		{"a%b_c", "AND cwd LIKE '%/a!%b!_c%' ESCAPE '!' "},
+		// Existing '!' in input gets doubled so it remains a literal.
+		{"go!foo", "AND cwd LIKE '%/go!!foo%' ESCAPE '!' "},
 	}
 	for _, c := range cases {
 		if got := peerCwdFilter(c.in); got != c.want {

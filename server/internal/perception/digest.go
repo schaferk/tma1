@@ -4,6 +4,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"sort"
+	"strconv"
 	"strings"
 )
 
@@ -66,7 +67,7 @@ func digestBuild(bs *BuildStatus) string {
 	// freshly-updated timestamps don't count as a change.
 	exit := "running"
 	if bs.LastExitCode != nil {
-		exit = "exit=" + intToString(*bs.LastExitCode)
+		exit = "exit=" + strconv.Itoa(*bs.LastExitCode)
 	}
 	errKey := ""
 	if bs.LastErrorMessage != "" {
@@ -117,25 +118,3 @@ func shortHash(s string) string {
 	return hex.EncodeToString(h[:8])
 }
 
-func intToString(n int) string {
-	if n == 0 {
-		return "0"
-	}
-	// Avoid importing strconv for one call site.
-	neg := n < 0
-	if neg {
-		n = -n
-	}
-	var buf [16]byte
-	i := len(buf)
-	for n > 0 {
-		i--
-		buf[i] = byte('0' + n%10)
-		n /= 10
-	}
-	if neg {
-		i--
-		buf[i] = '-'
-	}
-	return string(buf[i:])
-}

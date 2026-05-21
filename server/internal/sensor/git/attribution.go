@@ -9,6 +9,8 @@ import (
 	"net/url"
 	"strings"
 	"time"
+
+	"github.com/tma1-ai/tma1/server/internal/pathutil"
 )
 
 // AttributionWindow is the ±window we look at hook events to classify a
@@ -87,8 +89,8 @@ func (a *HookAttributor) Classify(ctx context.Context, filePath string, when tim
 		 WHERE event_type = 'PreToolUse'
 		   AND tool_name = 'Bash'
 		   AND ts BETWEEN %d AND %d
-		   AND tool_input LIKE '%%%s%%'`,
-		low, high, escapeSQLLiteral(base),
+		   AND tool_input LIKE '%%%s%%' ESCAPE '!'`,
+		low, high, escapeSQLLikeLiteral(base),
 	)
 	if count, err := a.queryCount(ctx, bashSQL); err != nil {
 		return AttributionUnknown
@@ -100,14 +102,10 @@ func (a *HookAttributor) Classify(ctx context.Context, filePath string, when tim
 }
 
 // basenameOf returns the last path segment of p ("/a/b/c.go" → "c.go").
-// Empty input → empty output.
+// pathutil handles both POSIX and Windows separators because file_path
+// values come from agents on any OS.
 func basenameOf(p string) string {
-	for i := len(p) - 1; i >= 0; i-- {
-		if p[i] == '/' {
-			return p[i+1:]
-		}
-	}
-	return p
+	return pathutil.Basename(p)
 }
 
 func (a *HookAttributor) queryCount(ctx context.Context, sql string) (int, error) {
@@ -163,5 +161,16 @@ func (a *HookAttributor) queryCount(ctx context.Context, sql string) (int, error
 }
 
 func escapeSQLLiteral(s string) string {
+	return strings.ReplaceAll(s, "'", "''")
+}
+
+// escapeSQLLikeLiteral escapes s for use as a LIKE pattern literal. Pair
+// with `ESCAPE '!'` in the SQL clause; '!' as the escape character
+// avoids the SQL-string-literal vs Go-string-literal backslash double
+// escape that '\' would otherwise require.
+func escapeSQLLikeLiteral(s string) string {
+	s = strings.ReplaceAll(s, "!", "!!")
+	s = strings.ReplaceAll(s, "%", "!%")
+	s = strings.ReplaceAll(s, "_", "!_")
 	return strings.ReplaceAll(s, "'", "''")
 }

@@ -8,6 +8,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/tma1-ai/tma1/server/internal/pathutil"
 )
 
 // IndexTTL — how long an indexed snapshot is considered "fresh". When
@@ -166,9 +168,5 @@ func findAncestorWith(start, marker string) string {
 }
 
 func projectLabel(root string) string {
-	root = strings.TrimRight(root, "/")
-	if i := strings.LastIndex(root, "/"); i >= 0 {
-		return root[i+1:]
-	}
-	return root
+	return pathutil.Basename(strings.TrimRight(root, `/\`))
 }

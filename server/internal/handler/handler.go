@@ -20,6 +20,7 @@ import (
 	"github.com/tma1-ai/tma1/server/internal/sensor/git"
 	"github.com/tma1-ai/tma1/server/internal/sensor/project"
 	"github.com/tma1-ai/tma1/server/internal/transcript"
+	"github.com/tma1-ai/tma1/server/internal/writeq"
 )
 
 // Server holds shared state for all HTTP handlers.
@@ -39,6 +40,7 @@ type Server struct {
 	hookTelemetry     *hookTelemetry
 	gitSensor         *git.Sensor
 	projectSensor     *project.Sensor
+	writeSem          *writeq.Sem
 	llmConfig         LLMConfig
 	mu                sync.RWMutex
 	dataDir           string
@@ -77,7 +79,10 @@ func New(greptimeHTTPPort int, tma1Port string, webFS http.FileSystem, logger *s
 		)
 		projectSensor = project.NewSensor(project.NewGreptimeStore(greptimeHTTPPort), logger)
 	}
-	return &Server{
+	// 64 in-flight background writes — enough for a subagent storm,
+	// small enough that a stuck GreptimeDB can't fork-bomb us.
+	writeSem := writeq.New(64)
+	srv := &Server{
 		greptimeHTTPPort:  greptimeHTTPPort,
 		tma1Port:          tma1Port,
 		logger:            logger,
@@ -93,12 +98,20 @@ func New(greptimeHTTPPort int, tma1Port string, webFS http.FileSystem, logger *s
 		hookTelemetry:     newHookTelemetry(logger),
 		gitSensor:         gitSensor,
 		projectSensor:     projectSensor,
+		writeSem:          writeSem,
 		llmConfig:         llm,
 		dataDir:           sc.DataDir,
 		dataTTL:           sc.DataTTL,
 		queryConcurrency:  clampQueryConcurrency(sc.QueryConcurrency),
 		logLevelVar:       sc.LogLevelVar,
 	}
+	// Route Detector emit-log INSERTs through the same semaphore so
+	// hook handlers and anomaly emits share a single capacity budget
+	// against GreptimeDB.
+	if bundler != nil {
+		bundler.Detector().SetSubmit(writeSem.Go)
+	}
+	return srv
 }
 
 // StartBackgroundTasks launches long-running goroutines owned by the Server

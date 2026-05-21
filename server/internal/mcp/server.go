@@ -27,8 +27,11 @@ const (
 // ServerVersion can be overridden by callers (e.g. main package sets it from build ldflags).
 var ServerVersion = "dev"
 
-// ToolHandler implements a single MCP tool. Implementations must be safe for
-// concurrent use because clients may pipeline requests.
+// ToolHandler implements a single MCP tool. The server processes JSON-RPC
+// frames serially in Run's scanner loop, so individual Call invocations
+// don't race each other within one Server. They can still race the host
+// process: every tma1 Bundler/Detector method called from a tool is
+// expected to be safe for concurrent use.
 type ToolHandler interface {
 	Definition() Tool
 	Call(ctx context.Context, args map[string]any) (CallToolResult, error)

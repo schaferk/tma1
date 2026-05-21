@@ -215,10 +215,10 @@ func peerCwdFilter(project string) string {
 		root := strings.TrimRight(project, "/")
 		// Match the root exactly OR any subdirectory under it. Anchoring
 		// with the trailing slash prevents `/foo` from matching `/foobar`.
-		return fmt.Sprintf("AND (cwd = '%s' OR cwd LIKE '%s/%%') ",
-			escapeSQL(root), escapeSQL(root))
+		return fmt.Sprintf("AND (cwd = '%s' OR cwd LIKE '%s/%%' ESCAPE '!') ",
+			escapeSQL(root), escapeSQLLike(root))
 	}
-	return fmt.Sprintf("AND cwd LIKE '%%/%s%%' ", escapeSQL(project))
+	return fmt.Sprintf("AND cwd LIKE '%%/%s%%' ESCAPE '!' ", escapeSQLLike(project))
 }
 
 // enrichPeerSession fills Messages / RecentToolNames / FilesTouched /

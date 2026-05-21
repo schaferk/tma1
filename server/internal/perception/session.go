@@ -221,6 +221,23 @@ func escapeSQL(s string) string {
 	return strings.ReplaceAll(s, "'", "''")
 }
 
+// escapeSQLLike escapes s for use as a literal inside a LIKE pattern.
+// Pair with `ESCAPE '!'` in the SQL clause. Why '!': avoids the
+// backslash/single-quote gymnastics that come with the conventional
+// '\' escape (Go string literal → SQL string literal → LIKE pattern is
+// three rewrites deep, easy to get wrong). '!' is allowed in
+// file_paths but very rare, so collisions are negligible.
+//
+// Use this whenever an unsanitised file_path, command, project name,
+// or other agent-controlled string is interpolated into a LIKE pattern
+// — otherwise a path containing '%' or '_' silently over-matches.
+func escapeSQLLike(s string) string {
+	s = strings.ReplaceAll(s, "!", "!!")
+	s = strings.ReplaceAll(s, "%", "!%")
+	s = strings.ReplaceAll(s, "_", "!_")
+	return strings.ReplaceAll(s, "'", "''")
+}
+
 func indexCols(cols []string) map[string]int {
 	m := make(map[string]int, len(cols))
 	for i, c := range cols {
