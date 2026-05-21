@@ -45,6 +45,13 @@ var AgentCanvas = (function () {
   var replaySpeed = 1, replayPaused = false;
   var replayStartTs = 0, replayEndTs = 0, replayCurrentTs = 0;
 
+  // Anomalies (Plan §Phase 1.5): markers on the replay scrubber + a
+  // top-right badge in live mode. Polled every 10s while the canvas
+  // is open; the Detector caches detection results for 30s so polling
+  // at 10s gives near-real-time updates without extra server push.
+  var anomalies = [], anomalyPollTimer = null;
+  var ANOM_COLORS = { high: '#ff5566', medium: '#ffbb44', low: '#8b949e' };
+
   var agentToolCounts = {};
 
   // ── Scene Graph ──────────────────────────────────────────────
@@ -480,6 +487,17 @@ var AgentCanvas = (function () {
         var dp = (replayEvents[di].ts - replayStartTs) / (replayEndTs - replayStartTs);
         ctx.beginPath(); ctx.arc(barX + dp * barW, barY + 2, 2, 0, 6.28); ctx.fill();
       }
+      // Anomaly markers on the scrubber — colored vertical ticks. HIGH
+      // is loudest (red, tall); LOW is subtle. Drawn under the playhead
+      // so a marker right at the cursor isn't obscured.
+      for (var ai = 0; ai < anomalies.length; ai++) {
+        var aTs = anomalies[ai].ts;
+        if (aTs < replayStartTs || aTs > replayEndTs) continue;
+        var ap = (aTs - replayStartTs) / (replayEndTs - replayStartTs);
+        ctx.fillStyle = ANOM_COLORS[anomalies[ai].severity] || ANOM_COLORS.low;
+        ctx.fillRect(barX + ap * barW - 1, barY - 5, 2, 14);
+      }
+
       var pp = Math.max(0, Math.min(1, (replayCurrentTs - replayStartTs) / (replayEndTs - replayStartTs)));
       ctx.fillStyle = '#66ccff';
       ctx.beginPath(); ctx.roundRect(barX + pp * barW - 2, barY - 4, 4, 12, 2); ctx.fill();
@@ -512,6 +530,41 @@ var AgentCanvas = (function () {
       ctx.fillStyle = '#66ffaa'; ctx.font = 'bold 14px system-ui,sans-serif';
       ctx.fillText('$' + displayCost.toFixed(4), 16, 34);
     }
+
+    // Anomaly count badge (top-right). Reads "⚠ N high · M med · K low"
+    // so a glance at the canvas surfaces how loud the session is right
+    // now. Colors mirror the scrubber markers.
+    if (anomalies.length > 0) {
+      var counts = { high: 0, medium: 0, low: 0 };
+      for (var ci = 0; ci < anomalies.length; ci++) {
+        counts[anomalies[ci].severity] = (counts[anomalies[ci].severity] || 0) + 1;
+      }
+      var parts = [];
+      if (counts.high) parts.push({ n: counts.high, label: 'high', color: ANOM_COLORS.high });
+      if (counts.medium) parts.push({ n: counts.medium, label: 'med', color: ANOM_COLORS.medium });
+      if (counts.low) parts.push({ n: counts.low, label: 'low', color: ANOM_COLORS.low });
+      ctx.font = 'bold 12px system-ui,sans-serif';
+      ctx.textAlign = 'right'; ctx.textBaseline = 'top';
+      var anomBadgeX = w - 16, anomBadgeY = 16;
+      ctx.fillStyle = '#cccccc';
+      ctx.fillText('⚠', anomBadgeX - measureParts(ctx, parts) - 8, anomBadgeY);
+      for (var partIdx = 0; partIdx < parts.length; partIdx++) {
+        var p = parts[parts.length - 1 - partIdx];
+        var seg = p.n + ' ' + p.label;
+        ctx.fillStyle = p.color;
+        ctx.fillText(seg, anomBadgeX, anomBadgeY);
+        anomBadgeX -= ctx.measureText(seg).width + 10;
+      }
+      ctx.textAlign = 'left'; // restore default
+    }
+  }
+
+  function measureParts(ctx, parts) {
+    var total = 0;
+    for (var i = 0; i < parts.length; i++) {
+      total += ctx.measureText(parts[i].n + ' ' + parts[i].label).width + 10;
+    }
+    return total;
   }
 
   function drawHex(c, x, y, r) {
@@ -683,6 +736,44 @@ var AgentCanvas = (function () {
   function stopLive() {
     if (eventSource) { eventSource.close(); eventSource = null; }
     if (costPollTimer) { clearInterval(costPollTimer); costPollTimer = null; }
+  }
+
+  // Anomaly poll — fetches /api/anomalies for the current session every
+  // 10s and updates the marker list. Empty when no sessionId so the
+  // canvas can be opened without one (global live view).
+  function loadAnomalies(sessionId) {
+    if (!sessionId) { anomalies = []; return; }
+    fetch('/api/anomalies?session_id=' + encodeURIComponent(sessionId))
+      .then(function (r) { return r.ok ? r.json() : { anomalies: [] }; })
+      .then(function (data) {
+        var rows = data.anomalies || [];
+        var out = [];
+        for (var i = 0; i < rows.length; i++) {
+          var a = rows[i];
+          // a.ts is RFC3339 (see handler/anomalies.go). Skip bad rows.
+          var ts = a.ts ? new Date(a.ts).getTime() : 0;
+          if (!ts || isNaN(ts)) continue;
+          out.push({
+            ts: ts,
+            severity: a.severity || 'low',
+            kind: a.kind || '',
+            suggestion: a.suggestion || '',
+          });
+        }
+        anomalies = out;
+      })
+      .catch(function () { /* ignore */ });
+  }
+
+  function startAnomalyPoll(sessionId) {
+    if (anomalyPollTimer) clearInterval(anomalyPollTimer);
+    loadAnomalies(sessionId);
+    anomalyPollTimer = setInterval(function () { loadAnomalies(sessionId); }, 10000);
+  }
+
+  function stopAnomalyPoll() {
+    if (anomalyPollTimer) { clearInterval(anomalyPollTimer); anomalyPollTimer = null; }
+    anomalies = [];
   }
 
   // B1: Cost ticker.
@@ -988,6 +1079,7 @@ var AgentCanvas = (function () {
     // Clean up any previous session to prevent animation/listener leaks.
     if (animFrame) cancelAnimationFrame(animFrame);
     stopLive();
+    stopAnomalyPoll();
     clearTimeout(replayTimer);
     if (canvas) {
       canvas.removeEventListener('click', onClick);
@@ -1033,10 +1125,15 @@ var AgentCanvas = (function () {
       costFinal = (typeof sessCurrentStats !== 'undefined' && sessCurrentStats) ? sessCurrentStats.cost || 0 : 0;
       startReplay(opts.timelineData || [], opts.speed);
     }
+    // Anomalies overlay both modes — the same SessionID drives them, so
+    // a replay-of-completed-session can still show what fired during
+    // it, and a live view ticks new ones in as detection runs.
+    if (opts.sessionId) startAnomalyPoll(opts.sessionId);
   }
 
   function close() {
     stopLive();
+    stopAnomalyPoll();
     clearTimeout(replayTimer);
     if (animFrame) cancelAnimationFrame(animFrame);
     animFrame = null;
