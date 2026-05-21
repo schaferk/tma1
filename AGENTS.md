@@ -297,3 +297,17 @@ shellcheck site/public/install.sh
 - No authentication (local-only tool)
 - No multi-tenant support
 - No TypeScript plugin (SKILL.md + shell is sufficient for MVP)
+
+<!-- tma1:start -->
+## TMA1 Context Layer
+
+TMA1 thickens the Observe step in your reasoning loop. At the start of each
+turn it injects a <tma1-context> block summarising the current session
+(tool history, tokens, current focus, recent files). Use that block when
+deciding what to do next.
+
+**You should:**
+- Read the <tma1-context> block (when present) before reasoning about the next action
+- Call the MCP tool `get_session_state` if you need a fuller view of your prior tool calls
+- Call `get_context_bundle` after compaction or when context feels stale
+<!-- tma1:end -->

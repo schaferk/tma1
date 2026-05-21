@@ -40,6 +40,22 @@ Each view gives you:
 
 OpenClaw and OTel GenAI views also have a Security tab (shell commands, prompt injection, webhook errors).
 
+## Closing the agent loop
+
+Observability is one half; the other half is feeding what TMA1 sees back into the agent's reasoning loop so it can do better work next turn. v2 ships two channels for this:
+
+**Push channel — hooks inject context into the agent's prompt stream.** Five Claude Code hook events are wired to TMA1: `UserPromptSubmit` prepends a session digest before each turn, `SessionStart` orients a fresh session with prior state and external changes, `PreCompact` carries critical state through context compaction, `PostToolUse` appends per-tool anomaly notes when needed, and `Stop` blocks termination on unresolved high-severity issues. The hook script (`~/.tma1/hooks/tma1-hook.sh`) is request–response: it POSTs the event, and whatever the server returns becomes the injection content. Fail-safe: 500 ms timeout, empty stdout on error — the agent never blocks on TMA1.
+
+**Pull channel — seven MCP stdio tools the agent can call on demand.** `get_context_bundle` is the aggregate entry point; `get_session_state` returns the full action history; `get_anomalies` lists currently-active issues; `get_external_changes` shows what changed on disk outside the agent; `get_build_status` reports the last build watcher state; `get_project_state` is the static index of the project's structure; `get_peer_sessions` lets Claude Code read recent sessions from Codex / OpenClaw / Copilot CLI on the same project.
+
+**Anomaly engine.** Six rules run on every Detect, with a per-session 10-minute suppression layer plus resolution checks (e.g. R-stale-view auto-clears when the agent re-reads the modified file). Each anomaly routes to a specific channel — `stop_block` for HIGH-severity build/test issues, `user_prompt_submit` for stale views and human-modified-during-session — so the same finding never injects twice. Three validation gates ship: `/api/anomalies/budget` (≤ 5 emits/kind/day target), `/api/anomalies/follow-rate` (≥ 30% target), and offline precision via the `tma1_anomaly_emits` table.
+
+**Cross-agent collaboration.** Inside Claude Code, `/tma1-peer codex` pulls Codex's most recent session content on the current project and feeds it directly into Claude's context — no copy-paste between terminals. `/tma1-peer copilot 2` works the same way for Copilot CLI; `/tma1-peer` alone returns the latest session from every peer agent.
+
+Setup is one command. After `curl … | TMA1_ADAPTER=claude-code bash`, the binary writes hook entries into `~/.claude/settings.json`, registers itself as an MCP server in `~/.claude.json`, drops the `/tma1-peer` skill into `~/.claude/skills/`, and adds a TMA1 block to your project's CLAUDE.md (or AGENTS.md). All idempotent — re-running install only updates what's stale.
+
+See [docs/mcp-tools.md](docs/mcp-tools.md), [docs/hooks.md](docs/hooks.md), and [docs/anomalies.md](docs/anomalies.md) for the deeper reference.
+
 ![Session Detail](site/public/screenshots/sessions-dark.webp)
 
 ![Cost & Burn Rate](site/public/screenshots/cost-dark.webp)
@@ -52,6 +68,16 @@ curl -fsSL https://tma1.ai/install.sh | bash
 
 # Windows (PowerShell)
 irm https://tma1.ai/install.ps1 | iex
+```
+
+To wire TMA1 into Claude Code (hooks + MCP server + `/tma1-peer` skill) in the same step:
+
+```bash
+# macOS / Linux
+curl -fsSL https://tma1.ai/install.sh | TMA1_ADAPTER=claude-code bash
+
+# Windows
+$env:TMA1_ADAPTER = 'claude-code'; irm https://tma1.ai/install.ps1 | iex
 ```
 
 Or build from source:
@@ -161,6 +187,11 @@ Codex requires separate per-signal endpoints; other agents can use the single `/
 | `/api/evaluate` | GET/POST | LLM prompt evaluation (availability check / single prompt) |
 | `/api/evaluate/summary` | POST | LLM batch summary (sampled prompts) |
 | `/api/settings` | GET/POST | Read/write server settings (LLM config, log level, TTL) |
+| `/api/hooks` | POST | Hook event ingest from agent adapters (Claude Code) — request-response, returns injection content |
+| `/api/hooks/stream` | GET | SSE feed of hook events for the live agent canvas |
+| `/api/anomalies` | GET | Recent anomalies across sessions (`?session_id=` to scope) |
+| `/api/anomalies/budget` | GET | Daily emit count per Kind. 1.7 gate: ≤ 5 / Kind / day |
+| `/api/anomalies/follow-rate` | GET | Did the agent take the suggested action within N tool calls? 1.7 gate: ≥ 30% |
 
 ## Configuration
 
@@ -178,6 +209,9 @@ Codex requires separate per-signal endpoints; other agents can use the single `/
 | `TMA1_LLM_API_KEY` | (empty) | API key for LLM provider (enables prompt evaluation) |
 | `TMA1_LLM_PROVIDER` | `anthropic` | LLM provider: `anthropic` or `openai` |
 | `TMA1_LLM_MODEL` | (auto) | Model override for LLM evaluation |
+| `TMA1_ADAPTER` | (empty) | Set during install to wire an agent (`claude-code`). Idempotent. |
+| `TMA1_DISABLE_INJECTION` | (unset) | When `1`, hook handlers return empty bodies — agent runs without TMA1's push channel |
+| `TMA1_CONTEXT_PRESSURE_THRESHOLD` | `100000` | Token threshold for the `context_pressure` anomaly (default ≈ 50% of Sonnet's 200k window) |
 
 ## Development
 
