@@ -5,6 +5,33 @@ import (
 	"time"
 )
 
+func TestExtractErrorLineCrossLanguage(t *testing.T) {
+	// Each entry is one synthetic error blob the build/test runner of
+	// some language might emit. We assert extractErrorLine pulls the
+	// line number that points into `base`, and returns "" when the
+	// number names a different file or is missing entirely.
+	cases := []struct {
+		name, result, base, want string
+	}{
+		{"go compiler", "./pkg/auth.go:42:7: undefined: bar", "auth.go", "42"},
+		{"clang/gcc",   "src/util.c:128: error: expected ';'", "util.c", "128"},
+		{"rustc",       "error[E0282]: type annotations needed\n  --> src/lib.rs:88:5", "lib.rs", "88"},
+		{"tsc",         "src/index.ts:14:3 - error TS2322: Type 'string' is not assignable", "index.ts", "14"},
+		{"python tb",   "Traceback ...\n  File \"app/handlers.py\", line 27, in handle\n    raise ValueError", "handlers.py", "27"},
+		{"unrelated",   "./pkg/other.go:10: missing return", "auth.go", ""},
+		{"no line",     "linker: undefined symbol _foo in auth.go", "auth.go", ""},
+		{"empty",       "", "auth.go", ""},
+		{"empty base",  "auth.go:1: blah", "", ""},
+	}
+	for _, c := range cases {
+		got := extractErrorLine(c.result, c.base)
+		if got != c.want {
+			t.Errorf("%s: extractErrorLine = %q, want %q\nresult=%q base=%q",
+				c.name, got, c.want, c.result, c.base)
+		}
+	}
+}
+
 func TestLooksLikeTestRunnerAcrossLanguages(t *testing.T) {
 	// Locks the cross-language coverage of R-test-stuck. The earlier
 	// regex-based implementation only matched Go-style "--- FAIL:"

@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"log/slog"
 	"os"
+	"regexp"
 	"sort"
 	"strconv"
 	"strings"
@@ -299,13 +300,17 @@ func (d *Detector) ruleBuildBrokenAfterMyEdit(ctx context.Context, sessionID str
 		}
 
 		// 2) check for Bash failures within ±10min whose tool_input OR
-		// tool_result mentions the basename. Generic, not project-tuned.
+		// tool_result mentions the basename. Pull the failures' results
+		// too so we can extract a line number for the suggestion --
+		// utility upgrade per the dogfood retro: "re-read around the
+		// error site" was vague; "re-read <file>:<line>" is one step.
 		failuresSQL := fmt.Sprintf(
-			`SELECT COUNT(*) FROM tma1_hook_events
+			`SELECT tool_result FROM tma1_hook_events
 			 WHERE session_id = '%s'
 			   AND event_type = 'PostToolUseFailure' AND tool_name = 'Bash'
 			   AND ts BETWEEN %d AND %d
-			   AND (tool_input LIKE '%%%s%%' ESCAPE '!' OR tool_result LIKE '%%%s%%' ESCAPE '!')`,
+			   AND (tool_input LIKE '%%%s%%' ESCAPE '!' OR tool_result LIKE '%%%s%%' ESCAPE '!')
+			 ORDER BY ts DESC LIMIT 5`,
 			escapeSQL(sessionID),
 			lastEdit.Add(-10*time.Minute).UnixMilli(),
 			lastEdit.Add(10*time.Minute).UnixMilli(),
@@ -315,21 +320,35 @@ func (d *Detector) ruleBuildBrokenAfterMyEdit(ctx context.Context, sessionID str
 		if err != nil || len(fRows) == 0 {
 			continue
 		}
-		failCount := intAt(fRows[0], 0)
-		if failCount == 0 {
-			continue
-		}
+		failCount := len(fRows)
 
 		sev := SeverityMedium
 		if failCount >= 3 {
 			sev = SeverityHigh
 		}
 
+		// Best-effort line-number extraction from the most recent failure
+		// (rows are ordered DESC by ts). Format `<basename>:<line>` is
+		// emitted by virtually every compiler (gcc, clang, rustc, go,
+		// tsc, pyright, ...); when the runtime is Python the format
+		// becomes `File "path", line N` so we cover that too. When no
+		// number is found we drop back to the original "around the
+		// error site" phrasing.
+		lineHint := extractErrorLine(stringAt(fRows[0], 0), base)
+
 		// Action sentence: verb-first, names the file + the symptom + the next move.
-		suggestion := fmt.Sprintf(
-			"Re-read %s around the error site before editing again — %d build/test failure(s) since you started editing it.",
-			shortPath(fp), failCount,
-		)
+		var suggestion string
+		if lineHint != "" {
+			suggestion = fmt.Sprintf(
+				"Re-read %s near line %s before editing again -- %d build/test failure(s) since you started editing it.",
+				shortPath(fp), lineHint, failCount,
+			)
+		} else {
+			suggestion = fmt.Sprintf(
+				"Re-read %s around the error site before editing again -- %d build/test failure(s) since you started editing it.",
+				shortPath(fp), failCount,
+			)
+		}
 		evidence := fmt.Sprintf(
 			"Edited %s %d time(s) in 30 min; %d build/test failure(s) named this file in the same window.",
 			shortPath(fp), editCount, failCount,
@@ -792,6 +811,60 @@ func isDocFile(base string) bool {
 // Uses pathutil so a Windows agent's file_path lifts the right name.
 func basename(p string) string {
 	return pathutil.Basename(p)
+}
+
+// extractErrorLine pulls a line number from a compiler / runtime error
+// message that mentions base. Cross-language patterns:
+//
+//	gcc/clang/rustc/go/tsc/pyright: "foo.go:42:7: error: ..." or
+//	                                  "foo.go:42: undefined: bar"
+//	python tracebacks:               'File "foo.py", line 42, in ...'
+//
+// Returns "" when no line number is recognisable. The base argument
+// scopes the search so a compile error in `bar.go` doesn't leak into
+// a suggestion about `foo.go`.
+//
+// Pure function, easy to unit-test against synthetic error snippets.
+func extractErrorLine(result, base string) string {
+	if result == "" || base == "" {
+		return ""
+	}
+	// Pattern 1: "<...path...><base>:<line>" -- the dominant compiler
+	// shape. We anchor to base + ":" so we don't pick up the line
+	// number of an unrelated file mentioned in the same blob.
+	if reBase := regexpQuoteBaseColon(base); reBase != nil {
+		if m := reBase.FindStringSubmatch(result); len(m) > 1 {
+			return m[1]
+		}
+	}
+	// Pattern 2: Python traceback `File "...<base>", line N`.
+	if rePy := regexpQuoteBasePyTraceback(base); rePy != nil {
+		if m := rePy.FindStringSubmatch(result); len(m) > 1 {
+			return m[1]
+		}
+	}
+	return ""
+}
+
+// Pre-built regex cache keyed by base would matter at scale; the rule
+// fires at most O(edits-per-session) times per Detect, so a tiny
+// regex compile per call is fine and keeps the lifecycle simple.
+func regexpQuoteBaseColon(base string) *regexp.Regexp {
+	pat := `\b` + regexp.QuoteMeta(base) + `:(\d+)`
+	re, err := regexp.Compile(pat)
+	if err != nil {
+		return nil
+	}
+	return re
+}
+
+func regexpQuoteBasePyTraceback(base string) *regexp.Regexp {
+	pat := `File\s+"[^"]*` + regexp.QuoteMeta(base) + `",\s*line\s+(\d+)`
+	re, err := regexp.Compile(pat)
+	if err != nil {
+		return nil
+	}
+	return re
 }
 
 // projectBasename: basename of the .git-preferred project root for cwd.
