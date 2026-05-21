@@ -552,28 +552,69 @@ func detectStaleEdit(reads, edits, changes []int64) int64 {
 // R-test-stuck — same test name appears in Bash failure outputs 3+ times
 // ───────────────────────────────────────────────────────────────────────
 
+// testRunnerPrefixes are the canonical prefixes for test-runner
+// invocations across the languages we know agents work in. A Bash
+// command whose first token (or first two for "npm run") matches one
+// of these is treated as a test run. Listed lowercase; matching is
+// LIKE against tool_command_prefix which is already lowercased at
+// ingest -- nope, it isn't; we use the LIKE escape pattern instead.
+//
+// Adding a runner: append a pattern that, when used in
+// `tool_command_prefix LIKE '<pattern>%' ESCAPE '!'`, identifies a
+// test invocation. The trailing space-or-end is implicit in the
+// 60-char prefix store.
+var testRunnerPrefixes = []string{
+	"go test",
+	"cargo test",
+	"cargo nextest",
+	"pytest",
+	"py.test",
+	"python -m pytest",
+	"python -m unittest",
+	"npm test",
+	"npm run test",
+	"yarn test",
+	"pnpm test",
+	"pnpm run test",
+	"jest",
+	"npx jest",
+	"vitest",
+	"npx vitest",
+	"mocha",
+	"npx mocha",
+	"phpunit",
+	"vendor/bin/phpunit",
+	"rspec",
+	"bundle exec rspec",
+	"mix test",
+}
+
 func (d *Detector) ruleTestStuck(ctx context.Context, sessionID string) ([]Anomaly, error) {
-	// Heuristic test-name extraction: pull tokens matching common test
-	// shapes (TestXxx for Go, test_xxx / it("...") / "describe(...)"
-	// generally identifiable). Generic across languages: just look for
-	// substrings of "FAIL" / "--- FAIL" / "Error: <name>".
-	//
-	// For Phase 1.7 first cut we use a coarser proxy: a Bash failure
-	// where tool_result includes "FAIL" or "Error" appearing 3+ times for
-	// what looks like the same test identifier (first whitespace token
-	// after "FAIL").
+	// Cross-language: instead of regex-extracting a test name from
+	// tool_result (which only worked for Go-style "--- FAIL: TestX"),
+	// we now group Bash failures by the leading test-runner command
+	// across all supported runners. Cost: we lose the specific test ID
+	// in the evidence; gain: the rule actually fires in pytest / jest /
+	// cargo-test / mocha / vitest / rspec / phpunit / mix-test projects
+	// instead of being silently dead.
+	clauses := make([]string, 0, len(testRunnerPrefixes))
+	for _, p := range testRunnerPrefixes {
+		clauses = append(clauses,
+			fmt.Sprintf("tool_command_prefix LIKE '%s%%' ESCAPE '!'", escapeSQLLike(p)))
+	}
 	sql := fmt.Sprintf(
-		`SELECT regexp_match(tool_result, 'FAIL[: ]\s*([A-Za-z0-9_./:-]+)')[1] AS test_id,
-		        COUNT(*) AS n
+		`SELECT tool_command_prefix AS prefix, COUNT(*) AS n
 		 FROM tma1_hook_events
 		 WHERE session_id = '%s'
 		   AND event_type = 'PostToolUseFailure' AND tool_name = 'Bash'
 		   AND ts > now() - INTERVAL '30 minutes'
-		   AND tool_result IS NOT NULL
-		 GROUP BY test_id
-		 HAVING test_id IS NOT NULL AND COUNT(*) >= 3
+		   AND tool_command_prefix IS NOT NULL
+		   AND (%s)
+		 GROUP BY tool_command_prefix
+		 HAVING COUNT(*) >= 3
 		 ORDER BY n DESC LIMIT 5`,
 		escapeSQL(sessionID),
+		strings.Join(clauses, " OR "),
 	)
 	_, rows, err := d.client.Query(ctx, sql)
 	if err != nil || len(rows) == 0 {
@@ -581,20 +622,40 @@ func (d *Detector) ruleTestStuck(ctx context.Context, sessionID string) ([]Anoma
 	}
 	var out []Anomaly
 	for _, r := range rows {
-		testID := stringAt(r, 0)
+		prefix := stringAt(r, 0)
 		n := intAt(r, 1)
-		if testID == "" {
+		if prefix == "" {
 			continue
 		}
 		out = append(out, Anomaly{
 			Kind:       "test_stuck",
 			Severity:   SeverityMedium,
 			Channel:    ChannelUserPromptSubmit,
-			Evidence:   fmt.Sprintf("%s failed %d times in the last 30 minutes.", testID, n),
-			Suggestion: fmt.Sprintf("Inspect the test fixture or mock for %s — three identical failures rarely fix themselves with another code tweak.", testID),
+			Evidence:   fmt.Sprintf("`%s` failed %d times in the last 30 minutes.", prefix, n),
+			Suggestion: fmt.Sprintf("Inspect the test fixture or mock for the failing case in `%s` — three identical test-run failures rarely fix themselves with another code tweak.", prefix),
 		})
 	}
 	return out, nil
+}
+
+// looksLikeTestRunner returns true when cmd's leading tokens match any
+// entry in testRunnerPrefixes. Used by tests + future callers that
+// need the heuristic outside of SQL.
+func looksLikeTestRunner(cmd string) bool {
+	cmd = strings.TrimSpace(strings.ToLower(cmd))
+	if cmd == "" {
+		return false
+	}
+	for _, p := range testRunnerPrefixes {
+		if strings.HasPrefix(cmd, p) {
+			// require word boundary so "go testify" doesn't match "go test"
+			rest := cmd[len(p):]
+			if rest == "" || rest[0] == ' ' || rest[0] == '\t' {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 // ───────────────────────────────────────────────────────────────────────

@@ -5,6 +5,62 @@ import (
 	"time"
 )
 
+func TestLooksLikeTestRunnerAcrossLanguages(t *testing.T) {
+	// Locks the cross-language coverage of R-test-stuck. The earlier
+	// regex-based implementation only matched Go-style "--- FAIL:"
+	// output; this list is the empirical floor of what the rule must
+	// recognise in real coding workflows.
+	positive := []string{
+		"go test ./...",
+		"GO TEST ./pkg",            // case-insensitive
+		"cargo test --workspace",
+		"cargo nextest run",
+		"pytest -k foo",
+		"py.test tests/",
+		"python -m pytest",
+		"python -m unittest discover",
+		"npm test -- --watch",
+		"npm run test",
+		"yarn test --ci",
+		"pnpm test",
+		"pnpm run test",
+		"jest --bail",
+		"npx jest --watchAll=false",
+		"vitest run",
+		"npx vitest",
+		"mocha --recursive",
+		"npx mocha test/",
+		"phpunit --testdox",
+		"vendor/bin/phpunit",
+		"rspec spec/",
+		"bundle exec rspec --format doc",
+		"mix test --trace",
+	}
+	for _, cmd := range positive {
+		if !looksLikeTestRunner(cmd) {
+			t.Errorf("expected test-runner match: %q", cmd)
+		}
+	}
+
+	negative := []string{
+		"",
+		"   ",
+		"go build",
+		"go testify",   // word-boundary guard: not "go test"
+		"cargo build",
+		"npm install",
+		"npm run dev",
+		"make test",   // intentionally NOT covered -- Makefile target names are project-defined
+		"./bin/foo",
+		"docker compose up",
+	}
+	for _, cmd := range negative {
+		if looksLikeTestRunner(cmd) {
+			t.Errorf("expected NO match: %q", cmd)
+		}
+	}
+}
+
 func TestAnomalyCacheHitAndExpiry(t *testing.T) {
 	c := newAnomalyCache(50 * time.Millisecond)
 	want := []Anomaly{{Kind: "file_loop_edit", Severity: SeverityHigh}}
