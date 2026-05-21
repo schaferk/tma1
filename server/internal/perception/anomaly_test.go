@@ -5,6 +5,39 @@ import (
 	"time"
 )
 
+func TestFirstErrorLineFindsTheActualError(t *testing.T) {
+	cases := []struct {
+		name, raw, want string
+	}{
+		{"go compile",
+			"go: building...\n# github.com/foo/bar\n./pkg/auth.go:42:7: undefined: bar\nmake: *** [build] Error 1",
+			"./pkg/auth.go:42:7: undefined: bar"},
+		{"rustc",
+			"   Compiling foo v0.1.0\nerror[E0282]: type annotations needed\n  --> src/lib.rs:88:5",
+			"error[E0282]: type annotations needed"},
+		{"pytest assertion",
+			"collected 1 item\ntest_x.py F\n=========\nFAILED test_x.py::test_y - AssertionError",
+			"FAILED test_x.py::test_y - AssertionError"},
+		{"node uncaught",
+			"server starting...\nUncaught Exception: TypeError at handler.js:12",
+			"Uncaught Exception: TypeError at handler.js:12"},
+		{"no marker",
+			"Compiling foo...\nDone.",
+			""},
+		{"empty",
+			"",
+			""},
+		{"only whitespace",
+			"   \n  \n",
+			""},
+	}
+	for _, c := range cases {
+		if got := firstErrorLine(c.raw); got != c.want {
+			t.Errorf("%s: firstErrorLine = %q, want %q", c.name, got, c.want)
+		}
+	}
+}
+
 func TestExtractErrorLineCrossLanguage(t *testing.T) {
 	// Each entry is one synthetic error blob the build/test runner of
 	// some language might emit. We assert extractErrorLine pulls the

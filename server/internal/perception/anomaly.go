@@ -397,15 +397,112 @@ func (d *Detector) ruleRepeatedFailedBuild(ctx context.Context, sessionID string
 	for _, r := range rows {
 		prefix := stringAt(r, 0)
 		n := intAt(r, 1)
+		// Pull the most recent failure's stderr/result line so the
+		// suggestion names the actual error the agent keeps re-running
+		// into. Without this, the suggestion was "read the error
+		// output" -- which sent the agent grepping for context the
+		// rule already had access to.
+		lastErr := d.latestErrorLineForPrefix(ctx, sessionID, prefix)
+		var suggestion string
+		if lastErr != "" {
+			suggestion = fmt.Sprintf(
+				"Stop retrying `%s` and address this error first: %s",
+				prefix, lastErr,
+			)
+		} else {
+			suggestion = fmt.Sprintf(
+				"Read the actual error output from `%s` before retrying -- three consecutive identical failures means the root cause isn't fixed.",
+				prefix,
+			)
+		}
 		out = append(out, Anomaly{
 			Kind:       "repeated_failed_build",
 			Severity:   SeverityHigh,
 			Channel:    ChannelStopBlock,
 			Evidence:   fmt.Sprintf("`%s` failed %d times in the last 30 minutes.", prefix, n),
-			Suggestion: fmt.Sprintf("Read the actual error output from `%s` before retrying — three consecutive identical failures means the root cause isn't fixed.", prefix),
+			Suggestion: suggestion,
 		})
 	}
 	return out, nil
+}
+
+// latestErrorLineForPrefix returns a single representative error line
+// from the most recent Bash failure matching prefix. Returns "" when
+// the lookup fails or no row carries result text. The returned line is
+// truncated via oneLine() so a multi-KB stack trace doesn't bloat the
+// anomaly suggestion past the bundle budget.
+func (d *Detector) latestErrorLineForPrefix(ctx context.Context, sessionID, prefix string) string {
+	sql := fmt.Sprintf(
+		`SELECT tool_result FROM tma1_hook_events
+		 WHERE session_id = '%s'
+		   AND event_type = 'PostToolUseFailure' AND tool_name = 'Bash'
+		   AND substr(COALESCE(tool_command_prefix,
+		                       regexp_match(tool_input, '"command":"([^"]+)"')[1]), 1, 60) = '%s'
+		   AND ts > now() - INTERVAL '30 minutes'
+		   AND tool_result IS NOT NULL
+		 ORDER BY ts DESC LIMIT 1`,
+		escapeSQL(sessionID), escapeSQL(prefix),
+	)
+	_, rows, err := d.client.Query(ctx, sql)
+	if err != nil || len(rows) == 0 {
+		return ""
+	}
+	raw := stringAt(rows[0], 0)
+	if raw == "" {
+		return ""
+	}
+	// Pick the first line that looks like an error message; fall back
+	// to the last non-empty line if no marker matches. Keeps the
+	// suggestion concrete instead of dragging "Compiling..." progress
+	// noise into it.
+	if line := firstErrorLine(raw); line != "" {
+		return oneLine(line, 200)
+	}
+	return ""
+}
+
+// errorLineMarkers are case-insensitive substrings that indicate the
+// line is an error / failure / panic message. Tuned for popular build
+// tooling output across languages.
+//
+// Tradeoff in marker design: too narrow (e.g. "error:" only) misses
+// real diagnostics like "FAILED test_x.py::..." or "undefined: bar";
+// too loose (e.g. bare "error") happily grabs Makefile noise like
+// "make: *** [build] Error 1" before the actual compiler line. We
+// list both compiler-style colon variants and free-text language-
+// specific tokens, ordered so the most discriminating match first.
+var errorLineMarkers = []string{
+	"error[", "error:", " error:",          // compilers (rustc E-codes, gcc/clang colon)
+	"failed:", "failed ", "failure:",       // pytest "FAILED ", generic
+	"--- fail", "fail:",                    // go test
+	"panic:", "fatal:",                     // go panic, generic fatal
+	"undefined:", "undefined symbol",       // linker / compiler "undefined: X"
+	"cannot find ", "no such file",         // missing-symbol / missing-file diagnostics
+	"assertionerror", "typeerror",          // python / js runtime types
+	"syntaxerror", "valueerror", "runtimeerror",
+	"exception", "uncaught",                // generic runtime
+}
+
+// firstErrorLine scans raw line-by-line looking for the first line
+// that contains an errorLineMarkers substring. Returns "" if none
+// matches. Empty / whitespace-only lines are skipped.
+func firstErrorLine(raw string) string {
+	if raw == "" {
+		return ""
+	}
+	for _, line := range strings.Split(raw, "\n") {
+		trimmed := strings.TrimSpace(line)
+		if trimmed == "" {
+			continue
+		}
+		low := strings.ToLower(trimmed)
+		for _, m := range errorLineMarkers {
+			if strings.Contains(low, m) {
+				return trimmed
+			}
+		}
+	}
+	return ""
 }
 
 // ───────────────────────────────────────────────────────────────────────
