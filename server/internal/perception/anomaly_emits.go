@@ -48,7 +48,7 @@ func (d *Detector) insertEmit(sessionID string, a Anomaly) {
 
 	sql := fmt.Sprintf(
 		"INSERT INTO tma1_anomaly_emits "+
-			"(ts, session_id, kind, severity, channel, evidence, suggestion, related_files, first_emitted_at) "+
+			"(ts, session_id, kind, severity, \"channel\", evidence, suggestion, related_files, first_emitted_at) "+
 			"VALUES (%d, %s, %s, %s, %s, %s, %s, %s, %s)",
 		time.Now().UnixMilli(),
 		emitQuote(sessionID, 256),

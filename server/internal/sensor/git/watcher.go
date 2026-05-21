@@ -38,6 +38,11 @@ type projectWatcher struct {
 	mu           sync.Mutex
 	recentEvents map[string]time.Time
 
+	// gitignore captures patterns from <root>/.gitignore so build
+	// artifacts a project already declared "not interesting" don't
+	// drown the external_changes signal. Nil when no .gitignore.
+	gitignore *gitignoreMatcher
+
 	// lastGitSHA / lastGitBranch let the poller emit one event per change.
 	lastGitSHA    string
 	lastGitBranch string
@@ -60,6 +65,7 @@ func newProjectWatcher(parent context.Context, cfg projectWatcherConfig) *projec
 		ctx:          ctx,
 		cancel:       cancel,
 		recentEvents: make(map[string]time.Time),
+		gitignore:    loadGitignore(cfg.Root),
 	}
 }
 
@@ -113,10 +119,10 @@ func (w *projectWatcher) handleFsEvent(ev fsnotify.Event) {
 	if !shouldRecordFsEvent(ev) {
 		return
 	}
-	if !w.acceptDebounced(ev.Name) {
+	if w.shouldIgnorePath(ev.Name) {
 		return
 	}
-	if shouldIgnorePath(ev.Name) {
+	if !w.acceptDebounced(ev.Name) {
 		return
 	}
 
@@ -239,45 +245,75 @@ func classifyFsOp(op fsnotify.Op) string {
 	}
 }
 
-// shouldIgnorePath excludes high-noise directories + files: .git/,
-// node_modules/, build outputs, IDE state, AND tma1's own bookkeeping
-// (.tma1-context.md, .claude/settings.local.json) so the sensor doesn't
-// observe its own file_writer or CC's local-state file.
-func shouldIgnorePath(p string) bool {
-	for _, frag := range []string{
-		"/.git/",
-		"/node_modules/",
-		"/.next/",
-		"/.cache/",
-		"/dist/",
-		"/build/",
-		"/target/",
-		"/.idea/",
-		"/.vscode/",
-		"/__pycache__/",
-		"/.pytest_cache/",
-		"/coverage/",
-		"/.claude/",
-	} {
+// staticIgnoreFragments are paths the sensor never wants to see across
+// every project: VCS internals, dependency installs, build outputs, IDE
+// state, and tma1's own bookkeeping. Per-project nuance comes from the
+// gitignore matcher (see (*projectWatcher).shouldIgnorePath).
+var staticIgnoreFragments = []string{
+	"/.git/",
+	"/node_modules/",
+	"/.next/",
+	"/.cache/",
+	"/dist/",
+	"/build/",
+	"/target/",
+	"/bin/",          // Go build outputs (server/bin, tooling). Dropped here
+	"/out/",          // Java / generic build output dir
+	"/vendor/",       // Go / PHP / Ruby vendored deps
+	"/.venv/",        // Python venv
+	"/venv/",         // Python venv (alt)
+	"/.tma1/",        // tma1's own data dir (avoids self-noise loop)
+	"/.idea/",
+	"/.vscode/",
+	"/__pycache__/",
+	"/.pytest_cache/",
+	"/coverage/",
+	"/.claude/",
+}
+
+var staticIgnoreSuffixes = []string{
+	".pyc", ".swp", ".swo", ".log", ".DS_Store",
+}
+
+// staticShouldIgnorePath is the project-agnostic ignore check. Tests
+// call this directly; runtime callers go through
+// (*projectWatcher).shouldIgnorePath which also consults the loaded
+// .gitignore.
+func staticShouldIgnorePath(p string) bool {
+	for _, frag := range staticIgnoreFragments {
 		if strings.Contains(p, frag) {
 			return true
 		}
 	}
-	// File-extension / name noise.
 	base := filepath.Base(p)
-	for _, suffix := range []string{".pyc", ".swp", ".swo", ".log", ".DS_Store"} {
+	for _, suffix := range staticIgnoreSuffixes {
 		if strings.HasSuffix(base, suffix) {
 			return true
 		}
 	}
-	switch base {
-	case ".tma1-context.md":
+	if base == ".tma1-context.md" {
 		return true
 	}
 	// Atomic-write tempfile pattern that many editors / git itself produce:
 	// "<name>.tmp.<pid>.<random>". Drops the noisy intermediates without
 	// hiding the resulting committed file modification.
 	if strings.Contains(base, ".tmp.") {
+		return true
+	}
+	return false
+}
+
+// shouldIgnorePath combines the static, cross-project ignore list with
+// per-project rules picked up from <root>/.gitignore. Any project that
+// added "bin/" or "logs/" or "build/output.json" to its .gitignore was
+// explicitly saying "this isn't interesting" -- the fs sensor honours
+// that just like rg / VSCode / ag do, instead of trying to maintain a
+// universal ignore list ourselves.
+func (w *projectWatcher) shouldIgnorePath(p string) bool {
+	if staticShouldIgnorePath(p) {
+		return true
+	}
+	if w.gitignore != nil && w.gitignore.matches(p, w.cfg.Root) {
 		return true
 	}
 	return false
@@ -294,7 +330,7 @@ func addRecursive(fsw *fsnotify.Watcher, root string) error {
 		if !info.IsDir() {
 			return nil
 		}
-		if shouldIgnorePath(path + "/") {
+		if staticShouldIgnorePath(path + "/") {
 			return filepath.SkipDir
 		}
 		_ = fsw.Add(path)

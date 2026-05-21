@@ -77,9 +77,12 @@ var schemaMigrations = []Migration{
 // schemaVersionDDL creates the migration ledger. Append-only so the
 // most-recent-by-ts row is the active version. Same shape pattern as
 // the other tma1_* tables for consistency.
+//
+// "version" is a GreptimeDB reserved keyword and must be quoted in DDL +
+// every DML that touches the column.
 const schemaVersionDDL = `CREATE TABLE IF NOT EXISTS tma1_schema_version (
     ts          TIMESTAMP TIME INDEX,
-    version     INT NOT NULL,
+    "version"   INT NOT NULL,
     description STRING NULL
 ) WITH ('append_mode'='true')`
 
@@ -153,7 +156,7 @@ func pendingMigrations(current int, all []Migration) []Migration {
 // currentSchemaVersion returns the highest version recorded in
 // tma1_schema_version, or 0 when the ledger is empty / unreadable.
 func currentSchemaVersion(sqlURL string) (int, error) {
-	body, err := postSQL(sqlURL, "SELECT MAX(version) FROM tma1_schema_version")
+	body, err := postSQL(sqlURL, `SELECT MAX("version") FROM tma1_schema_version`)
 	if err != nil {
 		return 0, err
 	}
@@ -193,7 +196,7 @@ func currentSchemaVersion(sqlURL string) (int, error) {
 func recordMigration(sqlURL string, m Migration) error {
 	desc := strings.ReplaceAll(m.Description, "'", "''")
 	stmt := fmt.Sprintf(
-		"INSERT INTO tma1_schema_version (ts, version, description) VALUES (%d, %d, '%s')",
+		`INSERT INTO tma1_schema_version (ts, "version", description) VALUES (%d, %d, '%s')`,
 		time.Now().UnixMilli(), m.Version, desc,
 	)
 	return execSQL(sqlURL, stmt)

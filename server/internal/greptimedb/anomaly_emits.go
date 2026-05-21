@@ -17,12 +17,14 @@ import (
 //   - Daily emit budget: COUNT(*) per kind per day, target <= 5
 //   - Action follow-rate: did the agent do the suggested action in
 //     the next N tool calls? Target >= 30%
+// "channel" is a GreptimeDB reserved keyword and must be quoted in DDL +
+// every DML that touches the column.
 var anomalyEmitsTableDDL = `CREATE TABLE IF NOT EXISTS tma1_anomaly_emits (
     ts               TIMESTAMP TIME INDEX,
     session_id       STRING SKIPPING INDEX,
     kind             STRING INVERTED INDEX,
     severity         STRING INVERTED INDEX,
-    channel          STRING NULL,
+    "channel"        STRING NULL,
     evidence         STRING NULL,
     suggestion       STRING NULL,
     related_files    STRING NULL,

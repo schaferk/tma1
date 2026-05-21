@@ -6,7 +6,7 @@ import (
 	"github.com/fsnotify/fsnotify"
 )
 
-func TestShouldIgnorePath(t *testing.T) {
+func TestStaticShouldIgnorePath(t *testing.T) {
 	cases := []struct {
 		path string
 		want bool
@@ -15,6 +15,11 @@ func TestShouldIgnorePath(t *testing.T) {
 		{"/repo/node_modules/foo/index.js", true},
 		{"/repo/dist/bundle.js", true},
 		{"/repo/build/x.o", true},
+		{"/repo/bin/tma1-server", true},      // dogfood report: bin/ was leaking
+		{"/repo/out/foo.class", true},
+		{"/repo/vendor/x.go", true},
+		{"/repo/.venv/bin/python", true},
+		{"/repo/.tma1/state.json", true},     // tma1's own data dir
 		{"/repo/__pycache__/x.cpython-311.pyc", true},
 		{"/repo/x.pyc", true},
 		{"/repo/.DS_Store", true},
@@ -27,8 +32,8 @@ func TestShouldIgnorePath(t *testing.T) {
 		{"/repo/README.md", false},
 	}
 	for _, tc := range cases {
-		if got := shouldIgnorePath(tc.path); got != tc.want {
-			t.Errorf("shouldIgnorePath(%q) = %v, want %v", tc.path, got, tc.want)
+		if got := staticShouldIgnorePath(tc.path); got != tc.want {
+			t.Errorf("staticShouldIgnorePath(%q) = %v, want %v", tc.path, got, tc.want)
 		}
 	}
 }
