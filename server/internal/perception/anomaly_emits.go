@@ -6,6 +6,8 @@ import (
 	"fmt"
 	"strings"
 	"time"
+
+	"github.com/tma1-ai/tma1/server/internal/strutil"
 )
 
 // logEmits writes one row per anomaly into tma1_anomaly_emits. Each row
@@ -66,15 +68,14 @@ func (d *Detector) insertEmit(sessionID string, a Anomaly) {
 	}
 }
 
-// emitQuote: SQL literal with truncation. Empty string becomes NULL so the
-// column distinguishes "no value" from "empty string".
+// emitQuote: SQL literal with rune-safe truncation. Empty string
+// becomes NULL so the column distinguishes "no value" from "empty
+// string".
 func emitQuote(v string, maxLen int) string {
 	if v == "" {
 		return "NULL"
 	}
-	if len(v) > maxLen {
-		v = v[:maxLen]
-	}
+	v = strutil.SafeTruncate(v, maxLen)
 	return "'" + strings.ReplaceAll(v, "'", "''") + "'"
 }
 

@@ -9,6 +9,8 @@ import (
 	"net/url"
 	"strings"
 	"time"
+
+	"github.com/tma1-ai/tma1/server/internal/strutil"
 )
 
 // Hard limits to keep individual rows reasonable. The full output is still
@@ -17,6 +19,7 @@ import (
 const (
 	maxMessageLen   = 16 * 1024 // 16 KB
 	maxCommandLen   = 512
+	maxProjectLen   = 256
 	maxFilePathLen  = 512
 	maxStreamLen    = 16
 	maxEventTypeLen = 32
@@ -61,7 +64,7 @@ func (s *GreptimeStore) Write(ctx context.Context, evt Event) error {
 			"file_path, line_no, exit_code, duration_ms, host, \"tag\") "+
 			"VALUES (%d, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)",
 		evt.Timestamp.UnixMilli(),
-		quoteString(evt.Project, maxCommandLen),
+		quoteString(evt.Project, maxProjectLen),
 		quoteString(evt.Command, maxCommandLen),
 		quoteString(evt.EventType, maxEventTypeLen),
 		quoteString(evt.Severity, maxSeverityLen),
@@ -113,15 +116,14 @@ func greptimeResponseError(body []byte) error {
 	return nil
 }
 
-// quoteString returns 'NULL' for empty input, otherwise a SQL string literal
-// with embedded quotes escaped and the value truncated to maxLen bytes.
+// quoteString returns the SQL NULL keyword for empty input, otherwise a
+// SQL string literal with embedded quotes escaped and the value
+// truncated (rune-safe) to at most maxLen bytes.
 func quoteString(v string, maxLen int) string {
 	if v == "" {
 		return "NULL"
 	}
-	if len(v) > maxLen {
-		v = v[:maxLen]
-	}
+	v = strutil.SafeTruncate(v, maxLen)
 	return "'" + strings.ReplaceAll(v, "'", "''") + "'"
 }
 

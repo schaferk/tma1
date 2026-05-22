@@ -9,6 +9,8 @@ import (
 	"net/url"
 	"strings"
 	"time"
+
+	"github.com/tma1-ai/tma1/server/internal/strutil"
 )
 
 // Hard caps to keep individual rows bounded; same philosophy as the build
@@ -100,14 +102,13 @@ func greptimeResponseError(body []byte) error {
 	return nil
 }
 
-// quote returns 'NULL' for empty input, otherwise a SQL string literal with
-// embedded quotes escaped and value truncated to maxLen bytes.
+// quote returns the SQL NULL keyword for empty input, otherwise a SQL
+// string literal with embedded quotes escaped and the value truncated
+// (rune-safe) to at most maxLen bytes.
 func quote(v string, maxLen int) string {
 	if v == "" {
 		return "NULL"
 	}
-	if len(v) > maxLen {
-		v = v[:maxLen]
-	}
+	v = strutil.SafeTruncate(v, maxLen)
 	return "'" + strings.ReplaceAll(v, "'", "''") + "'"
 }
