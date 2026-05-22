@@ -8,11 +8,11 @@ import (
 	"net/http"
 	"net/url"
 	"os"
-	"regexp"
 	"strings"
 	"sync"
 	"time"
 
+	"github.com/tma1-ai/tma1/server/internal/derive"
 	"github.com/tma1-ai/tma1/server/internal/perception"
 	"github.com/tma1-ai/tma1/server/internal/sqlutil"
 	"github.com/tma1-ai/tma1/server/internal/strutil"
@@ -199,6 +199,15 @@ func (s *Server) handleHooks(w http.ResponseWriter, r *http.Request) {
 		agentSource = "claude_code"
 	}
 
+	// Mark this session as "live via hooks" when it comes from Codex,
+	// so the transcript-JSONL parser knows to skip its own insert
+	// for the same event (the parser would otherwise race in a few
+	// seconds later with the same row from the rollout file).
+	// CC has no such backstop parser; the gate is a no-op for it.
+	if agentSource == "codex" && payload.SessionID != "" {
+		codexLiveSessions.markLive(payload.SessionID)
+	}
+
 	// Normalize tool_response to string.
 	toolResult := normalizeToolResponse(payload.ToolResponse)
 
@@ -302,9 +311,28 @@ func (s *Server) handleHooks(w http.ResponseWriter, r *http.Request) {
 	if s.hookTelemetry != nil {
 		s.hookTelemetry.record(payload.HookEventName, injection != "")
 	}
-	w.WriteHeader(http.StatusOK)
-	if injection != "" {
-		_, _ = w.Write([]byte(injection))
+
+	// Envelope: clients with different hook protocols pass ?envelope=<name>
+	// to request the response in their native shape. CC (the default)
+	// receives the raw injection content (UserPromptSubmit / PostToolUse)
+	// or our existing decision-JSON (Stop). Codex receives a JSON object
+	// in its `hookSpecificOutput` shape. Single source of truth for the
+	// content itself; only the wrapper changes.
+	envelope := r.URL.Query().Get("envelope")
+	if envelope != "" {
+		out, ctype := wrapInjectionEnvelope(envelope, payload.HookEventName, injection)
+		if ctype != "" {
+			w.Header().Set("Content-Type", ctype)
+		}
+		w.WriteHeader(http.StatusOK)
+		if out != "" {
+			_, _ = w.Write([]byte(out))
+		}
+	} else {
+		w.WriteHeader(http.StatusOK)
+		if injection != "" {
+			_, _ = w.Write([]byte(injection))
+		}
 	}
 
 	// File-callback refresh runs after response so it never delays the hook.
@@ -315,6 +343,68 @@ func (s *Server) handleHooks(w http.ResponseWriter, r *http.Request) {
 	if s.fileWriter != nil && payload.CWD != "" && os.Getenv("TMA1_ENABLE_FILE_CALLBACK") == "1" {
 		go s.refreshContextFile(payload.SessionID, payload.CWD)
 	}
+}
+
+// wrapInjectionEnvelope reshapes the raw injection content into the
+// hook protocol shape the requesting adapter expects.
+//
+// The CC adapter passes no envelope and gets the raw content back —
+// preserving the existing wire format. Other adapters opt in via
+// `?envelope=<name>`; today only "codex" is supported.
+//
+// Codex hook shapes (from developers.openai.com/codex/hooks):
+//   - Stop with block decision: `{"decision":"block","reason":"..."}`
+//     — IDENTICAL to what `generateStopInjection` already emits, so
+//     we pass it through verbatim when present.
+//   - UserPromptSubmit / PostToolUse / SessionStart / PreCompact with
+//     context injection: `{"hookSpecificOutput": {"hookEventName":
+//     "<event>", "additionalContext": "<string>"}}`.
+//   - Anything empty (no injection, PreToolUse, unknown event):
+//     `{}` — Codex's silent-no-op shape.
+//
+// Returns (body, content-type). An empty content-type means "leave
+// the default text/plain alone" (only happens for unknown envelopes,
+// which fall back to raw behaviour).
+func wrapInjectionEnvelope(envelope, eventName, content string) (string, string) {
+	if envelope != "codex" {
+		// Unknown envelope -- fall back to raw content. We intentionally
+		// don't 400 here so a typo doesn't break the agent's loop.
+		return content, ""
+	}
+
+	const ctype = "application/json; charset=utf-8"
+
+	// Empty content -> silent no-op for any event.
+	if content == "" {
+		return "{}", ctype
+	}
+
+	// Stop's existing output is already the shape Codex's Stop hook
+	// consumes. Pass through after a sanity parse so we don't ship
+	// non-JSON under application/json.
+	if eventName == "Stop" {
+		var probe map[string]any
+		if err := json.Unmarshal([]byte(content), &probe); err == nil {
+			if _, ok := probe["decision"]; ok {
+				return content, ctype
+			}
+		}
+		// Fall through if Stop content isn't the expected decision
+		// JSON for some reason — wrap as additionalContext below so
+		// the agent still sees the message.
+	}
+
+	// All other events: wrap as additionalContext in hookSpecificOutput.
+	wrapped, err := json.Marshal(map[string]any{
+		"hookSpecificOutput": map[string]any{
+			"hookEventName":     eventName,
+			"additionalContext": content,
+		},
+	})
+	if err != nil {
+		return "{}", ctype
+	}
+	return string(wrapped), ctype
 }
 
 // generateInjection returns the stdout the hook script should emit for this
@@ -601,7 +691,9 @@ func (s *Server) insertHookEvent(p hookPayload, agentSource, toolInput, toolResu
 	// downstream queries don't need to regex/parse_json the raw blob.
 	// Extraction is best-effort — failures yield empty strings and we
 	// fall back to the raw column.
-	filePath, cmdPrefix, success, errSummary := extractDerivedFields(p, toolInput, toolResult)
+	filePath, cmdPrefix, success, errSummary := derive.Fields(
+		p.HookEventName, p.ToolName, toolInput, toolResult, p.Message,
+	)
 
 	sql := fmt.Sprintf(
 		"INSERT INTO tma1_hook_events "+
@@ -650,90 +742,6 @@ func (s *Server) insertHookEvent(p hookPayload, agentSource, toolInput, toolResu
 	if err := greptimeResponseError(body); err != nil {
 		s.logger.Debug("hook event insert failed", "error", err, "event", p.HookEventName)
 	}
-}
-
-// fileInputRE / commandInputRE extract the most common tool_input fields.
-// We use regex rather than json.Unmarshal because the raw blob is often
-// truncated to 2 KB and may not parse — best-effort lift of the leading
-// fields is more robust than all-or-nothing JSON parsing.
-var (
-	fileInputRE    = regexp.MustCompile(`"file_path"\s*:\s*"([^"]+)"`)
-	commandInputRE = regexp.MustCompile(`"command"\s*:\s*"((?:[^"\\]|\\.)*)"`)
-)
-
-// extractDerivedFields lifts file_path / command prefix / success / error
-// summary out of a hook payload so downstream queries can WHERE on them
-// without re-parsing JSON.
-//
-// Returns ("","",nil,"") for events that don't have these signals.
-func extractDerivedFields(p hookPayload, toolInput, toolResult string) (filePath, cmdPrefix string, success *bool, errSummary string) {
-	// File path: applies to Edit / Write / Read / MultiEdit (anything that
-	// takes a file_path arg). Regex lift handles truncated blobs.
-	if m := fileInputRE.FindStringSubmatch(toolInput); len(m) >= 2 {
-		filePath = m[1]
-	}
-
-	// Command prefix: first 200 chars of Bash / exec_command. Quote escapes
-	// in the JSON ("\n", '\"') are unescaped to keep the column readable.
-	if p.ToolName == "Bash" || p.ToolName == "exec_command" {
-		if m := commandInputRE.FindStringSubmatch(toolInput); len(m) >= 2 {
-			cmdPrefix = strutil.SafeTruncate(unescapeJSONString(m[1]), 200)
-		}
-	}
-
-	// Success / error summary: PostToolUse / PostToolUseFailure tell us
-	// directly; the result body is the error text for failures.
-	switch p.HookEventName {
-	case "PostToolUse":
-		t := true
-		success = &t
-	case "PostToolUseFailure":
-		f := false
-		success = &f
-		errSummary = strutil.SafeTruncate(firstNonEmpty(toolResult, p.Message), 400)
-	}
-	return
-}
-
-// unescapeJSONString reverses the common JSON string escapes so the
-// command stored in tool_command_prefix is human-readable. Best-effort:
-// unknown escapes pass through unchanged.
-func unescapeJSONString(s string) string {
-	if !strings.Contains(s, `\`) {
-		return s
-	}
-	var b strings.Builder
-	b.Grow(len(s))
-	for i := 0; i < len(s); i++ {
-		c := s[i]
-		if c == '\\' && i+1 < len(s) {
-			next := s[i+1]
-			switch next {
-			case 'n':
-				b.WriteByte('\n')
-			case 't':
-				b.WriteByte('\t')
-			case 'r':
-				b.WriteByte('\r')
-			case '"', '\\', '/':
-				b.WriteByte(next)
-			default:
-				b.WriteByte(c)
-				b.WriteByte(next)
-			}
-			i++
-			continue
-		}
-		b.WriteByte(c)
-	}
-	return b.String()
-}
-
-func firstNonEmpty(a, b string) string {
-	if a != "" {
-		return a
-	}
-	return b
 }
 
 // nullableString renders v as a SQL literal, or NULL when empty. Also

@@ -10,7 +10,22 @@ import (
 	"path/filepath"
 	"strings"
 	"time"
+
+	"github.com/tma1-ai/tma1/server/internal/derive"
+	"github.com/tma1-ai/tma1/server/internal/sqlutil"
 )
+
+// nullableBool renders *bool as TRUE/FALSE/NULL SQL literal.
+// Local to transcript package; sqlutil.Quote handles string columns.
+func nullableBool(b *bool) string {
+	if b == nil {
+		return "NULL"
+	}
+	if *b {
+		return "TRUE"
+	}
+	return "FALSE"
+}
 
 const (
 	codexScanInterval = 5 * time.Second
@@ -373,6 +388,11 @@ func (w *Watcher) processCodexResponseItem(sessionID string, ts time.Time, item 
 // insertCodexModelMessage stores a synthetic message with the model field set.
 // This makes the model visible in session detail KPI and cost calculation.
 func (w *Watcher) insertCodexModelMessage(sessionID string, ts time.Time, model string, seen map[string]struct{}) {
+	// NOT gated by codexLiveGate: this writes a row into tma1_messages,
+	// which the hook handler never duplicates (hooks only write
+	// tma1_hook_events). Gating here would silently kill conversation
+	// replay + prompt analysis + peer-session content for active Codex
+	// sessions. The gate only belongs on tma1_hook_events writers.
 	key := "model:" + model
 	if _, ok := seen[key]; ok {
 		return
@@ -409,6 +429,9 @@ func (w *Watcher) insertCodexModelMessage(sessionID string, ts time.Time, model 
 }
 
 func (w *Watcher) insertCodexMessage(sessionID string, ts time.Time, role, content string, seen map[string]struct{}) {
+	// NOT gated by codexLiveGate -- same reasoning as
+	// insertCodexModelMessage above. Writes tma1_messages, never
+	// duplicated by the hook handler.
 	// Dedup by content prefix hash.
 	prefix := content
 	if len(prefix) > 200 {
@@ -454,7 +477,47 @@ func (w *Watcher) insertCodexMessage(sessionID string, ts time.Time, role, conte
 	}()
 }
 
+// codexHookCoveredEvents lists the tma1_hook_events.event_type values
+// that the Codex hook handler writes itself. Must stay in sync with
+// install_codex.go's codexHookEvents — that's the list registered in
+// ~/.codex/hooks.json, so any event NOT in this set is JSONL-only and
+// the parser is the only writer.
+//
+// Notably absent: SubagentStart / SubagentStop. Codex never POSTs those
+// (its hook catalogue has no subagent lifecycle event), so the JSONL
+// parser must keep writing them even when the live gate is active.
+var codexHookCoveredEvents = map[string]struct{}{
+	"SessionStart":     {},
+	"PreToolUse":       {},
+	"PostToolUse":      {},
+	"UserPromptSubmit": {},
+	"Stop":             {},
+}
+
+// codexLiveGate returns true when the Codex hook adapter is actively
+// posting events for this session AND the given event_type is one the
+// hook handler actually writes. nil gate => always false (parser stays
+// the sole writer, original behaviour).
+//
+// IMPORTANT: only call this from insertion paths that write to
+// tma1_hook_events. The hook handler never writes to tma1_messages,
+// so gating message-inserts would kill conversation replay for any
+// active Codex session. See `insertCodexMessage` /
+// `insertCodexModelMessage` for the deliberate exclusion.
+func (w *Watcher) codexLiveGate(sessionID, eventType string) bool {
+	if w.IsLiveSession == nil {
+		return false
+	}
+	if _, covered := codexHookCoveredEvents[eventType]; !covered {
+		return false
+	}
+	return w.IsLiveSession(sessionID)
+}
+
 func (w *Watcher) insertCodexSessionStart(sessionID string, ts time.Time, cwd, conversationID string) {
+	if w.codexLiveGate(sessionID, "SessionStart") {
+		return
+	}
 	msTs := ts.UnixMilli()
 	for {
 		prev := lastInsertTS.Load()
@@ -493,6 +556,9 @@ func codexSubagentID(fileID, agentType string) string {
 }
 
 func (w *Watcher) insertCodexSubagentEvent(sessionID string, ts time.Time, agentID, agentType, conversationID string) {
+	if w.codexLiveGate(sessionID, "SubagentStart") {
+		return
+	}
 	msTs := ts.UnixMilli()
 	for {
 		prev := lastInsertTS.Load()
@@ -525,6 +591,9 @@ func (w *Watcher) insertCodexSubagentEvent(sessionID string, ts time.Time, agent
 }
 
 func (w *Watcher) insertCodexHookEvent(sessionID string, ts time.Time, eventType, toolName, toolInput, toolUseID, toolResult string, fctx *codexFileContext) {
+	if w.codexLiveGate(sessionID, eventType) {
+		return
+	}
 	msTs := ts.UnixMilli()
 	for {
 		prev := lastInsertTS.Load()
@@ -550,11 +619,21 @@ func (w *Watcher) insertCodexHookEvent(sessionID string, ts time.Time, eventType
 		conversationID = fctx.conversationID
 	}
 
+	// Derive the ingest-time columns the way the CC handler does
+	// (handler/hooks.go calls derive.Fields too). Without this,
+	// downstream queries that COALESCE(tool_file_path, regexp_match(...))
+	// would fall back to regex on every Codex row — measurable cost
+	// in the anomaly + peer paths.
+	filePath, cmdPrefix, success, errSummary := derive.Fields(
+		eventType, toolName, toolInput, toolResult, "",
+	)
+
 	sql := fmt.Sprintf(
 		"INSERT INTO tma1_hook_events "+
 			"(ts, session_id, event_type, agent_source, tool_name, tool_input, tool_result, "+
-			"tool_use_id, agent_id, agent_type, notification_type, \"message\", cwd, transcript_path, conversation_id) "+
-			"VALUES (%d, '%s', '%s', 'codex', '%s', '%s', '%s', '%s', '%s', '%s', '', '', '', '', '%s')",
+			"tool_use_id, agent_id, agent_type, notification_type, \"message\", cwd, transcript_path, conversation_id, "+
+			"tool_file_path, tool_command_prefix, tool_success, tool_error_summary) "+
+			"VALUES (%d, '%s', '%s', 'codex', '%s', '%s', '%s', '%s', '%s', '%s', '', '', '', '', '%s', %s, %s, %s, %s)",
 		msTs,
 		escapeSQLString(sessionID),
 		escapeSQLString(eventType),
@@ -565,6 +644,10 @@ func (w *Watcher) insertCodexHookEvent(sessionID string, ts time.Time, eventType
 		escapeSQLString(agentID),
 		escapeSQLString(agentType),
 		escapeSQLString(conversationID),
+		sqlutil.Quote(filePath, 512),
+		sqlutil.Quote(cmdPrefix, 200),
+		nullableBool(success),
+		sqlutil.Quote(errSummary, 400),
 	)
 	go func() {
 		insertSem <- struct{}{}

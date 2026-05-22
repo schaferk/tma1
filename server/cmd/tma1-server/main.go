@@ -218,6 +218,10 @@ func main() {
 
 	bc := handler.NewHookBroadcaster()
 	tw := transcript.NewWatcher(cfg.GreptimeDBHTTPPort, logger, bc.Broadcast)
+	// Wire the live-hook gate: when a Codex session is actively
+	// posting hook events to /api/hooks, the JSONL parser skips its
+	// own inserts so we don't double-write the same event.
+	tw.IsLiveSession = handler.IsCodexSessionLive
 	defer tw.StopAll()
 
 	// Start Codex session scanner (discovers ~/.codex/sessions/ JSONL files).
@@ -459,15 +463,11 @@ func runInstall(args []string) error {
 		case "--dry-run", "-n":
 			dryRun = true
 		case "-h", "--help":
-			fmt.Println("usage: tma1-server install [--adapter claude-code] [--project DIR] [--dry-run]")
+			fmt.Println("usage: tma1-server install [--adapter claude-code|codex] [--project DIR] [--dry-run]")
 			return nil
 		default:
 			return fmt.Errorf("unknown flag %q", args[i])
 		}
-	}
-
-	if adapter != "claude-code" {
-		return fmt.Errorf("adapter %q not supported yet (only claude-code)", adapter)
 	}
 
 	cfg, err := config.Load()
@@ -481,13 +481,35 @@ func runInstall(args []string) error {
 
 	logger := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelInfo}))
 
-	inst := &hooks.ClaudeCodeInstaller{
-		DataDir:            cfg.DataDir,
-		Port:               port,
-		GreptimeDBHTTPPort: cfg.GreptimeDBHTTPPort,
-		ProjectDir:         project,
-		Logger:             logger,
-		DryRun:             dryRun,
+	// adapterInstaller is the surface runInstall needs from each
+	// per-adapter installer. ClaudeCodeInstaller + CodexInstaller both
+	// implement it; both Install() returns the same report shape.
+	type adapterInstaller interface {
+		Install() (hooks.InstallReport, error)
+	}
+
+	var inst adapterInstaller
+	switch adapter {
+	case "claude-code":
+		inst = &hooks.ClaudeCodeInstaller{
+			DataDir:            cfg.DataDir,
+			Port:               port,
+			GreptimeDBHTTPPort: cfg.GreptimeDBHTTPPort,
+			ProjectDir:         project,
+			Logger:             logger,
+			DryRun:             dryRun,
+		}
+	case "codex":
+		inst = &hooks.CodexInstaller{
+			DataDir:            cfg.DataDir,
+			Port:               port,
+			GreptimeDBHTTPPort: cfg.GreptimeDBHTTPPort,
+			ProjectDir:         project,
+			Logger:             logger,
+			DryRun:             dryRun,
+		}
+	default:
+		return fmt.Errorf("adapter %q not supported (available: claude-code, codex)", adapter)
 	}
 	rep, installErr := inst.Install()
 

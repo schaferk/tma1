@@ -46,6 +46,14 @@ type Watcher struct {
 	sqlURL    string
 	logger    *slog.Logger
 	broadcast BroadcastFunc
+
+	// IsLiveSession, when set, tells the Codex JSONL parser to skip
+	// inserts for any session that has recently emitted a hook event
+	// to /api/hooks (i.e. the Codex adapter is wired and posting in
+	// real time). Without this, the JSONL parser and the hook handler
+	// would both write rows for the same Codex event. handler.New
+	// installs the gate at startup; main.go does the wiring.
+	IsLiveSession func(sessionID string) bool
 }
 
 type sessionWatch struct {

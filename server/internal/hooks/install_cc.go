@@ -13,13 +13,11 @@ import (
 	"embed"
 	"encoding/json"
 	"fmt"
-	"io/fs"
 	"log/slog"
 	"os"
 	"path/filepath"
 	"runtime"
 	"strconv"
-	"strings"
 )
 
 //go:embed all:skills
@@ -115,6 +113,12 @@ func (i *ClaudeCodeInstaller) mkdirAll(path string, perm os.FileMode) error {
 	}
 	return os.MkdirAll(path, perm)
 }
+
+// dryRun / getLogger satisfy the installSink interface so the helpers
+// in install_shared.go can route DryRun + structured logging through
+// this installer.
+func (i *ClaudeCodeInstaller) dryRun() bool          { return i.DryRun }
+func (i *ClaudeCodeInstaller) getLogger() *slog.Logger { return i.Logger }
 
 // Install performs all installation steps. Errors from any step are joined
 // but not fatal — partial success is reported so the user can act.
@@ -245,120 +249,19 @@ func (i *ClaudeCodeInstaller) installCommands() ([]string, error) {
 	return i.syncEmbeddedTree(embeddedCommands, "commands", cmdsDest)
 }
 
-// syncEmbeddedTree walks an embed.FS rooted at `embedRoot`, mirroring
-// each file under `destRoot`. Files whose on-disk content already
-// matches the embedded version are left untouched (so reinstalls don't
-// thrash mtimes). Files under destRoot that are NOT in the embed are
-// removed -- otherwise a skill / command renamed or dropped upstream
-// would linger in the user's ~/.claude/{skills,commands}/ forever.
-// Honors DryRun via writeFile / mkdirAll / removeStale.
+// syncEmbeddedTree is a thin wrapper over the shared helper so the
+// existing call sites + tests keep their method-shaped invocation.
+// Stale-sweep is scoped to the "tma1-" owner prefix so user-installed
+// skills / commands sitting alongside ours in ~/.claude/{skills,
+// commands}/ are never touched.
 func (i *ClaudeCodeInstaller) syncEmbeddedTree(src embed.FS, embedRoot, destRoot string) ([]string, error) {
-	if err := i.mkdirAll(destRoot, 0o755); err != nil {
-		return nil, err
-	}
-	var changed []string
-	wanted := map[string]struct{}{} // tracks every target written or already-current
-	walkErr := fs.WalkDir(src, embedRoot, func(p string, d fs.DirEntry, walkErr error) error {
-		if walkErr != nil {
-			return walkErr
-		}
-		if d.IsDir() {
-			return nil
-		}
-		rel, err := filepath.Rel(embedRoot, p)
-		if err != nil {
-			return err
-		}
-		want, err := src.ReadFile(p)
-		if err != nil {
-			return err
-		}
-		target := filepath.Join(destRoot, rel)
-		wanted[target] = struct{}{}
-		if existing, err := os.ReadFile(target); err == nil && string(existing) == string(want) {
-			return nil
-		}
-		if err := i.mkdirAll(filepath.Dir(target), 0o755); err != nil {
-			return err
-		}
-		if err := i.writeFile(target, want, 0o644); err != nil {
-			return err
-		}
-		changed = append(changed, target)
-		return nil
-	})
-	if walkErr != nil {
-		return changed, walkErr
-	}
-	// Sweep stale files: anything under destRoot the embed no longer
-	// declares. Walking on-disk after the embed pass means we already
-	// know exactly which targets are legitimate (wanted set above).
-	staleRemoved, err := i.removeStaleUnder(destRoot, wanted)
-	if err != nil {
-		// Don't fail the install on cleanup error -- the desired files
-		// are already in place. Surface the staleness as part of the
-		// changed list so the caller can log it.
-		return changed, fmt.Errorf("remove stale under %s: %w", destRoot, err)
-	}
-	changed = append(changed, staleRemoved...)
-	return changed, nil
+	return syncEmbeddedTree(i, src, embedRoot, destRoot, "tma1-")
 }
 
-// removeStaleUnder walks `root` and removes every file whose path
-// isn't in `keep`. Empty directories left behind are removed too so
-// the user's ~/.claude/{skills,commands}/ doesn't accumulate dead
-// folders.
-//
-// DryRun-aware: in dry-run mode we log what would be deleted and
-// return the would-be paths without touching disk.
+// removeStaleUnder is a thin wrapper over the shared helper, scoped
+// to the "tma1-" owner prefix.
 func (i *ClaudeCodeInstaller) removeStaleUnder(root string, keep map[string]struct{}) ([]string, error) {
-	var removed []string
-	var dirs []string // bottom-up sweep for empties
-	// Root may not exist yet on a fresh install (and definitely doesn't
-	// in dry-run mode, where mkdirAll above was a logged no-op). Treat
-	// "no directory" as "no stale to clean".
-	if _, err := os.Stat(root); os.IsNotExist(err) {
-		return removed, nil
-	}
-	walkErr := filepath.WalkDir(root, func(path string, d fs.DirEntry, err error) error {
-		if err != nil {
-			return err
-		}
-		if path == root {
-			return nil
-		}
-		if d.IsDir() {
-			dirs = append(dirs, path)
-			return nil
-		}
-		if _, ok := keep[path]; ok {
-			return nil
-		}
-		if i.DryRun {
-			if i.Logger != nil {
-				i.Logger.Info("[dry-run] would remove stale", "path", path)
-			}
-			removed = append(removed, path+" (stale, would remove)")
-			return nil
-		}
-		if err := os.Remove(path); err != nil {
-			return err
-		}
-		removed = append(removed, path+" (stale, removed)")
-		return nil
-	})
-	if walkErr != nil {
-		return removed, walkErr
-	}
-	// Best-effort: prune now-empty directories from the deepest path
-	// first so a removed leaf doesn't leave behind a forest of empties.
-	for j := len(dirs) - 1; j >= 0; j-- {
-		if i.DryRun {
-			continue
-		}
-		_ = os.Remove(dirs[j]) // fails noisily only when non-empty; that's the signal we want
-	}
-	return removed, nil
+	return removeStaleUnder(i, root, keep, "tma1-")
 }
 
 // installSettings updates ~/.claude/settings.json to register UserPromptSubmit
@@ -395,42 +298,6 @@ func (i *ClaudeCodeInstaller) installSettings(scriptPath string) (string, bool, 
 		return settingsPath, false, err
 	}
 	return settingsPath, true, nil
-}
-
-// writeFileAtomic writes data to path via a temp-file + rename so a crash or
-// signal between truncate and full write can't leave the target half-written.
-// Critical for ~/.claude.json (OAuth + project history) and ~/.claude/settings.json
-// (hook registrations) — losing either silently breaks the user's CC install.
-//
-// The temp file lives in the same directory as the target so the rename is
-// guaranteed to be on the same filesystem (atomic).
-func writeFileAtomic(path string, data []byte, perm os.FileMode) error {
-	dir := filepath.Dir(path)
-	tmp, err := os.CreateTemp(dir, ".tma1-write-*")
-	if err != nil {
-		return err
-	}
-	tmpName := tmp.Name()
-	cleanup := func() { _ = os.Remove(tmpName) }
-	if _, err := tmp.Write(data); err != nil {
-		_ = tmp.Close()
-		cleanup()
-		return err
-	}
-	if err := tmp.Chmod(perm); err != nil {
-		_ = tmp.Close()
-		cleanup()
-		return err
-	}
-	if err := tmp.Close(); err != nil {
-		cleanup()
-		return err
-	}
-	if err := os.Rename(tmpName, path); err != nil {
-		cleanup()
-		return err
-	}
-	return nil
 }
 
 // installMCPServer registers `tma1` as an MCP stdio server under the
@@ -493,27 +360,6 @@ func (i *ClaudeCodeInstaller) installMCPServer() (string, bool, error) {
 		return cfgPath, false, err
 	}
 	return cfgPath, true, nil
-}
-
-// tma1BinaryPath returns the absolute path to the tma1-server binary CC
-// should spawn for `mcp-serve`. Prefer os.Executable() (the binary we're
-// running right now is what the user just invoked), then fall back to the
-// standard install location under DataDir/bin.
-func tma1BinaryPath(dataDir string) (string, error) {
-	if exe, err := os.Executable(); err == nil {
-		if resolved, err := filepath.EvalSymlinks(exe); err == nil {
-			return resolved, nil
-		}
-		return exe, nil
-	}
-	name := "tma1-server"
-	if runtime.GOOS == "windows" {
-		name = "tma1-server.exe"
-	}
-	if dataDir == "" {
-		return "", fmt.Errorf("cannot determine tma1-server path: no executable, no DataDir")
-	}
-	return filepath.Join(dataDir, "bin", name), nil
 }
 
 // mcpEntryEqual compares two MCP server entries on the fields we manage.
@@ -653,19 +499,6 @@ func entryCommand(entry map[string]any) string {
 	return cmd
 }
 
-// expandHome resolves a leading ~/ to $HOME so two paths pointing at the
-// same script are recognized as equal regardless of how they were spelled.
-func expandHome(p string) string {
-	if !strings.HasPrefix(p, "~/") {
-		return p
-	}
-	home, err := os.UserHomeDir()
-	if err != nil {
-		return p
-	}
-	return filepath.Join(home, p[2:])
-}
-
 func entryEqual(a, b any) bool {
 	am, _ := a.(map[string]any)
 	bm, _ := b.(map[string]any)
@@ -691,148 +524,16 @@ func entryEqual(a, b any) bool {
 // Strict on purpose: callers like installSettings / installMCPServer write
 // back to files that hold user-critical state. Silently treating a parse
 // error as "empty" would corrupt those files.
-func readJSONFileStrict(path string) (map[string]any, error) {
-	data, err := os.ReadFile(path)
-	if err != nil {
-		if os.IsNotExist(err) {
-			return map[string]any{}, nil
-		}
-		return nil, err
-	}
-	if len(strings.TrimSpace(string(data))) == 0 {
-		return map[string]any{}, nil
-	}
-	var m map[string]any
-	if err := json.Unmarshal(data, &m); err != nil {
-		return nil, fmt.Errorf("parse %s: %w", path, err)
-	}
-	if m == nil {
-		return nil, fmt.Errorf("parse %s: root is not a JSON object", path)
-	}
-	return m, nil
-}
-
-// installInstructions appends a TMA1 block to CLAUDE.md (or AGENTS.md if
-// CLAUDE.md is absent and AGENTS.md exists). Idempotent via marker matching.
+// installInstructions / installGitignore are thin method wrappers
+// around the shared helpers in install_shared.go so existing callers
+// (Install() and the tests) keep their method-shaped invocation.
+// CC prefers CLAUDE.md as the instructions file -- it's Claude
+// Code's canonical name; AGENTS.md is the fallback when CLAUDE.md
+// is absent.
 func (i *ClaudeCodeInstaller) installInstructions(projectDir string) (string, bool, error) {
-	target := chooseInstructionsFile(projectDir)
-	existing, _ := os.ReadFile(target)
-
-	const startMarker = "<!-- tma1:start -->"
-	const endMarker = "<!-- tma1:end -->"
-
-	desired := instructionsBlock(startMarker, endMarker)
-
-	var newContent []byte
-	if startIdx := indexOf(existing, []byte(startMarker)); startIdx >= 0 {
-		endIdx := indexOf(existing, []byte(endMarker))
-		if endIdx < 0 {
-			endIdx = len(existing)
-		} else {
-			endIdx += len(endMarker)
-		}
-		newContent = append([]byte{}, existing[:startIdx]...)
-		newContent = append(newContent, desired...)
-		newContent = append(newContent, existing[endIdx:]...)
-	} else {
-		// Append block. Ensure there is a blank line before.
-		newContent = append([]byte{}, existing...)
-		if len(newContent) > 0 && newContent[len(newContent)-1] != '\n' {
-			newContent = append(newContent, '\n')
-		}
-		if len(newContent) > 0 {
-			newContent = append(newContent, '\n')
-		}
-		newContent = append(newContent, desired...)
-		newContent = append(newContent, '\n')
-	}
-
-	if string(newContent) == string(existing) {
-		return target, false, nil
-	}
-	if err := i.writeFile(target, newContent, 0o644); err != nil {
-		return target, false, err
-	}
-	return target, true, nil
+	return installInstructions(i, projectDir, "CLAUDE.md")
 }
 
-func chooseInstructionsFile(projectDir string) string {
-	claudeMD := filepath.Join(projectDir, "CLAUDE.md")
-	agentsMD := filepath.Join(projectDir, "AGENTS.md")
-	if fileExists(claudeMD) {
-		return claudeMD
-	}
-	if fileExists(agentsMD) {
-		return agentsMD
-	}
-	return claudeMD
-}
-
-func fileExists(path string) bool {
-	_, err := os.Stat(path)
-	return err == nil
-}
-
-func instructionsBlock(start, end string) []byte {
-	return []byte(start + `
-## TMA1 Context Layer
-
-TMA1 thickens the Observe step in your reasoning loop. At the start of each
-turn it injects a <tma1-context> block summarising the current session
-(tool history, tokens, current focus, recent files). Use that block when
-deciding what to do next.
-
-**You should:**
-- Read the <tma1-context> block (when present) before reasoning about the next action
-- Call the MCP tool ` + "`get_session_state`" + ` if you need a fuller view of your prior tool calls
-- Call ` + "`get_context_bundle`" + ` after compaction or when context feels stale
-` + end)
-}
-
-// installGitignore appends ".tma1-context.md" to projectDir/.gitignore if
-// missing. Tolerates an absent .gitignore (creates it) and an absent project
-// (no-op).
 func (i *ClaudeCodeInstaller) installGitignore(projectDir string) (string, bool, error) {
-	path := filepath.Join(projectDir, ".gitignore")
-	existing, _ := os.ReadFile(path)
-	if containsLine(existing, ".tma1-context.md") {
-		return path, false, nil
-	}
-	suffix := ".tma1-context.md\n"
-	updated := existing
-	if len(updated) > 0 && updated[len(updated)-1] != '\n' {
-		updated = append(updated, '\n')
-	}
-	updated = append(updated, []byte(suffix)...)
-	if err := i.writeFile(path, updated, 0o644); err != nil {
-		return path, false, err
-	}
-	return path, true, nil
-}
-
-func containsLine(data []byte, line string) bool {
-	for _, l := range strings.Split(string(data), "\n") {
-		if strings.TrimSpace(l) == line {
-			return true
-		}
-	}
-	return false
-}
-
-func indexOf(haystack, needle []byte) int {
-	return strings.Index(string(haystack), string(needle))
-}
-
-func joinErrors(errs []error) error {
-	if len(errs) == 0 {
-		return nil
-	}
-	if len(errs) == 1 {
-		return errs[0]
-	}
-	parts := make([]string, len(errs))
-	for i, e := range errs {
-		parts[i] = e.Error()
-	}
-	return fmt.Errorf("multiple install errors: %s", strings.Join(parts, "; "))
+	return installGitignore(i, projectDir)
 }

@@ -3,6 +3,7 @@ package greptimedb
 import (
 	"errors"
 	"sort"
+	"strings"
 	"testing"
 )
 
@@ -82,6 +83,37 @@ func TestSchemaMigrationsCarrySQLAndIgnoreErr(t *testing.T) {
 		}
 		if m.IgnoreErr(errors.New("syntax error near 'foo'")) {
 			t.Errorf("migration v%d IgnoreErr swallows real errors", m.Version)
+		}
+	}
+}
+
+// TestSchemaMigrationsHasNoDestructiveDDL is the data-safety guard:
+// shipping migrations must NEVER `DROP TABLE`, `DROP COLUMN`,
+// `TRUNCATE` an existing tma1_* table, or `RENAME` one. An early
+// v3 draft used DROP+CREATE to retrofit a PRIMARY KEY and wiped
+// every dogfood install's anomaly_emits / build_events /
+// external_changes / project_state history before we caught it.
+//
+// If you genuinely need to reshape an existing table, do it via a
+// non-destructive CREATE-NEW → INSERT…SELECT → swap path (and
+// update this test's allowlist with a comment explaining why).
+func TestSchemaMigrationsHasNoDestructiveDDL(t *testing.T) {
+	destructive := []string{
+		"DROP TABLE",
+		"DROP COLUMN",
+		"TRUNCATE",
+		"RENAME TABLE",
+		"ALTER TABLE.*RENAME",
+	}
+	for _, m := range schemaMigrations {
+		for _, stmt := range m.SQL {
+			upper := strings.ToUpper(stmt)
+			for _, bad := range destructive {
+				if strings.Contains(upper, bad) {
+					t.Errorf("migration v%d contains destructive DDL %q: %s",
+						m.Version, bad, stmt)
+				}
+			}
 		}
 	}
 }

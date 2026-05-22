@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"sort"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/tma1-ai/tma1/server/internal/sqlutil"
@@ -116,55 +117,79 @@ func (b *Bundler) GetSessionState(ctx context.Context, sessionID string) (*Sessi
 		state.DurationMinutes = int(dur.Minutes())
 	}
 
+	// The three remaining queries (per-tool counts, token totals,
+	// recent files) are independent — each writes to a distinct
+	// field of `state`. Run them concurrently to drop the wall-clock
+	// to max(3) instead of sum(3). Same pattern peer.go uses for
+	// enrichPeerSession. Each goroutine swallows its own error
+	// (best-effort enrichment) so a slow / failing sub-query never
+	// blocks the rest.
+	var wg sync.WaitGroup
+	wg.Add(3)
+
 	// Per-tool counts.
-	toolSQL := fmt.Sprintf(
-		`SELECT tool_name, COUNT(*) AS n FROM tma1_hook_events
-		 WHERE session_id = '%s' AND event_type = 'PreToolUse' AND tool_name != ''
-		 GROUP BY tool_name ORDER BY n DESC LIMIT 12`,
-		escapeSQL(sessionID),
-	)
-	_, toolRows, err := b.client.Query(ctx, toolSQL)
-	if err == nil {
+	go func() {
+		defer wg.Done()
+		toolSQL := fmt.Sprintf(
+			`SELECT tool_name, COUNT(*) AS n FROM tma1_hook_events
+			 WHERE session_id = '%s' AND event_type = 'PreToolUse' AND tool_name != ''
+			 GROUP BY tool_name ORDER BY n DESC LIMIT 12`,
+			escapeSQL(sessionID),
+		)
+		_, toolRows, err := b.client.Query(ctx, toolSQL)
+		if err != nil {
+			return
+		}
+		tc := make([]ToolCount, 0, len(toolRows))
 		for _, tr := range toolRows {
-			state.RecentTools = append(state.RecentTools, ToolCount{
+			tc = append(tc, ToolCount{
 				Name:  stringAt(tr, 0),
 				Count: intAt(tr, 1),
 			})
 		}
-	}
+		state.RecentTools = tc
+	}()
 
-	// Tokens — sum from tma1_messages assistant rows (per CLAUDE.md tma1_messages
-	// has input_tokens / output_tokens columns).
-	tokenSQL := fmt.Sprintf(
-		`SELECT COALESCE(SUM(input_tokens), 0), COALESCE(SUM(output_tokens), 0)
-		 FROM tma1_messages
-		 WHERE session_id = '%s'`,
-		escapeSQL(sessionID),
-	)
-	_, tokRows, err := b.client.Query(ctx, tokenSQL)
-	if err == nil && len(tokRows) > 0 {
+	// Tokens — sum from tma1_messages assistant rows.
+	go func() {
+		defer wg.Done()
+		tokenSQL := fmt.Sprintf(
+			`SELECT COALESCE(SUM(input_tokens), 0), COALESCE(SUM(output_tokens), 0)
+			 FROM tma1_messages
+			 WHERE session_id = '%s'`,
+			escapeSQL(sessionID),
+		)
+		_, tokRows, err := b.client.Query(ctx, tokenSQL)
+		if err != nil || len(tokRows) == 0 {
+			return
+		}
 		state.TokensInput = int64At(tokRows[0], 0)
 		state.TokensOutput = int64At(tokRows[0], 1)
-	}
+	}()
 
 	// Recent file paths — prefer the ingest-side tool_file_path column;
 	// fall back to regex extraction on tool_input for legacy rows.
-	pathSQL := fmt.Sprintf(
-		`SELECT tool_name,
-		        COALESCE(tool_file_path,
-		                 regexp_match(tool_input, '"file_path":"([^"]+)"')[1]) AS fp,
-		        CAST(ts AS BIGINT) AS ts_ms
-		 FROM tma1_hook_events
-		 WHERE session_id = '%s' AND event_type = 'PreToolUse'
-		   AND tool_name IN ('Edit','Write','Read','MultiEdit')
-		 ORDER BY ts DESC LIMIT 60`,
-		escapeSQL(sessionID),
-	)
-	_, pathRows, err := b.client.Query(ctx, pathSQL)
-	if err == nil {
+	go func() {
+		defer wg.Done()
+		pathSQL := fmt.Sprintf(
+			`SELECT tool_name,
+			        COALESCE(tool_file_path,
+			                 regexp_match(tool_input, '"file_path":"([^"]+)"')[1]) AS fp,
+			        CAST(ts AS BIGINT) AS ts_ms
+			 FROM tma1_hook_events
+			 WHERE session_id = '%s' AND event_type = 'PreToolUse'
+			   AND tool_name IN ('Edit','Write','Read','MultiEdit')
+			 ORDER BY ts DESC LIMIT 60`,
+			escapeSQL(sessionID),
+		)
+		_, pathRows, err := b.client.Query(ctx, pathSQL)
+		if err != nil {
+			return
+		}
 		state.RecentFiles, state.CurrentFocus = extractFilesFromRows(pathRows, state.LastActivityAt)
-	}
+	}()
 
+	wg.Wait()
 	return state, nil
 }
 

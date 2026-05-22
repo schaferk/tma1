@@ -20,10 +20,11 @@ func TestEscapeLike(t *testing.T) {
 	cases := []struct{ in, want string }{
 		{"", ""},
 		{"plain", "plain"},
-		{"50%", "50!%"},
-		{"a_b", "a!_b"},
-		{"!bang", "!!bang"},
-		{"O'Brien_%!", "O''Brien!_!%!!"},
+		{"50%", `50\%`},
+		{"a_b", `a\_b`},
+		{`back\slash`, `back\\slash`},
+		{"bang!", "bang!"}, // '!' no longer special — passes through.
+		{`O'Brien_%\`, `O''Brien\_\%\\`},
 	}
 	for _, c := range cases {
 		if got := EscapeLike(c.in); got != c.want {

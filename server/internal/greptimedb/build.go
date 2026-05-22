@@ -14,11 +14,17 @@ import (
 // FULLTEXT on message so the dashboard can search by error text.
 //
 // `message`, `stream`, `tag` are GreptimeDB reserved keywords — quoted.
+// buildTableDDL — project + event_type are the dominant filters
+// (every GetBuildStatus query is scoped to one project's tag) and
+// both are low-cardinality (a few projects × 3 event_types:
+// started / output / completed). Make them PRIMARY KEY for locality.
+// Keep INVERTED on severity (used as a filter); FULLTEXT on message
+// for dashboard keyword search.
 var buildTableDDL = `CREATE TABLE IF NOT EXISTS tma1_build_events (
     ts          TIMESTAMP TIME INDEX,
-    project     STRING SKIPPING INDEX,
+    project     STRING,
+    event_type  STRING,
     command     STRING NULL,
-    event_type  STRING INVERTED INDEX,
     severity    STRING NULL INVERTED INDEX,
     "stream"    STRING NULL,
     "message"   STRING NULL FULLTEXT INDEX WITH (backend='bloom', analyzer='English', case_sensitive='false'),
@@ -27,7 +33,8 @@ var buildTableDDL = `CREATE TABLE IF NOT EXISTS tma1_build_events (
     exit_code   INT NULL,
     duration_ms BIGINT NULL,
     host        STRING NULL,
-    "tag"       STRING NULL
+    "tag"       STRING NULL,
+    PRIMARY KEY (project, event_type)
 ) WITH ('append_mode'='true')`
 
 // InitBuildTable creates tma1_build_events. Idempotent.

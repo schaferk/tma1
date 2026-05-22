@@ -87,6 +87,85 @@ func TestProcessCodexLineCarriesConversationIDIntoSubagentLifecycle(t *testing.T
 	}
 }
 
+// TestCodexLiveGateSkipsSubagentEvents pins down the rule that the
+// live-hook gate must NOT suppress SubagentStart / SubagentStop —
+// Codex never POSTs those via hooks, so the JSONL parser is the only
+// writer. Gating them silently dropped hierarchy data for any session
+// the hook adapter was active for.
+func TestCodexLiveGateSkipsSubagentEvents(t *testing.T) {
+	sqlCh := make(chan string, 4)
+	ts := httptest.NewServer(httpTestHandler(sqlCh))
+	defer ts.Close()
+
+	oldClient := httpClient
+	httpClient = ts.Client()
+	defer func() { httpClient = oldClient }()
+
+	w := &Watcher{
+		sqlURL:        ts.URL,
+		logger:        slog.New(slog.NewTextHandler(io.Discard, nil)),
+		IsLiveSession: func(string) bool { return true }, // every session is "live"
+	}
+	seen := make(map[string]struct{})
+	fctx := &codexFileContext{fileID: "codex:rollout-test-sub"}
+
+	// session_meta with subagent → SubagentStart (must NOT be gated).
+	w.processCodexLine("rollout-test",
+		`{"timestamp":"2026-05-22T05:00:00Z","type":"session_meta","payload":{"id":"conv-x","source":{"subagent":"review"}}}`,
+		seen, fctx)
+	// task_complete on a subagent file → SubagentStop (must NOT be gated).
+	w.processCodexLine("rollout-test",
+		`{"timestamp":"2026-05-22T05:00:01Z","type":"event_msg","payload":{"type":"task_complete"}}`,
+		seen, fctx)
+
+	sqls := []string{waitForSQL(t, sqlCh), waitForSQL(t, sqlCh)}
+	var sawStart, sawStop bool
+	for _, sql := range sqls {
+		if strings.Contains(sql, "SubagentStart") {
+			sawStart = true
+		}
+		if strings.Contains(sql, "SubagentStop") {
+			sawStop = true
+		}
+	}
+	if !sawStart || !sawStop {
+		t.Fatalf("subagent lifecycle rows must survive live-hook gate, got SQLs %q", sqls)
+	}
+}
+
+// TestCodexLiveGateSuppressesHookCoveredEvents confirms the gate still
+// fires for events the hook adapter actually posts (PreToolUse /
+// PostToolUse), so we don't double-write rows.
+func TestCodexLiveGateSuppressesHookCoveredEvents(t *testing.T) {
+	sqlCh := make(chan string, 4)
+	ts := httptest.NewServer(httpTestHandler(sqlCh))
+	defer ts.Close()
+
+	oldClient := httpClient
+	httpClient = ts.Client()
+	defer func() { httpClient = oldClient }()
+
+	w := &Watcher{
+		sqlURL:        ts.URL,
+		logger:        slog.New(slog.NewTextHandler(io.Discard, nil)),
+		IsLiveSession: func(string) bool { return true },
+	}
+	seen := make(map[string]struct{})
+	fctx := &codexFileContext{fileID: "codex:rollout-test", live: true}
+
+	// function_call → PreToolUse (hook-covered, MUST be gated).
+	w.processCodexLine("rollout-test",
+		`{"timestamp":"2026-05-22T05:00:00Z","type":"response_item","payload":{"type":"function_call","name":"bash","call_id":"c1"}}`,
+		seen, fctx)
+
+	select {
+	case sql := <-sqlCh:
+		t.Fatalf("expected no insert for hook-covered PreToolUse when live, got %s", sql)
+	case <-time.After(150 * time.Millisecond):
+		// expected — gate suppressed the insert
+	}
+}
+
 func httpTestHandler(sqlCh chan<- string) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		if err := r.ParseForm(); err != nil {

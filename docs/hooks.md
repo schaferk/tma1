@@ -1,24 +1,27 @@
 # Hooks
 
-TMA1 wires into Claude Code via five hook events. Each one is a
-request-response exchange: the hook script POSTs the event payload to
-`http://127.0.0.1:14318/api/hooks`, the server's stdout-shaped reply
-becomes the injection content.
+TMA1 wires into Claude Code via five hook events (Codex registers
+four of them — Codex's hook catalogue does not include `PreCompact`).
+Each event is a request-response exchange: the hook script POSTs the
+event payload to `http://127.0.0.1:14318/api/hooks`, the server's
+stdout-shaped reply becomes the injection content.
 
-## The five events
+## The injection events
 
-| Event | When CC fires it | What TMA1 returns | Channel |
-|-------|------------------|-------------------|---------|
-| `UserPromptSubmit` | Before each user turn | `<tma1-context>` digest (session state, anomalies, build, recent external changes) | Prepended to the user prompt |
-| `PostToolUse` | After each tool call returns | One-line anomaly note when a rule routes to `post_tool_use` (no rule does today; default silent) | Appended to tool result |
-| `Stop` | When the agent wants to stop | JSON `{"decision":"block","reason":"…"}` when there are unresolved `stop_block`-channel anomalies; empty otherwise | Blocks termination |
-| `SessionStart` | New session opens | `<tma1-context>` digest for the prior session + external changes in the meantime | Prepended to the session's first prompt |
-| `PreCompact` | Before CC compacts old turns | "Preserve through compaction" framed bundle | Folded into the post-compaction summary |
+| Event | When the agent fires it | What TMA1 returns | Channel | Adapters |
+|-------|-------------------------|-------------------|---------|----------|
+| `UserPromptSubmit` | Before each user turn | `<tma1-context>` digest (session state, anomalies, build, recent external changes) | Prepended to the user prompt | CC + Codex |
+| `PostToolUse` | After each tool call returns | One-line anomaly note when a rule routes to `post_tool_use` (no rule does today; default silent) | Appended to tool result | CC + Codex |
+| `Stop` | When the agent wants to stop | JSON `{"decision":"block","reason":"…"}` when there are unresolved `stop_block`-channel anomalies; empty otherwise | Blocks termination | CC + Codex |
+| `SessionStart` | New session opens | `<tma1-context>` digest for the prior session + external changes in the meantime | Prepended to the session's first prompt | CC + Codex |
+| `PreCompact` | Before CC compacts old turns | "Preserve through compaction" framed bundle | Folded into the post-compaction summary | CC only — Codex has no equivalent hook |
 
 ## Hook script protocol
 
 `tma1-server install --adapter claude-code` writes
-`~/.tma1/hooks/tma1-hook.sh` (or `.ps1` on Windows). The script:
+`~/.tma1/hooks/tma1-hook.sh` (or `.ps1` on Windows). For Codex,
+`tma1-server install --adapter codex` writes the analogous
+`~/.tma1/hooks/tma1-hook-codex.sh` (or `.ps1`). Both scripts:
 
 1. Reads the event JSON from stdin.
 2. POSTs it to `127.0.0.1:14318/api/hooks`.
@@ -27,6 +30,13 @@ becomes the injection content.
      PowerShell's `-TimeoutSec` only accepts whole seconds, so we
      trade ~500 ms of latency on Windows for keeping the script
      dependency-free (no .NET HttpClient wrapper).
+   - **Codex variant** appends `?source=codex&envelope=codex` so
+     the handler tags the row with `agent_source='codex'` and
+     reshapes the response from CC's raw-stdout / Stop-decision-JSON
+     into Codex's `hookSpecificOutput.additionalContext` shape (Stop
+     stays as `{decision,reason}` — that shape is identical for both
+     agents). The hook-content generator
+     (`generateInjection`) is shared; only the envelope differs.
 3. Writes the response body to stdout.
 
 On any error — server unreachable, timeout, non-200, etc. — stdout is
@@ -42,8 +52,13 @@ the agent.
 
 ## Registration
 
-`install --adapter claude-code` writes idempotent entries into
-`~/.claude/settings.json` for all five events:
+Both adapters write idempotent entries scoped to a `tma1`
+identifier so legacy and user-written entries for the same events
+are preserved.
+
+**Claude Code** — `install --adapter claude-code` writes into
+`~/.claude/settings.json` for all five injection-content events
+(plus the other 22 telemetry-only events Claude Code emits):
 
 ```json
 {
@@ -60,6 +75,35 @@ the agent.
 The installer recognises legacy entries (no `id` field) by command path
 and rewrites them in place — it won't add a second TMA1 entry that runs
 the same script twice.
+
+**Codex** — `install --adapter codex` writes the analogous entries
+into `~/.codex/hooks.json` for the four injection events Codex
+supports (`SessionStart`, `UserPromptSubmit`, `PostToolUse`, `Stop`)
+plus `PreToolUse` for anomaly telemetry — Codex's hook catalogue
+([developers.openai.com/codex/hooks](https://developers.openai.com/codex/hooks))
+has no `PreCompact` event, so context compaction is the one signal
+the Codex adapter cannot push. It also registers
+itself as an MCP server under `[mcp_servers.tma1]` in
+`~/.codex/config.toml` (TOML merge so user-managed entries stay
+intact), and drops the `tma1-peer` skill into
+`~/.agents/skills/tma1-peer/`. Stale-sweep on these multi-tenant
+directories is scoped to the `tma1-` owner prefix — user-installed
+skills sitting alongside ours are never touched.
+
+The hook **content** is the same (`generateInjection` is
+adapter-agnostic). Only the **envelope** differs: Codex's hook
+script POSTs with `?envelope=codex`, and the server reshapes the
+response into Codex's `hookSpecificOutput.additionalContext`. Stop
+output already matches both agents (`{decision:"block",reason:…}`).
+
+`PreToolUse` on Codex deliberately never injects context — Codex
+does not consume `additionalContext` from `PreToolUse` hooks
+([openai/codex#19385](https://github.com/openai/codex/issues/19385)).
+The shaper emits `{"continue": true}` for PreToolUse and lets the
+agent proceed. Our anomaly rules route HIGH-severity findings
+through `Stop` and MEDIUM through `UserPromptSubmit`, both of
+which Codex consumes correctly, so this gap doesn't affect the
+rules we ship.
 
 ### Why every matcher is `""`
 

@@ -1,0 +1,22 @@
+# TMA1 hook — Codex variant. Forwards Codex hook events to tma1-server and
+# returns the response in Codex's `hookSpecificOutput.additionalContext`
+# (or `decision`/`reason` for Stop) shape — the server handles the wrap
+# behind ?envelope=codex.
+#
+# Codex hook protocol: stdin = JSON object with snake_case keys. stdout =
+# JSON object. Empty stdout (or {}) is the silent-no-op signal.
+#
+# Fail-safe: any error → empty stdout, exit 0. Never blocks the agent.
+# PowerShell's Invoke-WebRequest only accepts whole-second timeouts; we
+# trade ~500 ms of latency on Windows for keeping the script dependency-
+# free. Both Unix curl-0.5s and PS TimeoutSec=1 sit above the server-side
+# 300 ms `hookInjectionTimeout` cap.
+$ErrorActionPreference = 'SilentlyContinue'
+$body = [Console]::In.ReadToEnd()
+try {
+    $resp = Invoke-WebRequest -Uri 'http://127.0.0.1:{{PORT}}/api/hooks?source=codex&envelope=codex' `
+        -Method POST -ContentType 'application/json' -Body $body -TimeoutSec 1 -UseBasicParsing
+    if ($resp.Content) { [Console]::Out.Write($resp.Content) }
+} catch {
+    exit 0
+}

@@ -19,16 +19,22 @@ import (
 //     the next N tool calls? Target >= 30%
 // "channel" is a GreptimeDB reserved keyword and must be quoted in DDL +
 // every DML that touches the column.
+// anomalyEmitsTableDDL — kind + severity are the dominant filters
+// (every dashboard / budget query starts with at least one of them)
+// and both are low-cardinality (6 kinds × 3 severities). Make them
+// the PRIMARY KEY for locality; session_id stays SKIPPING for
+// high-cardinality bloom-filter equality.
 var anomalyEmitsTableDDL = `CREATE TABLE IF NOT EXISTS tma1_anomaly_emits (
     ts               TIMESTAMP TIME INDEX,
+    kind             STRING,
+    severity         STRING,
     session_id       STRING SKIPPING INDEX,
-    kind             STRING INVERTED INDEX,
-    severity         STRING INVERTED INDEX,
     "channel"        STRING NULL,
     evidence         STRING NULL,
     suggestion       STRING NULL,
     related_files    STRING NULL,
-    first_emitted_at TIMESTAMP NULL
+    first_emitted_at TIMESTAMP NULL,
+    PRIMARY KEY (kind, severity)
 ) WITH ('append_mode'='true')`
 
 // InitAnomalyEmitsTable creates tma1_anomaly_emits. Idempotent.

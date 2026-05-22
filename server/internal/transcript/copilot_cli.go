@@ -14,6 +14,9 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/tma1-ai/tma1/server/internal/derive"
+	"github.com/tma1-ai/tma1/server/internal/sqlutil"
 )
 
 const (
@@ -879,11 +882,18 @@ func (w *Watcher) insertCopilotCLIHookEventFull(ts time.Time, fctx *copilotCLICo
 		cwd = fctx.cwd
 	}
 
+	// Derive ingest-time columns so downstream queries don't fall back
+	// to regex_match on tool_input. Matches the CC + Codex path.
+	filePath, cmdPrefix, success, errSummary := derive.Fields(
+		eventType, toolName, toolInput, toolResult, "",
+	)
+
 	sql := fmt.Sprintf(
 		"INSERT INTO tma1_hook_events "+
 			"(ts, session_id, event_type, agent_source, tool_name, tool_input, tool_result, "+
-			"tool_use_id, agent_id, agent_type, notification_type, \"message\", cwd, transcript_path, conversation_id, metadata) "+
-			"VALUES (%d, '%s', '%s', '%s', '%s', '%s', '%s', '%s', '%s', '%s', '', '', '%s', '', '%s', '%s')",
+			"tool_use_id, agent_id, agent_type, notification_type, \"message\", cwd, transcript_path, conversation_id, metadata, "+
+			"tool_file_path, tool_command_prefix, tool_success, tool_error_summary) "+
+			"VALUES (%d, '%s', '%s', '%s', '%s', '%s', '%s', '%s', '%s', '%s', '', '', '%s', '', '%s', '%s', %s, %s, %s, %s)",
 		msTs,
 		escapeSQLString(fctx.dbSessionID()),
 		escapeSQLString(eventType),
@@ -897,6 +907,10 @@ func (w *Watcher) insertCopilotCLIHookEventFull(ts time.Time, fctx *copilotCLICo
 		escapeSQLString(truncate(cwd, 512)),
 		escapeSQLString(fctx.dbSessionID()),
 		escapeSQLString(metadataJSON), // json.Marshal already escapes backslashes
+		sqlutil.Quote(filePath, 512),
+		sqlutil.Quote(cmdPrefix, 200),
+		nullableBool(success),
+		sqlutil.Quote(errSummary, 400),
 	)
 	go func() {
 		insertSem <- struct{}{}

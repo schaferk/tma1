@@ -73,6 +73,38 @@ var schemaMigrations = []Migration{
 		},
 		IgnoreErr: isIgnorableSchemaUpgradeError,
 	},
+	{
+		Version: 3,
+		Description: "v2 backstop — re-issue CREATE IF NOT EXISTS for the 4 " +
+			"tables introduced by this branch (anomaly_emits / build_events / " +
+			"external_changes / project_state). " +
+			"An earlier draft of this migration did DROP+CREATE to retrofit " +
+			"a PRIMARY KEY on installs that pre-dated the layout change; " +
+			"that path is gone — the data loss it caused on dogfood instances " +
+			"was not worth the perf delta on these append-only tables. " +
+			"What remains is an idempotent CREATE IF NOT EXISTS, which is a " +
+			"no-op on installs that already have the tables and a safety net " +
+			"if init somehow failed to create them earlier in startup. " +
+			"tma1_hook_events and tma1_messages are unaffected and never were.",
+		SQL: []string{
+			// Each DDL is CREATE TABLE IF NOT EXISTS — see the *TableDDL
+			// definitions in anomaly_emits.go / build.go / external.go /
+			// project.go. Re-issuing them here means the migration ledger
+			// stamps v3 applied even on hosts that already ran the init
+			// pass, keeping the version line monotonic.
+			anomalyEmitsTableDDL,
+			buildTableDDL,
+			externalChangesTableDDL,
+			projectStateTableDDL,
+		},
+		// CREATE TABLE IF NOT EXISTS shouldn't raise duplicate-column
+		// either, but keep the tolerant guard in case a future column
+		// addition lands inside one of the *TableDDL strings without a
+		// matching migration entry — that would be a separate bug, but
+		// silently no-op'ing it here lets the ledger keep advancing
+		// instead of wedging the start sequence.
+		IgnoreErr: isIgnorableSchemaUpgradeError,
+	},
 }
 
 // schemaVersionDDL creates the migration ledger. Append-only so the

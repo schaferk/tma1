@@ -3,6 +3,7 @@ package perception
 import (
 	"context"
 	"fmt"
+	"sync"
 	"time"
 
 	"github.com/tma1-ai/tma1/server/internal/strutil"
@@ -75,28 +76,81 @@ func (b *Bundler) GetBuildStatus(ctx context.Context, project string) (*BuildSta
 		LastEventAt: time.UnixMilli(lastMs),
 	}
 
-	// Step 2: most recent COMPLETED for this tag (defines command + exit
-	// code). If the build is still running (watcher mode, no completion
-	// yet), these stay zero/null — that's how the agent knows it's live.
-	completeSQL := fmt.Sprintf(
-		`SELECT command, exit_code, duration_ms
-		 FROM tma1_build_events
-		 WHERE project = '%s' AND "tag" = '%s' AND event_type = 'completed'
-		 ORDER BY ts DESC LIMIT 1`,
-		escapeSQL(project), escapeSQL(activeTag),
-	)
-	if _, cr, err := b.client.Query(ctx, completeSQL); err == nil && len(cr) > 0 {
-		status.Command = stringAt(cr[0], 0)
-		if cr[0][1] != nil {
-			code := intAt(cr[0], 1)
-			status.LastExitCode = &code
-		}
-		status.LastDurationMs = int64At(cr[0], 2)
-	}
+	// Steps 2, 3, 4 are tag-scoped queries that don't depend on each
+	// other: completion lookup (Step 2 — drives Command + ExitCode),
+	// error count (Step 3 — independent), last-error message
+	// (Step 4 — independent). Run in parallel; each writes to a
+	// distinct field of `status`.
+	//
+	// Step 2's fallback (any-event command lookup) only fires when
+	// Step 2 returned no completion; that path stays serial AFTER
+	// Step 2 to avoid wasting a query on the happy path where a
+	// completion was present.
+	var wg sync.WaitGroup
+	wg.Add(3)
 
-	// Fallback: if no completion yet, take command from any event for this
-	// tag (command is constant per run). Covers both still-running watchers
-	// and rows from older binaries that didn't emit a "started" event.
+	// Step 2: most recent COMPLETED for this tag (defines command + exit code).
+	go func() {
+		defer wg.Done()
+		completeSQL := fmt.Sprintf(
+			`SELECT command, exit_code, duration_ms
+			 FROM tma1_build_events
+			 WHERE project = '%s' AND "tag" = '%s' AND event_type = 'completed'
+			 ORDER BY ts DESC LIMIT 1`,
+			escapeSQL(project), escapeSQL(activeTag),
+		)
+		if _, cr, err := b.client.Query(ctx, completeSQL); err == nil && len(cr) > 0 {
+			status.Command = stringAt(cr[0], 0)
+			if cr[0][1] != nil {
+				code := intAt(cr[0], 1)
+				status.LastExitCode = &code
+			}
+			status.LastDurationMs = int64At(cr[0], 2)
+		}
+	}()
+
+	// Step 3: error count for this tag in the last 30 min.
+	go func() {
+		defer wg.Done()
+		errCountSQL := fmt.Sprintf(
+			`SELECT COUNT(*) FROM tma1_build_events
+			 WHERE project = '%s' AND "tag" = '%s'
+			   AND ts > now() - INTERVAL '30 minutes'
+			   AND (severity = 'error' OR (event_type = 'completed' AND exit_code != 0))`,
+			escapeSQL(project), escapeSQL(activeTag),
+		)
+		if _, er, err := b.client.Query(ctx, errCountSQL); err == nil && len(er) > 0 {
+			status.ErrorsInLast30Min = intAt(er[0], 0)
+		}
+	}()
+
+	// Step 4: most recent stderr/error message for THIS tag (truncated).
+	// Include ts so the renderer can show "Xm ago".
+	go func() {
+		defer wg.Done()
+		lastErrSQL := fmt.Sprintf(
+			`SELECT "message", CAST(ts AS BIGINT) AS ts_ms FROM tma1_build_events
+			 WHERE project = '%s' AND "tag" = '%s'
+			   AND (severity = 'error' OR "stream" = 'stderr')
+			   AND ts > now() - INTERVAL '30 minutes'
+			 ORDER BY ts DESC LIMIT 1`,
+			escapeSQL(project), escapeSQL(activeTag),
+		)
+		if _, lr, err := b.client.Query(ctx, lastErrSQL); err == nil && len(lr) > 0 {
+			msg := stringAt(lr[0], 0)
+			if len(msg) > 400 {
+				msg = strutil.SafeTruncate(msg, 400) + "…"
+			}
+			status.LastErrorMessage = msg
+			status.LastErrorAt = time.UnixMilli(int64At(lr[0], 1))
+		}
+	}()
+
+	wg.Wait()
+
+	// Step 2 fallback (serial, only when needed): if no completion was
+	// found, fetch the command from any event for this tag. Common
+	// case (completion present) skips this entirely.
 	if status.Command == "" {
 		anySQL := fmt.Sprintf(
 			`SELECT command FROM tma1_build_events
@@ -108,41 +162,6 @@ func (b *Bundler) GetBuildStatus(ctx context.Context, project string) (*BuildSta
 		if _, ar, err := b.client.Query(ctx, anySQL); err == nil && len(ar) > 0 {
 			status.Command = stringAt(ar[0], 0)
 		}
-	}
-
-	// Step 3: error count for this tag in the last 30 min.
-	errCountSQL := fmt.Sprintf(
-		`SELECT COUNT(*) FROM tma1_build_events
-		 WHERE project = '%s' AND "tag" = '%s'
-		   AND ts > now() - INTERVAL '30 minutes'
-		   AND (severity = 'error' OR (event_type = 'completed' AND exit_code != 0))`,
-		escapeSQL(project), escapeSQL(activeTag),
-	)
-	if _, er, err := b.client.Query(ctx, errCountSQL); err == nil && len(er) > 0 {
-		status.ErrorsInLast30Min = intAt(er[0], 0)
-	}
-
-	// Step 4: most recent stderr/error message for THIS tag (truncated).
-	// Include ts so the renderer can show "Xm ago" — an agent reading a
-	// stale error otherwise has no way to know the build may have recovered.
-	lastErrSQL := fmt.Sprintf(
-		`SELECT "message", CAST(ts AS BIGINT) AS ts_ms FROM tma1_build_events
-		 WHERE project = '%s' AND "tag" = '%s'
-		   AND (severity = 'error' OR "stream" = 'stderr')
-		   AND ts > now() - INTERVAL '30 minutes'
-		 ORDER BY ts DESC LIMIT 1`,
-		escapeSQL(project), escapeSQL(activeTag),
-	)
-	if _, lr, err := b.client.Query(ctx, lastErrSQL); err == nil && len(lr) > 0 {
-		msg := stringAt(lr[0], 0)
-		if len(msg) > 400 {
-			// Rune-safe truncation — build errors carry stderr that may
-			// be non-ASCII (locale-localised compiler messages, paths
-			// with accented chars).
-			msg = strutil.SafeTruncate(msg, 400) + "…"
-		}
-		status.LastErrorMessage = msg
-		status.LastErrorAt = time.UnixMilli(int64At(lr[0], 1))
 	}
 
 	return status, nil

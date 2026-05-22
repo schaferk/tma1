@@ -104,14 +104,40 @@ func (d *Detector) Detect(ctx context.Context, sessionID string) []Anomaly {
 		return cached
 	}
 
+	// Run the rules concurrently. Each rule issues 1-3 GreptimeDB
+	// queries and is independent of the others' output — the
+	// suppression layer below merges per-key. Total wall-clock drops
+	// from sum(rule latencies) to max(rule latency).
+	//
+	// Map iteration is non-deterministic (it always was), so we
+	// collect under a mutex; suppression layer sorts by stableKey
+	// anyway when deduping.
+	type ruleResult struct {
+		hits []Anomaly
+		err  error
+		name string
+	}
+	rules := d.rules()
+	resCh := make(chan ruleResult, len(rules))
+	var wg sync.WaitGroup
+	for name, rule := range rules {
+		wg.Add(1)
+		go func(name string, rule ruleFunc) {
+			defer wg.Done()
+			hits, err := rule(ctx, sessionID)
+			resCh <- ruleResult{hits: hits, err: err, name: name}
+		}(name, rule)
+	}
+	wg.Wait()
+	close(resCh)
+
 	var candidates []Anomaly
-	for name, rule := range d.rules() {
-		hits, err := rule(ctx, sessionID)
-		if err != nil {
-			d.logger.Debug("anomaly rule failed", "rule", name, "session", sessionID, "err", err)
+	for r := range resCh {
+		if r.err != nil {
+			d.logger.Debug("anomaly rule failed", "rule", r.name, "session", sessionID, "err", r.err)
 			continue
 		}
-		candidates = append(candidates, hits...)
+		candidates = append(candidates, r.hits...)
 	}
 
 	// Apply suppression. The Detector layer first asks each candidate's
@@ -233,7 +259,7 @@ func (d *Detector) resolverReReadHappened(ctx context.Context, sessionID string,
 		 WHERE session_id = '%s'
 		   AND event_type = 'PreToolUse' AND tool_name = 'Read'
 		   AND ts > %d
-		   AND (tool_file_path = '%s' OR tool_input LIKE '%%"file_path":"%s"%%' ESCAPE '!')`,
+		   AND (tool_file_path = '%s' OR tool_input LIKE '%%"file_path":"%s"%%')`,
 		escapeSQL(sessionID), lastEmitted.UnixMilli(),
 		escapeSQL(fp), escapeSQLLike(fp),
 	)
@@ -309,7 +335,7 @@ func (d *Detector) ruleBuildBrokenAfterMyEdit(ctx context.Context, sessionID str
 			 WHERE session_id = '%s'
 			   AND event_type = 'PostToolUseFailure' AND tool_name = 'Bash'
 			   AND ts BETWEEN %d AND %d
-			   AND (tool_input LIKE '%%%s%%' ESCAPE '!' OR tool_result LIKE '%%%s%%' ESCAPE '!')
+			   AND (tool_input LIKE '%%%s%%' OR tool_result LIKE '%%%s%%')
 			 ORDER BY ts DESC LIMIT 5`,
 			escapeSQL(sessionID),
 			lastEdit.Add(-10*time.Minute).UnixMilli(),
@@ -676,9 +702,10 @@ func detectStaleEdit(reads, edits, changes []int64) int64 {
 // ingest -- nope, it isn't; we use the LIKE escape pattern instead.
 //
 // Adding a runner: append a pattern that, when used in
-// `tool_command_prefix LIKE '<pattern>%' ESCAPE '!'`, identifies a
-// test invocation. The trailing space-or-end is implicit in the
-// 60-char prefix store.
+// `tool_command_prefix LIKE '<pattern>%'`, identifies a test
+// invocation. The trailing space-or-end is implicit in the 60-char
+// prefix store. GreptimeDB's LIKE escape char is backslash, which
+// sqlutil.EscapeLike emits inline — no explicit ESCAPE clause needed.
 var testRunnerPrefixes = []string{
 	"go test",
 	"cargo test",
@@ -716,7 +743,7 @@ func (d *Detector) ruleTestStuck(ctx context.Context, sessionID string) ([]Anoma
 	clauses := make([]string, 0, len(testRunnerPrefixes))
 	for _, p := range testRunnerPrefixes {
 		clauses = append(clauses,
-			fmt.Sprintf("tool_command_prefix LIKE '%s%%' ESCAPE '!'", escapeSQLLike(p)))
+			fmt.Sprintf("tool_command_prefix LIKE '%s%%'", escapeSQLLike(p)))
 	}
 	sql := fmt.Sprintf(
 		`SELECT tool_command_prefix AS prefix, COUNT(*) AS n

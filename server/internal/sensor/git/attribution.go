@@ -90,7 +90,7 @@ func (a *HookAttributor) Classify(ctx context.Context, filePath string, when tim
 		 WHERE event_type = 'PreToolUse'
 		   AND tool_name = 'Bash'
 		   AND ts BETWEEN %d AND %d
-		   AND tool_input LIKE '%%%s%%' ESCAPE '!'`,
+		   AND tool_input LIKE '%%%s%%'`,
 		low, high, escapeSQLLikeLiteral(base),
 	)
 	if count, err := a.queryCount(ctx, bashSQL); err != nil {

@@ -79,11 +79,21 @@ func parseGitignore(content string) *gitignoreMatcher {
 // matches returns true when path should be ignored per the loaded
 // patterns. root is the project root that the .gitignore lives in;
 // matches uses it to normalise relative comparisons.
+//
+// Both inputs are normalised to forward slashes up front so the
+// substring/prefix/suffix logic below stays a single POSIX-shaped
+// path-handling path. fsnotify gives us OS-native separators on
+// Windows, which would otherwise never match dir/literal patterns
+// that were parsed as POSIX. filepath.ToSlash is OS-conditional
+// (no-op on Unix), so we use ReplaceAll directly — that keeps unit
+// tests for Windows paths reproducible on a macOS/Linux runner.
 func (m *gitignoreMatcher) matches(path, root string) bool {
 	if m == nil {
 		return false
 	}
-	rel := strings.TrimPrefix(path, root)
+	normPath := strings.ReplaceAll(path, "\\", "/")
+	normRoot := strings.ReplaceAll(root, "\\", "/")
+	rel := strings.TrimPrefix(normPath, normRoot)
 	rel = strings.TrimPrefix(rel, "/")
 	for _, d := range m.dirs {
 		if strings.Contains(rel, d+"/") || strings.HasSuffix(rel, "/"+d) || rel == d {
@@ -96,11 +106,18 @@ func (m *gitignoreMatcher) matches(path, root string) bool {
 		}
 	}
 	for _, s := range m.suffixes {
-		if strings.HasSuffix(path, s) {
+		if strings.HasSuffix(normPath, s) {
 			return true
 		}
 	}
-	base := filepath.Base(path)
+	// Cross-platform basename: take everything after the last forward
+	// slash on the already-normalised path. filepath.Base would use
+	// the OS-native separator and miss backslash-separated input on
+	// non-Windows runners.
+	base := normPath
+	if idx := strings.LastIndex(normPath, "/"); idx >= 0 {
+		base = normPath[idx+1:]
+	}
 	for _, lit := range m.literals {
 		if base == lit {
 			return true

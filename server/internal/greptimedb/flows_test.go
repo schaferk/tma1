@@ -2,6 +2,9 @@ package greptimedb
 
 import (
 	"fmt"
+	"io"
+	"net/http"
+	"net/http/httptest"
 	"strings"
 	"testing"
 )
@@ -216,6 +219,80 @@ func TestDefaultPricing(t *testing.T) {
 		if p.OutputPrice <= 0 {
 			t.Errorf("pattern %s: output_price should be > 0", p.Pattern)
 		}
+	}
+}
+
+// TestExecSQLSurfacesJSONBodyError guards against the silent-failure
+// regression where GreptimeDB returns HTTP 200 with a JSON error body
+// and execSQL returns nil. If that ever returns nil again,
+// RunSchemaMigrations stamps a failed migration as applied and the
+// schema goes out of sync with the ledger.
+func TestExecSQLSurfacesJSONBodyError(t *testing.T) {
+	tests := []struct {
+		name    string
+		body    string
+		status  int
+		wantErr bool
+		wantSub string
+	}{
+		{
+			name:    "json error code with HTTP 200",
+			body:    `{"code":1003,"error":"column conversation_id already exists"}`,
+			status:  http.StatusOK,
+			wantErr: true,
+			wantSub: "already exists",
+		},
+		{
+			name:    "json error string only",
+			body:    `{"error":"unknown column \"foo\""}`,
+			status:  http.StatusOK,
+			wantErr: true,
+			wantSub: "unknown column",
+		},
+		{
+			name:    "json error with leading whitespace",
+			body:    "  \n\t" + `{"code":1003,"error":"duplicate column"}`,
+			status:  http.StatusOK,
+			wantErr: true,
+			wantSub: "duplicate column",
+		},
+		{
+			name:    "json code 0 = success",
+			body:    `{"code":0,"output":[]}`,
+			status:  http.StatusOK,
+			wantErr: false,
+		},
+		{
+			name:    "empty body 200 = success",
+			body:    ``,
+			status:  http.StatusOK,
+			wantErr: false,
+		},
+		{
+			name:    "http error",
+			body:    `internal server error`,
+			status:  http.StatusInternalServerError,
+			wantErr: true,
+			wantSub: "HTTP 500",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				w.WriteHeader(tt.status)
+				_, _ = io.WriteString(w, tt.body)
+			}))
+			defer srv.Close()
+
+			err := execSQL(srv.URL, "ALTER TABLE t ADD COLUMN c STRING")
+			if (err != nil) != tt.wantErr {
+				t.Fatalf("execSQL err=%v wantErr=%v", err, tt.wantErr)
+			}
+			if tt.wantErr && tt.wantSub != "" && !strings.Contains(err.Error(), tt.wantSub) {
+				t.Fatalf("execSQL err=%q does not contain %q", err.Error(), tt.wantSub)
+			}
+		})
 	}
 }
 

@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"sort"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -85,21 +86,45 @@ func (b *Bundler) GetPeerSessions(
 
 	// All-peers path: top-N per peer agent. Each agent is queried
 	// independently so we get a per-agent LIMIT instead of a global one.
-	// Iteration is serial — three peers, query latency dominates anyway.
+	// Run the three peers' queries in parallel -- each fans out to ~6
+	// HTTP roundtrips against GreptimeDB; serial iteration was costing
+	// ~3x the latency for no real reason (we're network-bound, not
+	// CPU-bound).
 	agents := make([]string, 0, len(validPeerAgents))
 	for a := range validPeerAgents {
 		agents = append(agents, a)
 	}
 	sort.Strings(agents) // stable output order for tests
 
+	type agentResult struct {
+		idx      int
+		sessions []PeerSession
+	}
+	resCh := make(chan agentResult, len(agents))
+	var wg sync.WaitGroup
+	for idx, agent := range agents {
+		wg.Add(1)
+		go func(idx int, agent string) {
+			defer wg.Done()
+			sessions, err := b.getPeerSessionsOneAgent(ctx, agent, project, limit, messageLimit, sinceMin)
+			if err != nil {
+				// best-effort: one agent's failure must not blank out the others.
+				return
+			}
+			resCh <- agentResult{idx: idx, sessions: sessions}
+		}(idx, agent)
+	}
+	wg.Wait()
+	close(resCh)
+
+	// Reassemble in agent-name order so test output stays stable.
+	gathered := make([][]PeerSession, len(agents))
+	for r := range resCh {
+		gathered[r.idx] = r.sessions
+	}
 	var all []PeerSession
-	for _, agent := range agents {
-		sessions, err := b.getPeerSessionsOneAgent(ctx, agent, project, limit, messageLimit, sinceMin)
-		if err != nil {
-			// best-effort: one agent's query failing must not blank out the others
-			continue
-		}
-		all = append(all, sessions...)
+	for _, s := range gathered {
+		all = append(all, s...)
 	}
 	// Most-recent first across all agents — the caller's mental model is
 	// "show me what peers were doing".
@@ -215,27 +240,41 @@ func peerCwdFilter(project string) string {
 		root := strings.TrimRight(project, "/")
 		// Match the root exactly OR any subdirectory under it. Anchoring
 		// with the trailing slash prevents `/foo` from matching `/foobar`.
-		return fmt.Sprintf("AND (cwd = '%s' OR cwd LIKE '%s/%%' ESCAPE '!') ",
+		return fmt.Sprintf("AND (cwd = '%s' OR cwd LIKE '%s/%%') ",
 			escapeSQL(root), escapeSQLLike(root))
 	}
-	return fmt.Sprintf("AND cwd LIKE '%%/%s%%' ESCAPE '!' ", escapeSQLLike(project))
+	return fmt.Sprintf("AND cwd LIKE '%%/%s%%' ", escapeSQLLike(project))
 }
 
 // enrichPeerSession fills Messages / RecentToolNames / FilesTouched /
 // tokens. Errors on individual fills are swallowed (best-effort).
+//
+// All four sub-queries are independent and read-only -- they run
+// concurrently so the per-session enrichment latency is the slowest
+// of the four, not their sum. Before this change the four roundtrips
+// were serial, making each session ~4x slower than necessary against
+// a GreptimeDB under load.
 func (b *Bundler) enrichPeerSession(ctx context.Context, ps *PeerSession, messageLimit int) {
+	var wg sync.WaitGroup
+	wg.Add(4)
+
 	// Messages: pull from tma1_messages.
-	msgSQL := fmt.Sprintf(
-		`SELECT CAST(ts AS BIGINT) AS ts_ms,
-		        message_type, "role", content, model, tool_name,
-		        input_tokens, output_tokens
-		 FROM tma1_messages
-		 WHERE session_id = '%s'
-		   AND content IS NOT NULL
-		 ORDER BY ts DESC LIMIT %d`,
-		escapeSQL(ps.SessionID), messageLimit,
-	)
-	if _, rows, err := b.client.Query(ctx, msgSQL); err == nil {
+	go func() {
+		defer wg.Done()
+		msgSQL := fmt.Sprintf(
+			`SELECT CAST(ts AS BIGINT) AS ts_ms,
+			        message_type, "role", content, model, tool_name,
+			        input_tokens, output_tokens
+			 FROM tma1_messages
+			 WHERE session_id = '%s'
+			   AND content IS NOT NULL
+			 ORDER BY ts DESC LIMIT %d`,
+			escapeSQL(ps.SessionID), messageLimit,
+		)
+		_, rows, err := b.client.Query(ctx, msgSQL)
+		if err != nil {
+			return
+		}
 		// We fetched DESC; flip to chronological order for natural reading.
 		msgs := make([]PeerMessage, 0, len(rows))
 		for i := len(rows) - 1; i >= 0; i-- {
@@ -252,27 +291,37 @@ func (b *Bundler) enrichPeerSession(ctx context.Context, ps *PeerSession, messag
 			})
 		}
 		ps.Messages = msgs
-	}
+	}()
 
 	// Token totals (use SUM separately — messages above may be capped by limit).
-	tokSQL := fmt.Sprintf(
-		`SELECT COALESCE(SUM(input_tokens), 0), COALESCE(SUM(output_tokens), 0)
-		 FROM tma1_messages WHERE session_id = '%s'`,
-		escapeSQL(ps.SessionID),
-	)
-	if _, rows, err := b.client.Query(ctx, tokSQL); err == nil && len(rows) > 0 {
+	go func() {
+		defer wg.Done()
+		tokSQL := fmt.Sprintf(
+			`SELECT COALESCE(SUM(input_tokens), 0), COALESCE(SUM(output_tokens), 0)
+			 FROM tma1_messages WHERE session_id = '%s'`,
+			escapeSQL(ps.SessionID),
+		)
+		_, rows, err := b.client.Query(ctx, tokSQL)
+		if err != nil || len(rows) == 0 {
+			return
+		}
 		ps.TokensInput = int64At(rows[0], 0)
 		ps.TokensOutput = int64At(rows[0], 1)
-	}
+	}()
 
 	// Top tools by count.
-	toolSQL := fmt.Sprintf(
-		`SELECT tool_name, COUNT(*) AS n FROM tma1_hook_events
-		 WHERE session_id = '%s' AND event_type = 'PreToolUse' AND tool_name != ''
-		 GROUP BY tool_name ORDER BY n DESC LIMIT 5`,
-		escapeSQL(ps.SessionID),
-	)
-	if _, rows, err := b.client.Query(ctx, toolSQL); err == nil {
+	go func() {
+		defer wg.Done()
+		toolSQL := fmt.Sprintf(
+			`SELECT tool_name, COUNT(*) AS n FROM tma1_hook_events
+			 WHERE session_id = '%s' AND event_type = 'PreToolUse' AND tool_name != ''
+			 GROUP BY tool_name ORDER BY n DESC LIMIT 5`,
+			escapeSQL(ps.SessionID),
+		)
+		_, rows, err := b.client.Query(ctx, toolSQL)
+		if err != nil {
+			return
+		}
 		names := make([]string, 0, len(rows))
 		for _, r := range rows {
 			if s := stringAt(r, 0); s != "" {
@@ -280,20 +329,25 @@ func (b *Bundler) enrichPeerSession(ctx context.Context, ps *PeerSession, messag
 			}
 		}
 		ps.RecentToolNames = names
-	}
+	}()
 
 	// Files touched — drop the CC-specific tool_name filter so we also
 	// pick up Codex (apply_patch, write_stdin), OpenClaw (custom tools),
 	// etc. Anything whose tool_input carries a file_path counts.
-	fileSQL := fmt.Sprintf(
-		`SELECT DISTINCT COALESCE(tool_file_path,
-		                          regexp_match(tool_input, '"file_path":"([^"]+)"')[1]) AS fp
-		 FROM tma1_hook_events
-		 WHERE session_id = '%s' AND event_type = 'PreToolUse'
-		 LIMIT 30`,
-		escapeSQL(ps.SessionID),
-	)
-	if _, rows, err := b.client.Query(ctx, fileSQL); err == nil {
+	go func() {
+		defer wg.Done()
+		fileSQL := fmt.Sprintf(
+			`SELECT DISTINCT COALESCE(tool_file_path,
+			                          regexp_match(tool_input, '"file_path":"([^"]+)"')[1]) AS fp
+			 FROM tma1_hook_events
+			 WHERE session_id = '%s' AND event_type = 'PreToolUse'
+			 LIMIT 30`,
+			escapeSQL(ps.SessionID),
+		)
+		_, rows, err := b.client.Query(ctx, fileSQL)
+		if err != nil {
+			return
+		}
 		files := make([]string, 0, len(rows))
 		seen := map[string]bool{}
 		for _, r := range rows {
@@ -305,7 +359,9 @@ func (b *Bundler) enrichPeerSession(ctx context.Context, ps *PeerSession, messag
 			files = append(files, fp)
 		}
 		ps.FilesTouched = files
-	}
+	}()
+
+	wg.Wait()
 }
 
 // normalizePeerAgent maps user-friendly aliases to canonical agent_source

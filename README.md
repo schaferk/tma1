@@ -44,15 +44,27 @@ OpenClaw and OTel GenAI views also have a Security tab (shell commands, prompt i
 
 Observability is one half; the other half is feeding what TMA1 sees back into the agent's reasoning loop so it can do better work next turn. v2 ships two channels for this:
 
-**Push channel — hooks inject context into the agent's prompt stream.** Five Claude Code hook events are wired to TMA1: `UserPromptSubmit` prepends a session digest before each turn, `SessionStart` orients a fresh session with prior state and external changes, `PreCompact` carries critical state through context compaction, `PostToolUse` appends per-tool anomaly notes when needed, and `Stop` blocks termination on unresolved high-severity issues. The hook script (`~/.tma1/hooks/tma1-hook.sh` on Unix, `tma1-hook.ps1` on Windows) is request–response: it POSTs the event, and whatever the server returns becomes the injection content. Fail-safe: 500 ms client timeout on Unix and 1 s on Windows (PowerShell's `-TimeoutSec` minimum granularity) — both sit above the server-side `hookInjectionTimeout = 300 ms` cap, so a slow path falls back to empty stdout. The agent never blocks on TMA1.
+**Push channel — hooks inject context into the agent's prompt stream.** Five hook events are wired to TMA1 — `UserPromptSubmit` prepends a session digest before each turn, `SessionStart` orients a fresh session with prior state and external changes, `PreCompact` carries critical state through context compaction, `PostToolUse` appends per-tool anomaly notes when needed, and `Stop` blocks termination on unresolved high-severity issues. **Claude Code** (`tma1-server install --adapter claude-code`) wires all five into `~/.claude/settings.json`. **Codex** (`tma1-server install --adapter codex`) wires the four that exist in Codex's hook catalogue — `PreCompact` is CC-only — into `~/.codex/hooks.json`. The hook script is request–response: it POSTs the event, and whatever the server returns becomes the injection content (raw stdout for CC; wrapped in Codex's `hookSpecificOutput.additionalContext` shape for Codex). Fail-safe: 500 ms client timeout on Unix and 1 s on Windows — both sit above the server-side `hookInjectionTimeout = 300 ms` cap, so a slow path falls back to empty stdout. The agent never blocks on TMA1.
 
-**Pull channel — seven MCP stdio tools the agent can call on demand.** `get_context_bundle` is the aggregate entry point; `get_session_state` returns the full action history; `get_anomalies` lists currently-active issues; `get_external_changes` shows what changed on disk outside the agent; `get_build_status` reports the last build watcher state; `get_project_state` is the static index of the project's structure; `get_peer_sessions` lets Claude Code read recent sessions from Codex / OpenClaw / Copilot CLI on the same project.
+**Pull channel — seven MCP stdio tools the agent can call on demand.** `get_context_bundle` is the aggregate entry point; `get_session_state` returns the full action history; `get_anomalies` lists currently-active issues; `get_external_changes` shows what changed on disk outside the agent; `get_build_status` reports the last build watcher state; `get_project_state` is the static index of the project's structure; `get_peer_sessions` lets one agent read recent sessions from the other agents on the same project (Claude Code ↔ Codex ↔ OpenClaw ↔ Copilot CLI — symmetric). The MCP server is registered in each agent's own config (`~/.claude.json` for CC, `~/.codex/config.toml` `[mcp_servers.tma1]` for Codex) by the adapter installer.
 
 **Anomaly engine.** Six rules run on every Detect, with a per-session 10-minute suppression layer plus resolution checks (e.g. R-stale-view auto-clears when the agent re-reads the modified file). Each anomaly routes to a specific channel — `stop_block` for HIGH-severity build/test issues, `user_prompt_submit` for stale views and human-modified-during-session — so the same finding never injects twice. Three validation gates ship: `/api/anomalies/budget` (≤ 5 emits/kind/day target), `/api/anomalies/follow-rate` (≥ 30% target), and offline precision via the `tma1_anomaly_emits` table.
 
 **Cross-agent collaboration.** Inside Claude Code, `/tma1-peer codex` pulls Codex's most recent session content on the current project and feeds it directly into Claude's context — no copy-paste between terminals. `/tma1-peer copilot 2` works the same way for Copilot CLI; `/tma1-peer` alone returns the latest session from every peer agent.
 
-Setup is one command. After `curl … | TMA1_ADAPTER=claude-code bash`, the binary writes hook entries into `~/.claude/settings.json`, registers itself as an MCP server in `~/.claude.json`, drops the `/tma1-peer` skill into `~/.claude/skills/`, and adds a TMA1 block to your project's CLAUDE.md (or AGENTS.md). All idempotent — re-running install only updates what's stale.
+Setup is one command per agent — both are idempotent:
+
+```bash
+# Claude Code: writes hooks + MCP + /tma1-peer skill + CLAUDE.md/AGENTS.md block.
+curl -fsSL https://tma1.ai/install.sh | TMA1_ADAPTER=claude-code bash
+
+# Codex: writes hooks + MCP + tma1-peer skill + AGENTS.md block in Codex's
+# native config shape (~/.codex/hooks.json, ~/.codex/config.toml,
+# ~/.agents/skills/tma1-peer/).
+curl -fsSL https://tma1.ai/install.sh | TMA1_ADAPTER=codex bash
+```
+
+Stale-sweep is scoped to a `tma1-` owner prefix on both adapters, so personal skills + commands sitting alongside ours in `~/.claude/{skills,commands}/` or `~/.agents/skills/` are never touched. Re-running install only updates files that drifted.
 
 See [docs/mcp-tools.md](docs/mcp-tools.md), [docs/hooks.md](docs/hooks.md), and [docs/anomalies.md](docs/anomalies.md) for the deeper reference.
 

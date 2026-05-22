@@ -17,16 +17,19 @@ build: sync-plugin
 	mkdir -p $(MAKEFILE_DIR)/server/bin
 	cd server && CGO_ENABLED=0 go build -o ./bin/tma1-server ./cmd/tma1-server
 
-# sync-plugin mirrors claude-plugin/{skills,commands}/ (canonical source — end
-# users get this via the published plugin) into server/internal/hooks/{skills,
-# commands}/ where the trees are baked into the binary via go:embed. Always
-# runs before build so the embedded copies can't drift from the plugin source.
+# sync-plugin mirrors claude-plugin/{skills,commands,codex-skills}/
+# (canonical source — end users get this via the published plugin) into
+# server/internal/hooks/{skills,commands,codex-skills}/ where the trees
+# are baked into the binary via go:embed. Always runs before build so
+# the embedded copies can't drift from the plugin source.
 sync-plugin:
 	@rm -rf $(MAKEFILE_DIR)/server/internal/hooks/skills
 	@cp -R $(MAKEFILE_DIR)/claude-plugin/skills $(MAKEFILE_DIR)/server/internal/hooks/skills
 	@rm -rf $(MAKEFILE_DIR)/server/internal/hooks/commands
 	@cp -R $(MAKEFILE_DIR)/claude-plugin/commands $(MAKEFILE_DIR)/server/internal/hooks/commands
-	@echo "synced claude-plugin/{skills,commands}/ -> server/internal/hooks/"
+	@rm -rf $(MAKEFILE_DIR)/server/internal/hooks/codex-skills
+	@cp -R $(MAKEFILE_DIR)/claude-plugin/codex-skills $(MAKEFILE_DIR)/server/internal/hooks/codex-skills
+	@echo "synced claude-plugin/{skills,commands,codex-skills}/ -> server/internal/hooks/"
 
 # Back-compat alias: pre-existing scripts / hooks may still target sync-skills.
 sync-skills: sync-plugin

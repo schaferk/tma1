@@ -10,6 +10,9 @@ import (
 	"path/filepath"
 	"strings"
 	"time"
+
+	"github.com/tma1-ai/tma1/server/internal/derive"
+	"github.com/tma1-ai/tma1/server/internal/sqlutil"
 )
 
 const (
@@ -643,11 +646,18 @@ func (w *Watcher) insertOpenClawModelMessage(sessionID string, ts time.Time, mod
 func (w *Watcher) insertOpenClawHookEvent(sessionID string, ts time.Time, eventType, toolName, toolInput, toolUseID, toolResult string, fctx *openclawFileContext) {
 	msTs := w.nextTS(ts)
 
+	// Derive ingest-time columns to match CC + Codex + Copilot CLI
+	// paths so the anomaly + peer queries don't fall back to regex.
+	filePath, cmdPrefix, success, errSummary := derive.Fields(
+		eventType, toolName, toolInput, toolResult, "",
+	)
+
 	sql := fmt.Sprintf(
 		"INSERT INTO tma1_hook_events "+
 			"(ts, session_id, event_type, agent_source, tool_name, tool_input, tool_result, "+
-			"tool_use_id, agent_id, agent_type, notification_type, \"message\", cwd, transcript_path, conversation_id) "+
-			"VALUES (%d, '%s', '%s', 'openclaw', '%s', '%s', '%s', '%s', '', '', '', '', '', '', '')",
+			"tool_use_id, agent_id, agent_type, notification_type, \"message\", cwd, transcript_path, conversation_id, "+
+			"tool_file_path, tool_command_prefix, tool_success, tool_error_summary) "+
+			"VALUES (%d, '%s', '%s', 'openclaw', '%s', '%s', '%s', '%s', '', '', '', '', '', '', '', %s, %s, %s, %s)",
 		msTs,
 		escapeSQLString(sessionID),
 		escapeSQLString(eventType),
@@ -655,6 +665,10 @@ func (w *Watcher) insertOpenClawHookEvent(sessionID string, ts time.Time, eventT
 		escapeSQLString(truncate(toolInput, maxToolInput)),
 		escapeSQLString(truncate(toolResult, maxToolContent)),
 		escapeSQLString(toolUseID),
+		sqlutil.Quote(filePath, 512),
+		sqlutil.Quote(cmdPrefix, 200),
+		nullableBool(success),
+		sqlutil.Quote(errSummary, 400),
 	)
 	go func() {
 		insertSem <- struct{}{}

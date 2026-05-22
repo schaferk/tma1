@@ -8,8 +8,10 @@
 // of truth; callers should not roll their own.
 //
 // All three primitives assume the literal will be embedded inside
-// single-quoted SQL strings and that LIKE patterns explicitly use
-// ESCAPE '!'. Don't mix-and-match with a different escape char.
+// single-quoted SQL strings. LIKE patterns rely on GreptimeDB's
+// default escape character — backslash — so callers do NOT need an
+// `ESCAPE` clause; using one with any other char fails at parse time
+// ("LIKE does not support escape_char other than the backslash").
 package sqlutil
 
 import (
@@ -30,17 +32,17 @@ func Escape(s string) string {
 
 // EscapeLike escapes s for use as a literal inside a LIKE pattern,
 // then applies Escape so the result is safe inside a single-quoted
-// SQL literal too. Pair with `ESCAPE '!'` in the SQL clause -- '!' as
-// the escape character avoids the SQL-string-literal vs Go-string-
-// literal backslash double-escape that '\' would otherwise require.
+// SQL literal too. GreptimeDB's LIKE only accepts backslash as the
+// escape character, so backslash is what we emit; no `ESCAPE` clause
+// is needed in the SQL.
 //
 // Use whenever an unsanitised file_path / command / project name /
 // other agent-controlled string is interpolated into a LIKE pattern;
 // otherwise a path containing '%' or '_' silently over-matches.
 func EscapeLike(s string) string {
-	s = strings.ReplaceAll(s, "!", "!!")
-	s = strings.ReplaceAll(s, "%", "!%")
-	s = strings.ReplaceAll(s, "_", "!_")
+	s = strings.ReplaceAll(s, `\`, `\\`) // backslash itself first
+	s = strings.ReplaceAll(s, `%`, `\%`)
+	s = strings.ReplaceAll(s, `_`, `\_`)
 	return strings.ReplaceAll(s, "'", "''")
 }
 

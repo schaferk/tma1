@@ -2,6 +2,7 @@
 package greptimedb
 
 import (
+	"bytes"
 	_ "embed"
 	"encoding/json"
 	"fmt"
@@ -38,45 +39,68 @@ func SetDatabaseTTL(httpPort int, ttl string, logger *slog.Logger) error {
 	return nil
 }
 
-// sessionTableDDLs are created unconditionally on startup (no dependency on trace data).
-// sessionTableDDLs v2: append-only tables with proper indexes.
-// - No PRIMARY KEY: avoids high-cardinality tag penalty (session_id is UUID).
-// - append_mode=true: skips merge/dedup, faster scans for log-like data.
-// - SKIPPING INDEX on session_id: Bloom filter for high-cardinality equality lookups.
-// - INVERTED INDEX on low-cardinality filter columns.
-// - FULLTEXT INDEX on content: accelerates keyword search.
+// sessionTableDDLs are created unconditionally on startup (no dependency
+// on trace data). Layout follows the GreptimeDB design-table guide:
+//
+//   - PRIMARY KEY: low-cardinality columns that appear in every
+//     WHERE / GROUP BY / ORDER BY (agent_source + event_type for
+//     hook_events; "role" + message_type for messages). With
+//     append_mode=true, PK is purely a locality hint -- no dedupe
+//     overhead, but data with the same PK clusters together for
+//     better scan performance.
+//   - SKIPPING INDEX on session_id (high cardinality UUID-ish) for
+//     bloom-filter accelerated equality lookups.
+//   - INVERTED INDEX on `model` (medium cardinality, used as a
+//     filter sometimes in messages).
+//   - FULLTEXT INDEX on content for matches_term() keyword search.
+//
+// All columns from v1 + v2 migrations (conversation_id,
+// permission_mode, metadata, tool_file_path, tool_command_prefix,
+// tool_success, tool_error_summary on hook_events; the token + timing
+// columns on messages) are baked into the base DDL so the v3
+// migration's DROP+CREATE lands the full schema in one shot. v1+v2
+// ADD COLUMN migrations on subsequent startups become no-ops
+// (already-exists errors swallowed by isIgnorableSchemaUpgradeError).
 var sessionTableDDLs = []string{
 	`CREATE TABLE IF NOT EXISTS tma1_hook_events (
-    ts                TIMESTAMP TIME INDEX,
-    session_id        STRING SKIPPING INDEX,
-    event_type        STRING INVERTED INDEX,
-    agent_source      STRING INVERTED INDEX,
-    tool_name         STRING NULL,
-    tool_input        STRING NULL,
-    tool_result       STRING NULL,
-    tool_use_id       STRING NULL,
-    agent_id          STRING NULL,
-    agent_type        STRING NULL,
-    notification_type STRING NULL,
-    "message"         STRING NULL,
-    cwd               STRING NULL,
-    transcript_path   STRING NULL,
-    conversation_id   STRING NULL
+    ts                  TIMESTAMP TIME INDEX,
+    agent_source        STRING,
+    event_type          STRING,
+    session_id          STRING SKIPPING INDEX,
+    tool_name           STRING NULL,
+    tool_input          STRING NULL,
+    tool_result         STRING NULL,
+    tool_use_id         STRING NULL,
+    agent_id            STRING NULL,
+    agent_type          STRING NULL,
+    notification_type   STRING NULL,
+    "message"           STRING NULL,
+    cwd                 STRING NULL,
+    transcript_path     STRING NULL,
+    conversation_id     STRING NULL,
+    permission_mode     STRING NULL,
+    "metadata"          STRING NULL,
+    tool_file_path      STRING NULL,
+    tool_command_prefix STRING NULL,
+    tool_success        BOOLEAN NULL,
+    tool_error_summary  STRING NULL,
+    PRIMARY KEY (agent_source, event_type)
 ) WITH ('append_mode'='true')`,
 	`CREATE TABLE IF NOT EXISTS tma1_messages (
-    ts              TIMESTAMP TIME INDEX,
-    session_id      STRING SKIPPING INDEX,
-    message_type    STRING INVERTED INDEX,
-    "role"          STRING INVERTED INDEX,
-    content         STRING NULL FULLTEXT INDEX WITH (backend='bloom', analyzer='English', case_sensitive='false'),
-    model           STRING NULL INVERTED INDEX,
-    tool_name       STRING NULL,
-    tool_use_id     STRING NULL,
-    input_tokens    BIGINT NULL,
-    output_tokens   BIGINT NULL,
-    cache_read_tokens      BIGINT NULL,
-    cache_creation_tokens  BIGINT NULL,
-    duration_ms            BIGINT NULL
+    ts                    TIMESTAMP TIME INDEX,
+    "role"                STRING,
+    message_type          STRING,
+    session_id            STRING SKIPPING INDEX,
+    content               STRING NULL FULLTEXT INDEX WITH (backend='bloom', analyzer='English', case_sensitive='false'),
+    model                 STRING NULL INVERTED INDEX,
+    tool_name             STRING NULL,
+    tool_use_id           STRING NULL,
+    input_tokens          BIGINT NULL,
+    output_tokens         BIGINT NULL,
+    cache_read_tokens     BIGINT NULL,
+    cache_creation_tokens BIGINT NULL,
+    duration_ms           BIGINT NULL,
+    PRIMARY KEY ("role", message_type)
 ) WITH ('append_mode'='true')`,
 	`CREATE TABLE IF NOT EXISTS tma1_prompt_insights (
     ts              TIMESTAMP TIME INDEX,
@@ -236,6 +260,26 @@ func execSQL(sqlURL, stmt string) error {
 
 	if resp.StatusCode != http.StatusOK {
 		return fmt.Errorf("exec sql HTTP %d: %s", resp.StatusCode, string(body))
+	}
+	// GreptimeDB's HTTP SQL API returns SQL errors as HTTP 200 with a
+	// JSON body whose `code` is non-zero. Without this check, ALTER /
+	// CREATE failures slip past and the schema-migration ledger stamps
+	// the version as applied even though the statement never ran.
+	// Look at the trimmed slice so a body that happens to start with
+	// whitespace still gets parsed.
+	trimmed := bytes.TrimSpace(body)
+	if len(trimmed) > 0 && trimmed[0] == '{' {
+		var r struct {
+			Code  int    `json:"code"`
+			Error string `json:"error"`
+		}
+		if json.Unmarshal(trimmed, &r) == nil && (r.Code != 0 || r.Error != "") {
+			msg := r.Error
+			if msg == "" {
+				msg = fmt.Sprintf("code %d", r.Code)
+			}
+			return fmt.Errorf("exec sql: %s", msg)
+		}
 	}
 	return nil
 }

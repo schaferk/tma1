@@ -15,16 +15,21 @@ import (
 // stay consistent with every other tma1 table.)
 // `root`, `language` are GreptimeDB reserved keywords — must be quoted in
 // DDL + DML.
+// project is the only filter (every query is "latest snapshot for
+// this one project") and is low-cardinality — PRIMARY KEY for locality
+// per the GreptimeDB design-table guide. INVERTED on language for the
+// occasional cross-project "show all Rust projects" filter.
 var projectStateTableDDL = `CREATE TABLE IF NOT EXISTS tma1_project_state (
     ts             TIMESTAMP TIME INDEX,
-    project        STRING SKIPPING INDEX,
+    project        STRING,
     "root"         STRING NULL,
     "language"     STRING NULL INVERTED INDEX,
     build_system   STRING NULL,
     test_framework STRING NULL,
     frameworks     STRING NULL,
     key_files      STRING NULL,
-    module_summary STRING NULL
+    module_summary STRING NULL,
+    PRIMARY KEY (project)
 ) WITH ('append_mode'='true')`
 
 // InitProjectStateTable creates tma1_project_state. Idempotent.

@@ -11,15 +11,21 @@ import (
 // Captures file-system + git events for any project the agent has touched,
 // so the perception layer can tell an agent "while you were away, a human
 // modified src/auth.rs and committed README.md". Append-only.
+//
+// project + change_type + attribution are the dominant filters (every
+// R-stale-view / R-human-modified query uses all three) and all are
+// low-cardinality. Make them PRIMARY KEY for locality per the
+// GreptimeDB design-table guide.
 var externalChangesTableDDL = `CREATE TABLE IF NOT EXISTS tma1_external_changes (
     ts          TIMESTAMP TIME INDEX,
-    project     STRING SKIPPING INDEX,
-    change_type STRING INVERTED INDEX,
+    project     STRING,
+    change_type STRING,
+    attribution STRING,
     file_path   STRING NULL,
     git_sha     STRING NULL,
     git_message STRING NULL,
-    attribution STRING NULL INVERTED INDEX,
-    host        STRING NULL
+    host        STRING NULL,
+    PRIMARY KEY (project, change_type, attribution)
 ) WITH ('append_mode'='true')`
 
 // InitExternalChangesTable creates tma1_external_changes. Idempotent.

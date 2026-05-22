@@ -279,9 +279,19 @@ var staticIgnoreSuffixes = []string{
 // call this directly; runtime callers go through
 // (*projectWatcher).shouldIgnorePath which also consults the loaded
 // .gitignore.
+//
+// Windows note: fsnotify hands us OS-native paths (backslashes on
+// Windows), but staticIgnoreFragments are written POSIX-style so the
+// list reads naturally and matches the .gitignore convention. We
+// normalize backslashes to forward slashes once at the top so
+// substring checks work regardless of platform. We can't use
+// filepath.ToSlash here because its behaviour is OS-dependent (no-op
+// on Unix) — but we want a Windows path passed to us on a Unix host
+// (e.g. cross-platform tests) to still match the fragments.
 func staticShouldIgnorePath(p string) bool {
+	normalized := strings.ReplaceAll(p, "\\", "/")
 	for _, frag := range staticIgnoreFragments {
-		if strings.Contains(p, frag) {
+		if strings.Contains(normalized, frag) {
 			return true
 		}
 	}

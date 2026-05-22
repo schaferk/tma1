@@ -89,6 +89,34 @@ docs/secrets.md
 	}
 }
 
+// TestMatchesWindowsPathsAgainstPOSIXPatterns pins down the
+// cross-platform normalisation: a Windows-shaped path passed in (as
+// fsnotify would deliver it on Windows) must still match the same
+// .gitignore patterns the project parsed POSIX-style.
+func TestMatchesWindowsPathsAgainstPOSIXPatterns(t *testing.T) {
+	m := parseGitignore("bin/\nnode_modules/\n*.log\ndocs/secrets.md\n")
+	if m == nil {
+		t.Fatal("matcher should not be nil")
+	}
+	root := `C:\repo`
+	cases := []struct {
+		path string
+		want bool
+	}{
+		{`C:\repo\bin\tma1-server.exe`, true},  // dir pattern
+		{`C:\repo\node_modules\react\index.js`, true},
+		{`C:\repo\var\app.log`, true}, // suffix pattern
+		{`C:\repo\docs\secrets.md`, true},
+		{`C:\repo\src\main.go`, false},
+		{`C:\repo\README.md`, false},
+	}
+	for _, c := range cases {
+		if got := m.matches(c.path, root); got != c.want {
+			t.Errorf("matches(%q) = %v, want %v", c.path, got, c.want)
+		}
+	}
+}
+
 func TestLoadGitignoreReadsFile(t *testing.T) {
 	dir := t.TempDir()
 	content := "bin/\n*.log\n"

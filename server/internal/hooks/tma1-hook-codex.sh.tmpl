@@ -1,0 +1,16 @@
+#!/bin/bash
+# TMA1 hook — Codex variant. Forwards Codex hook events to tma1-server and
+# returns the response in Codex's `hookSpecificOutput.additionalContext`
+# (or `decision`/`reason` for Stop) shape — the server handles the wrap
+# behind ?envelope=codex.
+#
+# Codex hook protocol: stdin = JSON object with snake_case keys
+# (session_id / hook_event_name / cwd / tool_name / …). stdout = JSON
+# object. Empty stdout (or {}) is the silent-no-op signal.
+#
+# Fail-safe: any error → empty stdout, exit 0. Never blocks the agent.
+RESPONSE=$(curl -sf -m 0.5 -X POST \
+  -H 'Content-Type: application/json' \
+  --data-binary @- \
+  "http://127.0.0.1:{{PORT}}/api/hooks?source=codex&envelope=codex" 2>/dev/null) || exit 0
+printf '%s' "$RESPONSE"

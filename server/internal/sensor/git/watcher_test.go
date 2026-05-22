@@ -30,6 +30,14 @@ func TestStaticShouldIgnorePath(t *testing.T) {
 		{"/repo/main.go.tmp.27019.4ef42db74560", true},
 		{"/repo/src/main.go", false},
 		{"/repo/README.md", false},
+		// Windows-style paths: fsnotify hands us backslashes on
+		// Windows. Without ToSlash normalization these never matched
+		// any POSIX fragment, so the recursive watcher descended into
+		// .git/ and node_modules/.
+		{`C:\repo\.git\HEAD`, true},
+		{`C:\repo\node_modules\foo\index.js`, true},
+		{`C:\repo\.tma1\state.json`, true},
+		{`C:\repo\src\main.go`, false},
 	}
 	for _, tc := range cases {
 		if got := staticShouldIgnorePath(tc.path); got != tc.want {
