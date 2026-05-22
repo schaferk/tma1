@@ -114,24 +114,35 @@ Dashboard: **http://localhost:14318**
 
 ## Agent loop (v2)
 
-Beyond passive recording, TMA1 v2 routes what it sees back into Claude
-Code's reasoning. Three channels:
+Beyond passive recording, TMA1 v2 routes what it sees back into the
+agent's reasoning loop. Currently wired for **Claude Code** and
+**Codex**; the surface is adapter-shaped, so any future agent that
+exposes hook + MCP integration points can plug in the same way.
 
-**Hooks** — all 27 Claude Code hook events are registered for
-telemetry (see Onboarding Step 5). Five of those events also pull
-injection content from the server, prepended to the agent's next
-prompt or used as a Stop block:
+Three channels:
 
-| Event | What gets injected |
-| --- | --- |
-| `UserPromptSubmit` | Per-turn `<tma1-context>` digest — session focus, tokens, recent files, active anomalies (delta-only after the first turn) |
-| `PostToolUse` | Per-tool anomaly notes when a rule explicitly routes to this channel |
-| `SessionStart` | Project orientation + prior-session carry-forward |
-| `PreCompact` | Session digest folded into the compaction summary so it survives context loss |
-| `Stop` | JSON block decision when unresolved HIGH-severity anomalies exist; CC refuses to terminate |
+**Hooks** — the install adapter registers every hook event the host
+agent supports. Five of those events also pull injection content
+from the server, prepended to the agent's next prompt or used as a
+Stop block:
 
-**MCP stdio tools** — `tma1-server mcp-serve` is registered in
-`~/.claude.json` so the agent can pull state on demand:
+| Event | What gets injected | CC | Codex |
+| --- | --- | :-: | :-: |
+| `UserPromptSubmit` | Per-turn `<tma1-context>` digest — session focus, tokens, recent files, active anomalies (delta-only after the first turn) | ✓ | ✓ |
+| `PostToolUse` | Per-tool anomaly notes when a rule explicitly routes to this channel | ✓ | ✓ |
+| `SessionStart` | Project orientation + prior-session carry-forward | ✓ | ✓ |
+| `PreCompact` | Session digest folded into the compaction summary so it survives context loss | ✓ | — (no equivalent in Codex's hook catalogue) |
+| `Stop` | JSON block decision when unresolved HIGH-severity anomalies exist; agent refuses to terminate | ✓ | ✓ |
+
+CC posts the response body raw; Codex posts with `?envelope=codex`
+and the same content gets wrapped in
+`hookSpecificOutput.additionalContext`. Either way the agent sees
+the digest at the right turn boundary.
+
+**MCP stdio tools** — `tma1-server mcp-serve` is registered in each
+agent's native MCP config (`~/.claude.json` `mcpServers.tma1` for
+CC, `~/.codex/config.toml` `[mcp_servers.tma1]` for Codex). The
+agent pulls state on demand:
 
 | Tool | When to call | Returns |
 | --- | --- | --- |
@@ -141,7 +152,12 @@ prompt or used as a Stop block:
 | `get_build_status` | After suggesting edits | Last exit, errors in last 30 min, latest stderr line |
 | `get_external_changes` | After a long break | Human-attributed file edits + git activity |
 | `get_project_state` | First time in an unfamiliar repo | Language / build / test / key files / top-level dirs |
-| `get_peer_sessions` | User asks "what did Codex / OpenClaw / Copilot just do" or invokes `/tma1-peer` | Recent peer-agent sessions on the same project |
+| `get_peer_sessions` | User asks "what did Codex / CC / OpenClaw / Copilot just do" or invokes `/tma1-peer` | Recent peer-agent sessions on the same project |
+
+`get_peer_sessions` is caller-aware: the adapter writes
+`TMA1_MCP_CALLER` into the MCP `env` block at install time, so a
+CC caller's empty-`agent_source` query excludes CC's own sessions
+and a Codex caller's excludes Codex's. No accidental self-loops.
 
 **Anomaly rules** — six rules detect agent-loop pathologies; each
 routes to a specific channel so the same finding never injects twice:
@@ -160,31 +176,50 @@ checks auto-clear an anomaly when the agent visibly addresses it
 (re-reads a stale file, ships a passing Bash command), so a fix in
 turn N stops the warning in turn N+1.
 
-**`/tma1-peer` slash command** — in Claude Code:
+**`/tma1-peer`** — pull a peer agent's recent sessions on this
+project into the current agent's context without copy-paste:
 
-- `/tma1-peer codex` — pull Codex's most recent session on this
-  project into Claude's context.
+- `/tma1-peer codex` — Codex's latest session.
 - `/tma1-peer copilot 2` — last 2 Copilot CLI sessions.
-- `/tma1-peer` alone — latest session per peer agent.
+- `/tma1-peer` alone — latest session per peer agent (caller
+  excluded automatically).
 
-No copy-paste between terminals. The command is installed as a
-native slash command at `~/.claude/commands/tma1-peer.md` plus a
-fallback skill at `~/.claude/skills/tma1-peer/SKILL.md`.
+CC gets a native slash command at `~/.claude/commands/tma1-peer.md`
+plus a fallback skill at `~/.claude/skills/tma1-peer/SKILL.md`.
+Codex gets a skill at `~/.agents/skills/tma1-peer/SKILL.md` —
+invoke it the same way you invoke any Codex skill.
 
 **One-shot wiring**:
 
 ```
+# Claude Code
 curl -fsSL https://tma1.ai/install.sh | TMA1_ADAPTER=claude-code bash
+
+# Codex
+curl -fsSL https://tma1.ai/install.sh | TMA1_ADAPTER=codex bash
 ```
 
-This calls `tma1-server install --adapter claude-code` after the
-service is up, which idempotently writes hook entries to
-`~/.claude/settings.json`, the MCP server entry to `~/.claude.json`,
-drops the `/tma1-peer` command + skill, and appends a
-`<!-- tma1:start -->` block to the project's `CLAUDE.md` /
-`AGENTS.md`. Re-running only updates what's stale.
+Both call `tma1-server install --adapter <name>` after the service
+is healthy. Each adapter writes its agent's native config shape
+idempotently — re-running only updates what's stale:
 
-Preview the diff before writing: `tma1-server install --dry-run`.
+| Adapter | Hooks file | MCP config | Skill / command drop | Instructions block |
+| --- | --- | --- | --- | --- |
+| `claude-code` | `~/.claude/settings.json` | `~/.claude.json` `mcpServers.tma1` | `~/.claude/{skills,commands}/` | `CLAUDE.md` (fallback `AGENTS.md` when `CLAUDE.md` is absent) |
+| `codex` | `~/.codex/hooks.json` | `~/.codex/config.toml` `[mcp_servers.tma1]` | `~/.agents/skills/tma1-peer/` | `AGENTS.md` |
+
+Preview the diff before writing: `tma1-server install --adapter <name> --dry-run`.
+
+Reverse with `tma1-server uninstall --adapter <name>` — adapter-
+scoped, surgical, leaves user-owned hooks / MCP servers / skills
+intact. Add `--purge-data` if you also want to wipe `~/.tma1/data/`
+and `~/.tma1/bin/`.
+
+Future adapters plug into the same surface: add a `*Installer`
+under `internal/hooks/` plus an `--adapter <name>` case in
+`cmd/tma1-server/main.go`, and the rest of the v2 surface (hook
+injection, MCP, `/tma1-peer`, instructions block) comes along for
+free.
 
 ---
 
@@ -243,24 +278,28 @@ If a clean reinstall is needed (wipes all data, config, and logs):
 curl -fsSL https://tma1.ai/install.sh | TMA1_FORCE=1 bash
 ```
 
-For Claude Code users who also want the **agent loop** wired up
-(hooks + MCP server + `/tma1-peer` skill) in a single shot, pass
-the adapter:
+If you also want the **agent loop** wired up (hooks + MCP server +
+`/tma1-peer`) in a single shot, pass the adapter for your host
+agent:
 
 ```bash
+# Claude Code
 curl -fsSL https://tma1.ai/install.sh | TMA1_ADAPTER=claude-code bash
+
+# Codex
+curl -fsSL https://tma1.ai/install.sh | TMA1_ADAPTER=codex bash
 ```
 
-The installer calls `tma1-server install --adapter claude-code`
-after the service is healthy. This writes hook entries to
-`~/.claude/settings.json`, registers the MCP server in
-`~/.claude.json`, drops `/tma1-peer` into `~/.claude/commands/`
-and `~/.claude/skills/`, and adds a `<!-- tma1:start -->` block to
-the project's `CLAUDE.md` / `AGENTS.md`. Idempotent — repeat runs
-only update what's stale. When this path runs, the manual hook
-edits in Step 5 are no longer necessary; verification still applies.
+Either form calls `tma1-server install --adapter <name>` after the
+service is healthy. The adapter writes the agent's native config
+(see the table in the **Agent loop (v2)** section above for the
+exact files touched), drops the `tma1-peer` skill / command, and
+adds a `<!-- tma1:start -->` block to the project's instructions
+file. Idempotent — repeat runs only update what's stale. When this
+path runs, the manual hook edits in Step 5 are no longer necessary
+for that agent; verification still applies.
 
-Preview before writing: `tma1-server install --dry-run`.
+Preview before writing: `tma1-server install --adapter <name> --dry-run`.
 
 Wait ~15 seconds for the database to start, then verify:
 
