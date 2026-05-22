@@ -2,8 +2,11 @@
 // Polls /api/anomalies (no SSE; the Detector itself caches with a 30s TTL
 // so polling at 10s gives near-real-time updates without server push).
 //
-// All visual styling lives in style.css under the .anom-* class family —
-// no inline styles, so the view follows the dashboard's theme variables.
+// Most visual styling lives in style.css under the .anom-* class family.
+// A couple of one-off layout hooks (the empty-state spacer, the "+N more"
+// dim text) keep inline `style=` for now since they're single-use and
+// not worth promoting to named classes. Theme variables (var(--text-*))
+// are referenced inline where used so palette changes still propagate.
 
 var anom_state = {
   items: [],

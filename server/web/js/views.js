@@ -253,7 +253,7 @@ async function initViews() {
   if (dataSources.hasMessages) views.push({ id: 'prompts', label: t('view.prompts') });
   // Anomalies tab shows whenever there's hook event data — the anomaly
   // engine derives from tma1_hook_events.
-  if (dataSources.hasHookEvents) views.push({ id: 'anomalies', label: 'Anomalies' });
+  if (dataSources.hasHookEvents) views.push({ id: 'anomalies', label: t('view.anomalies') });
 
   if (views.length === 0) {
     document.getElementById('setup-notice').style.display = 'block';
