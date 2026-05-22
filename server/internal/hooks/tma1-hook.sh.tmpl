@@ -6,7 +6,7 @@
 # (UserPromptSubmit prepend, PostToolUse append, etc).
 #
 # Fail-safe: any error → empty stdout, exit 0. Never blocks the agent.
-RESPONSE=$(curl -s -m 0.5 -X POST \
+RESPONSE=$(curl -sf -m 0.5 -X POST \
   -H 'Content-Type: application/json' \
   --data-binary @- \
   "http://127.0.0.1:{{PORT}}/api/hooks" 2>/dev/null) || exit 0

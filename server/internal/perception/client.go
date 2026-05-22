@@ -67,9 +67,18 @@ func (c *Client) Query(ctx context.Context, sql string) ([]string, [][]any, erro
 	}
 	defer resp.Body.Close()
 
-	body, err := io.ReadAll(resp.Body)
+	// Bound the read so a misbehaving GreptimeDB / proxy can't make us
+	// allocate unbounded memory. 8 MB is well above the largest
+	// perception query response we've seen in dogfood (a 5-session
+	// peer fetch with full message bodies, ~300 KB).
+	body, err := io.ReadAll(io.LimitReader(resp.Body, 8<<20))
 	if err != nil {
 		return nil, nil, fmt.Errorf("perception read response: %w", err)
+	}
+	// Surface transport-level failures before trying to unmarshal --
+	// JSON parse errors on an HTML/empty error body are confusing.
+	if resp.StatusCode != http.StatusOK {
+		return nil, nil, fmt.Errorf("perception query: HTTP %d: %s", resp.StatusCode, snippet(body))
 	}
 
 	var r queryResp
