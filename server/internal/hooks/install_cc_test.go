@@ -291,10 +291,15 @@ func TestInstallMCPServerPersistsCustomGreptimeDBPort(t *testing.T) {
 	}
 	env, ok := tma1["env"].(map[string]any)
 	if !ok {
-		t.Fatalf("expected env block with custom port, got: %+v", tma1)
+		t.Fatalf("expected env block, got: %+v", tma1)
 	}
 	if env["TMA1_GREPTIMEDB_HTTP_PORT"] != "14555" {
 		t.Errorf("env port wrong: %v", env)
+	}
+	// TMA1_MCP_CALLER ships unconditionally so get_peer_sessions can
+	// exclude the caller's own sessions on empty agent_source.
+	if env["TMA1_MCP_CALLER"] != "claude_code" {
+		t.Errorf("env TMA1_MCP_CALLER = %v, want claude_code", env["TMA1_MCP_CALLER"])
 	}
 
 	// Idempotent: re-running with the same port must NOT report a change.
@@ -306,13 +311,21 @@ func TestInstallMCPServerPersistsCustomGreptimeDBPort(t *testing.T) {
 		t.Error("expected no-op on second install with identical port")
 	}
 
-	// Default port → no env block (don't clutter the file when nothing's overridden).
+	// Default port → env still carries TMA1_MCP_CALLER but drops the
+	// GreptimeDB port override (don't clutter the file with the default).
 	inst.GreptimeDBHTTPPort = 14000
 	_, _, _ = inst.installMCPServer()
 	got = readClaudeConfig(t, path)
 	tma1 = got["mcpServers"].(map[string]any)["tma1"].(map[string]any)
-	if _, hasEnv := tma1["env"]; hasEnv {
-		t.Errorf("default port should not emit env block: %+v", tma1)
+	env2, ok := tma1["env"].(map[string]any)
+	if !ok {
+		t.Fatalf("env block must persist for TMA1_MCP_CALLER, got: %+v", tma1)
+	}
+	if env2["TMA1_MCP_CALLER"] != "claude_code" {
+		t.Errorf("default-port env missing TMA1_MCP_CALLER: %+v", env2)
+	}
+	if _, hasPort := env2["TMA1_GREPTIMEDB_HTTP_PORT"]; hasPort {
+		t.Errorf("default port should not emit TMA1_GREPTIMEDB_HTTP_PORT: %+v", env2)
 	}
 }
 
@@ -573,5 +586,73 @@ func TestRegisterTMA1HooksAdoptsEquivalentLegacyEntry(t *testing.T) {
 	}
 	if entryCommand(got) != resolved {
 		t.Errorf("command not canonicalized to absolute path: %s", entryCommand(got))
+	}
+}
+
+// TestInstallInstructionsIgnoresInProseMarker is the regression guard
+// for the 2026-05-22 AGENTS.md damage. installInstructions previously
+// used strings.Index (first occurrence) to find <!-- tma1:start -->,
+// so prose mentioning the marker — e.g. a `tma1-server uninstall`
+// comment that referred to "the <!-- tma1:start --> block" — became
+// a false start that ate ~170 lines of legitimate doc before the real
+// end marker. Match only standalone-line markers from now on; this
+// test feeds the exact failure shape.
+func TestInstallInstructionsIgnoresInProseMarker(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	project := filepath.Join(t.TempDir(), "proj")
+	if err := os.MkdirAll(project, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	claudePath := filepath.Join(project, "CLAUDE.md")
+	original := "# Project\n\n" +
+		"## Commands\n\n" +
+		"```bash\n" +
+		"tma1-server uninstall --adapter claude-code\n" +
+		"                                  # Removes hook registrations, MCP entry, skills, commands, hook script,\n" +
+		"                                  # and the <!-- tma1:start --> block. --purge-data also wipes data.\n" +
+		"```\n\n" +
+		"## Go conventions\n\nSection content that must survive.\n\n" +
+		"## Where to look\n\nMore content the install must not touch.\n\n" +
+		"<!-- tma1:start -->\n" +
+		"## TMA1 Context Layer\nold block body\n" +
+		"<!-- tma1:end -->\n"
+	if err := os.WriteFile(claudePath, []byte(original), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	inst := &ClaudeCodeInstaller{
+		DataDir:    filepath.Join(home, ".tma1"),
+		Port:       14318,
+		ProjectDir: project,
+		Logger:     slog.Default(),
+	}
+	if _, _, err := inst.installInstructions(project); err != nil {
+		t.Fatalf("installInstructions: %v", err)
+	}
+
+	got, err := os.ReadFile(claudePath)
+	if err != nil {
+		t.Fatalf("read claude.md: %v", err)
+	}
+	gotStr := string(got)
+	// The in-prose marker must survive untouched.
+	if !strings.Contains(gotStr, "and the <!-- tma1:start --> block. --purge-data") {
+		t.Errorf("in-prose marker text was clobbered by install:\n%s", gotStr)
+	}
+	// The Go conventions and Where to look sections must survive.
+	if !strings.Contains(gotStr, "Go conventions") {
+		t.Errorf("install destroyed the Go conventions section:\n%s", gotStr)
+	}
+	if !strings.Contains(gotStr, "Where to look") {
+		t.Errorf("install destroyed the Where to look section:\n%s", gotStr)
+	}
+	// The real block must have been replaced (its old body gone, new
+	// body present).
+	if strings.Contains(gotStr, "old block body") {
+		t.Errorf("install failed to replace the real marker block:\n%s", gotStr)
+	}
+	if !strings.Contains(gotStr, "## TMA1 Context Layer") {
+		t.Errorf("install did not write the new block body:\n%s", gotStr)
 	}
 }

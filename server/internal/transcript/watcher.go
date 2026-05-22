@@ -47,6 +47,14 @@ type Watcher struct {
 	logger    *slog.Logger
 	broadcast BroadcastFunc
 
+	// codexParentSession maps a Codex rollout-file timestamp prefix
+	// (the value codexSessionGroup returns) to the parent run's
+	// conversation UUID. Populated when a non-subagent session_meta is
+	// parsed; consulted by subagent files in the same run so their
+	// SubagentStart / SubagentStop rows land in the parent's UUID-keyed
+	// session rather than the legacy filename-prefix bucket.
+	codexParentSession map[string]string
+
 	// IsLiveSession, when set, tells the Codex JSONL parser to skip
 	// inserts for any session that has recently emitted a hook event
 	// to /api/hooks (i.e. the Codex adapter is wired and posting in
@@ -54,6 +62,36 @@ type Watcher struct {
 	// would both write rows for the same Codex event. handler.New
 	// installs the gate at startup; main.go does the wiring.
 	IsLiveSession func(sessionID string) bool
+}
+
+// recordCodexParentSession publishes the parent UUID for a Codex
+// timestamp prefix. Called once per main-session rollout file; safe
+// to call repeatedly with the same value.
+func (w *Watcher) recordCodexParentSession(prefix, uuid string) {
+	if prefix == "" || uuid == "" {
+		return
+	}
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	if w.codexParentSession == nil {
+		w.codexParentSession = map[string]string{}
+	}
+	w.codexParentSession[prefix] = uuid
+}
+
+// lookupCodexParentSession returns the parent UUID for a Codex
+// timestamp prefix, or "" if the parent's session_meta hasn't been
+// processed yet (subagent goroutine may have raced ahead of parent).
+func (w *Watcher) lookupCodexParentSession(prefix string) string {
+	if prefix == "" {
+		return ""
+	}
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	if w.codexParentSession == nil {
+		return ""
+	}
+	return w.codexParentSession[prefix]
 }
 
 type sessionWatch struct {

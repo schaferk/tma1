@@ -16,6 +16,59 @@ stdout-shaped reply becomes the injection content.
 | `SessionStart` | New session opens | `<tma1-context>` digest for the prior session + external changes in the meantime | Prepended to the session's first prompt | CC + Codex |
 | `PreCompact` | Before CC compacts old turns | "Preserve through compaction" framed bundle | Folded into the post-compaction summary | CC only — Codex has no equivalent hook |
 
+### The `<tma1-context>` block
+
+`UserPromptSubmit` and `SessionStart` return content wrapped in a
+`<tma1-context>...</tma1-context>` block. The agent SDK
+(`generateInjection` in `server/internal/handler/hooks.go` →
+`perception.Bundler.RenderSummaryDelta`) renders this from the
+current session's row in `tma1_hook_events` + the Detector's
+active anomalies + the build / external-changes sensors.
+
+Sanitized example:
+
+```
+<tma1-context>
+project: tma1
+session: a1b2c3d4
+duration: 12 min
+tool_calls: 47
+tokens: in=84210 out=312045
+current_focus: .../internal/perception/peer.go
+tools: Bash×18, Edit×12, Read×9, TaskUpdate×4
+recent_files: .../perception/peer.go, .../mcp/tools.go, .../hooks/install_cc.go
+build: make (running)
+build_last_error (6m ago, may have recovered): exit code 1 ...
+external_human_changes: 3
+external_files: .../path/to/file.go
+anomalies:
+  - [MEDIUM] human_modified_during_session — Re-read the listed files before assuming your in-memory copy is current.
+</tma1-context>
+```
+
+| Field | Meaning | Suppressed when |
+|-------|---------|-----------------|
+| `project` | Resolved project root basename (from `cwd`) | Never — always present |
+| `session` | First 8 chars of `session_id` for log correlation | Never |
+| `duration` | Wall clock since the first hook event in this session | Never |
+| `tool_calls` | Count of `PreToolUse` events this session | Never |
+| `tokens` | Cumulative input/output tokens (sum across messages) | Never |
+| `current_focus` | The most recent Edit / Write target (POSIX-relative path) | No Edit/Write yet this session |
+| `tools` | Top-N tool-use histogram by count | No tool calls yet |
+| `recent_files` | Up to 5 most recently touched files | No Edit/Write yet |
+| `build` | `make` running / last exit / never invoked | Build sensor never ran |
+| `build_last_error` | Excerpt of stderr from the most recent failed build, with `may have recovered` flag if newer build is green | No build error in session window |
+| `external_human_changes` | Count of file changes attributed to the human (vs. agent) during the session | No human writes detected |
+| `external_files` | Up to 3 paths the human touched outside the agent | Same as above |
+| `anomalies` | List of `[SEVERITY] kind — suggestion` lines from the Detector | No active anomalies |
+
+**Why fields suppress when empty:** the block is injected at every
+user turn — keeping it tight (under ~20 lines typically) preserves the
+agent's context budget. The `external_files` row only appears when
+the human has edited files behind the agent's back, because that's
+the case where the agent must invalidate its in-memory snapshot
+before reading.
+
 ## Hook script protocol
 
 `tma1-server install --adapter claude-code` writes
@@ -125,6 +178,63 @@ When the cost becomes a real concern (e.g. heavy `Read` storms), the
 right fix is filtering server-side in `generateInjection` rather than
 narrowing matchers — keeps the data path and the dispatch logic in one
 place.
+
+## Uninstall
+
+`tma1-server uninstall --adapter claude-code|codex [--project DIR] [--dry-run] [--purge-data]`
+removes everything `install` wrote, in the reverse order that install
+applied it. The flag is required (no default) so an installed-for-Codex
+user doesn't accidentally clean up the Claude Code side.
+
+What gets removed:
+
+- Hook registrations from `~/.claude/settings.json` (or `~/.codex/hooks.json`)
+  — matched by `id="tma1"` AND by command-path equivalence, so entries
+  that pre-date the `id` field are still recognised.
+- `mcpServers.tma1` from `~/.claude.json` (or `[mcp_servers.tma1]` from
+  `~/.codex/config.toml`).
+- The `<!-- tma1:start --> ... <!-- tma1:end -->` block in BOTH
+  `<project>/CLAUDE.md` AND `<project>/AGENTS.md`. The adapter flag
+  only colours the report wording; the search set is both files.
+- Embedded skills under `~/.claude/skills/` (CC) or `~/.agents/skills/`
+  (Codex), scoped to the `tma1-` owner prefix plus the legacy `tma1/`
+  directory (no hyphen).
+- Embedded commands under `~/.claude/commands/` (CC only — Codex has
+  no equivalent).
+- The hook script at `~/.tma1/hooks/tma1-hook[-codex].sh|.ps1`. If the
+  parent `~/.tma1/hooks/` directory ends up empty, it is removed too.
+
+What does NOT get removed:
+
+- **`<project>/.gitignore`'s `.tma1-context.md` line.** Install never
+  recorded whether it added the line or whether the user already had
+  it; deleting could remove a user-owned ignore rule. Uninstall logs
+  it as `Skipped — left in place`. Delete manually if desired.
+- **`~/.tma1/data/`** (GreptimeDB history) **and `~/.tma1/bin/`**
+  (downloaded binary). These are locked behind `--purge-data`. Default
+  is keep — TMA1's observability traces are user data, not install
+  scaffolding.
+- **The running `tma1-server` process.** Uninstall prints a hint;
+  stop it manually with `pkill tma1-server`.
+
+### Refuse-to-overwrite contract
+
+Mirrors install's parse-strict guarantee:
+
+- Malformed `settings.json`, `claude.json`, `hooks.json`, or
+  `config.toml` → command returns an error, the file is not modified.
+  Operator must clean up the syntax first.
+- An instructions file with only `<!-- tma1:start -->` (or only
+  `<!-- tma1:end -->`) is rejected with a clear error. The file is
+  left untouched. We refuse to guess where TMA1 content ends — a
+  start-only file might contain legitimate user content the user
+  appended after deleting the end marker. Operator decides.
+
+### Idempotency
+
+Re-running uninstall after a successful uninstall is a no-op (every
+artifact lands in the `Skipped` section, exit 0). Missing files are
+treated as already-gone, not as errors.
 
 ## Important runtime details
 

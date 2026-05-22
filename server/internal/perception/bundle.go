@@ -30,6 +30,15 @@ type Bundler struct {
 	client   *Client
 	detector *Detector
 	logger   *slog.Logger
+
+	// Caller identifies which agent is invoking this Bundler when it
+	// runs under `tma1-server mcp-serve`. It's set from the
+	// TMA1_MCP_CALLER env var the install adapters write into each
+	// agent's MCP config. Used by GetPeerSessions to exclude the
+	// caller from the empty-agent_source fan-out so an agent never
+	// sees its own sessions on `/tma1-peer`. Empty when the bundler
+	// is used by the long-running HTTP API, which has no fixed caller.
+	Caller string
 }
 
 // NewBundler returns a Bundler querying GreptimeDB on localhost:<httpPort>.

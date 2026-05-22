@@ -46,6 +46,12 @@ func main() {
 				os.Exit(1)
 			}
 			return
+		case "uninstall":
+			if err := runUninstall(os.Args[2:]); err != nil {
+				fmt.Fprintf(os.Stderr, "uninstall: %v\n", err)
+				os.Exit(1)
+			}
+			return
 		case "build":
 			exitCode, err := runBuild(os.Args[2:])
 			if err != nil {
@@ -559,6 +565,144 @@ func runInstall(args []string) error {
 	return nil
 }
 
+// runUninstall reverses runInstall: it removes the hook script, hook
+// registrations, MCP server entry, embedded skills/commands, and the
+// project-level instruction block written by the matching adapter.
+// The `.gitignore` line and `~/.tma1/data/` are left alone unless the
+// user passes `--purge-data`.
+//
+// --adapter is required (no default): the asymmetric blast radius of
+// "uninstall the wrong side" outweighs the convenience of a guess.
+func runUninstall(args []string) error {
+	adapter := ""
+	project, _ := os.Getwd()
+	dryRun := false
+	purgeData := false
+
+	for i := 0; i < len(args); i++ {
+		switch args[i] {
+		case "--adapter":
+			if i+1 >= len(args) {
+				return fmt.Errorf("--adapter needs a value")
+			}
+			adapter = args[i+1]
+			i++
+		case "--project":
+			if i+1 >= len(args) {
+				return fmt.Errorf("--project needs a value")
+			}
+			project = args[i+1]
+			i++
+		case "--dry-run", "-n":
+			dryRun = true
+		case "--purge-data":
+			purgeData = true
+		case "-h", "--help":
+			fmt.Println("usage: tma1-server uninstall --adapter claude-code|codex [--project DIR] [--dry-run] [--purge-data]")
+			return nil
+		default:
+			return fmt.Errorf("unknown flag %q", args[i])
+		}
+	}
+	if adapter == "" {
+		return fmt.Errorf("--adapter is required (claude-code|codex)")
+	}
+
+	cfg, err := config.Load()
+	if err != nil {
+		return fmt.Errorf("load config: %w", err)
+	}
+
+	logger := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelInfo}))
+
+	type adapterUninstaller interface {
+		Uninstall() (hooks.UninstallReport, error)
+	}
+	var unin adapterUninstaller
+	switch adapter {
+	case "claude-code":
+		unin = &hooks.ClaudeCodeUninstaller{
+			DataDir:    cfg.DataDir,
+			ProjectDir: project,
+			Logger:     logger,
+			DryRun:     dryRun,
+			PurgeData:  purgeData,
+		}
+	case "codex":
+		unin = &hooks.CodexUninstaller{
+			DataDir:    cfg.DataDir,
+			ProjectDir: project,
+			Logger:     logger,
+			DryRun:     dryRun,
+			PurgeData:  purgeData,
+		}
+	default:
+		return fmt.Errorf("adapter %q not supported (available: claude-code, codex)", adapter)
+	}
+
+	rep, uninstallErr := unin.Uninstall()
+
+	if dryRun {
+		fmt.Printf("TMA1 uninstall report (adapter=%s, DRY-RUN — no files touched)\n", adapter)
+	} else {
+		fmt.Printf("TMA1 uninstall report (adapter=%s)\n", adapter)
+	}
+	if rep.HookScript != "" {
+		fmt.Printf("  Hook script:   %s\n", rep.HookScript)
+	}
+	if rep.SettingsPath != "" {
+		fmt.Printf("  Settings:      %s\n", rep.SettingsPath)
+	}
+	if rep.MCPConfigPath != "" {
+		fmt.Printf("  MCP config:    %s\n", rep.MCPConfigPath)
+	}
+	for _, p := range rep.InstructionsPaths {
+		fmt.Printf("  Instructions:  %s\n", p)
+	}
+	if rep.GitignorePath != "" {
+		fmt.Printf("  .gitignore:    %s\n", rep.GitignorePath)
+	}
+	if len(rep.Removed) > 0 {
+		header := "  Removed:"
+		if dryRun {
+			header = "  Would remove:"
+		}
+		fmt.Println(header)
+		for _, r := range rep.Removed {
+			fmt.Printf("    - %s\n", r)
+		}
+	}
+	if len(rep.Skipped) > 0 {
+		fmt.Println("  Skipped:")
+		for _, s := range rep.Skipped {
+			fmt.Printf("    - %s\n", s)
+		}
+	}
+	if len(rep.Errors) > 0 {
+		fmt.Fprintln(os.Stderr, "  Errors (file left untouched):")
+		for _, e := range rep.Errors {
+			fmt.Fprintf(os.Stderr, "    - %s\n", e)
+		}
+	}
+	if len(rep.Removed) == 0 && len(rep.Errors) == 0 {
+		fmt.Println("  Nothing to remove (already uninstalled or never installed).")
+	}
+
+	// Hint about the still-running server. Don't pkill it — that's
+	// outside the config-management contract.
+	if !dryRun && len(rep.Removed) > 0 {
+		fmt.Fprintln(os.Stderr, "  Note: tma1-server may still be running. Stop it with `pkill tma1-server` if you no longer need the dashboard.")
+	}
+
+	if uninstallErr != nil {
+		return uninstallErr
+	}
+	if rep.HasErrors() {
+		return fmt.Errorf("%d file(s) needed operator review", len(rep.Errors))
+	}
+	return nil
+}
+
 // runMCPServe handles the `tma1-server mcp-serve` subcommand. Claude Code
 // spawns this once per session to talk MCP over stdio. The function MUST NOT
 // write anything to stdout that isn't a JSON-RPC frame.
@@ -579,6 +723,11 @@ func runMCPServe() error {
 	}))
 
 	bundler := perception.NewBundler(cfg.GreptimeDBHTTPPort, logger)
+	// Caller comes from the env var the install adapter wrote into each
+	// agent's MCP config (claude_code for CC, codex for Codex, etc).
+	// GetPeerSessions uses it to exclude the caller from the empty-
+	// agent_source fan-out.
+	bundler.Caller = os.Getenv("TMA1_MCP_CALLER")
 
 	srv := mcp.NewServer(logger,
 		mcp.ContextBundleTool{Bundler: bundler},

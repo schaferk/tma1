@@ -363,16 +363,21 @@ func (i *CodexInstaller) installMCPServer() (string, bool, error) {
 		"command": binary,
 		"args":    []any{"mcp-serve"},
 	}
+	// TMA1_MCP_CALLER tells the spawned mcp-serve which agent invoked
+	// it. get_peer_sessions uses this to exclude the caller's own
+	// sessions when agent_source is empty.
+	env := map[string]any{
+		"TMA1_MCP_CALLER": "codex",
+	}
 	// Propagate non-default GreptimeDB port so the Codex-spawned MCP
 	// child talks to the same DB as the parent tma1-server. Without
 	// this a user running with TMA1_GREPTIMEDB_HTTP_PORT=14555 would
 	// have the MCP child silently fall back to 14000 and return empty
 	// results.
 	if i.GreptimeDBHTTPPort != 0 && i.GreptimeDBHTTPPort != defaultGreptimeDBHTTPPort {
-		desired["env"] = map[string]any{
-			"TMA1_GREPTIMEDB_HTTP_PORT": strconv.Itoa(i.GreptimeDBHTTPPort),
-		}
+		env["TMA1_GREPTIMEDB_HTTP_PORT"] = strconv.Itoa(i.GreptimeDBHTTPPort)
 	}
+	desired["env"] = env
 
 	if cur, ok := mcpServers["tma1"].(map[string]any); ok && mcpEntryEqual(cur, desired) {
 		return cfgPath, false, nil

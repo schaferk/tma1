@@ -9,8 +9,11 @@ import (
 	"time"
 )
 
-// PeerSession is one non-claude_code agent session, returned by
-// GetPeerSessions for cross-agent lookup (`/tma1-peer` slash command).
+// PeerSession is one peer-agent session, returned by GetPeerSessions
+// for cross-agent lookup. "Peer" is relative to the caller: when CC
+// invokes the MCP tool, Codex / OpenClaw / Copilot CLI are peers;
+// when Codex invokes, CC is also a peer. The Bundler's Caller field
+// drives that exclusion when `agent_source` is left empty.
 type PeerSession struct {
 	SessionID         string        `json:"session_id"`
 	AgentSource       string        `json:"agent_source"`
@@ -41,8 +44,17 @@ type PeerMessage struct {
 }
 
 // validPeerAgents are the allowed agent_source values for cross-agent
-// lookup. claude_code is deliberately excluded — the caller is CC.
+// lookup. All four supported agents are accepted as explicit inputs;
+// the "exclude the caller from the empty-string fan-out" semantics
+// live in GetPeerSessions, driven by the Bundler's Caller field.
+//
+// An earlier version of this map hard-coded claude_code OUT because
+// the only caller was Claude Code. Once Codex started invoking the
+// same MCP tool, that asymmetry became a real bug — Codex callers
+// got "invalid agent_source 'claude_code'" when asking for CC's
+// peer sessions.
 var validPeerAgents = map[string]bool{
+	"claude_code": true,
 	"codex":       true,
 	"openclaw":    true,
 	"copilot_cli": true,
@@ -77,7 +89,7 @@ func (b *Bundler) GetPeerSessions(
 	}
 	agentSource = normalizePeerAgent(agentSource)
 	if agentSource != "" && !validPeerAgents[agentSource] {
-		return nil, fmt.Errorf("invalid agent_source %q (valid: codex, openclaw, copilot_cli, or empty for all)", agentSource)
+		return nil, fmt.Errorf("invalid agent_source %q (valid: claude_code, codex, openclaw, copilot_cli, or empty for all peers)", agentSource)
 	}
 
 	if agentSource != "" {
@@ -86,15 +98,10 @@ func (b *Bundler) GetPeerSessions(
 
 	// All-peers path: top-N per peer agent. Each agent is queried
 	// independently so we get a per-agent LIMIT instead of a global one.
-	// Run the three peers' queries in parallel -- each fans out to ~6
-	// HTTP roundtrips against GreptimeDB; serial iteration was costing
-	// ~3x the latency for no real reason (we're network-bound, not
-	// CPU-bound).
-	agents := make([]string, 0, len(validPeerAgents))
-	for a := range validPeerAgents {
-		agents = append(agents, a)
-	}
-	sort.Strings(agents) // stable output order for tests
+	// Run the peers' queries in parallel -- each fans out to ~6 HTTP
+	// roundtrips against GreptimeDB; serial iteration was costing ~3x
+	// the latency for no real reason (we're network-bound, not CPU-bound).
+	agents := b.peerAgentList()
 
 	type agentResult struct {
 		idx      int
@@ -364,14 +371,42 @@ func (b *Bundler) enrichPeerSession(ctx context.Context, ps *PeerSession, messag
 	wg.Wait()
 }
 
+// peerAgentList returns the validPeerAgents set with the Bundler's
+// Caller removed and sorted alphabetically for deterministic output.
+// When Caller is empty (long-running HTTP API path with no fixed
+// caller identity), all four agents are returned.
+//
+// Extracted to a method so the caller-aware exclusion has a unit-test
+// foothold without standing up a fake SQL backend.
+func (b *Bundler) peerAgentList() []string {
+	agents := make([]string, 0, len(validPeerAgents))
+	for a := range validPeerAgents {
+		if a == b.Caller {
+			continue
+		}
+		agents = append(agents, a)
+	}
+	sort.Strings(agents)
+	return agents
+}
+
 // normalizePeerAgent maps user-friendly aliases to canonical agent_source
 // values stored in the DB. Empty + "all" both yield "" (all peers).
+//
+// Aliases exist because the MCP tool gets called from skills/commands
+// that may receive raw user input ("cc", "claude", "copilot"). Canon-
+// icalising here keeps the validPeerAgents whitelist tight while still
+// letting humans type what they mean. The skill markdown documents
+// the same aliases, but skills are LLM-interpreted — server-side
+// fallback prevents the obvious typo from looking like a bug.
 func normalizePeerAgent(s string) string {
 	s = strings.TrimSpace(strings.ToLower(s))
 	switch s {
 	case "", "all", "*":
 		return ""
-	case "copilot":
+	case "cc", "claude", "claude-code", "claudecode":
+		return "claude_code"
+	case "copilot", "copilot-cli", "github-copilot":
 		return "copilot_cli"
 	}
 	return s

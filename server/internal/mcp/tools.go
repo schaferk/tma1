@@ -139,11 +139,13 @@ func (t SessionStateTool) Call(ctx context.Context, args map[string]any) (CallTo
 	return CallToolResult{Content: []ContentBlock{{Type: "text", Text: string(out)}}}, nil
 }
 
-// PeerSessionsTool returns recent session content from peer coding agents
-// (codex / openclaw / copilot_cli) that worked on the same project as the
-// caller. Lets CC see what Codex left as review feedback, what OpenClaw
-// ran for e2e, etc. — the agent-to-agent communication channel that
-// removes manual copy-paste between terminals.
+// PeerSessionsTool returns recent session content from peer coding
+// agents that worked on the same project as the caller. "Peer" is
+// relative to whichever agent invoked the MCP tool: CC sees Codex /
+// OpenClaw / Copilot CLI, Codex sees CC / OpenClaw / Copilot CLI, and
+// so on (the Bundler's Caller field excludes self). Lets one agent
+// act on review feedback or work left by another without manual copy-
+// paste between terminals.
 type PeerSessionsTool struct {
 	Bundler *perception.Bundler
 }
@@ -151,17 +153,18 @@ type PeerSessionsTool struct {
 func (t PeerSessionsTool) Definition() Tool {
 	return Tool{
 		Name: "get_peer_sessions",
-		Description: "Pull recent session content from other coding agents " +
-			"(Codex, OpenClaw, Copilot CLI) that worked on the same project. " +
-			"Use this when the user asks you to act on feedback or work left " +
-			"by another agent on this project, or invokes `/tma1-peer`. Filters " +
-			"by agent_source; empty string returns all non-CC peers.",
+		Description: "Pull recent session content from peer coding agents " +
+			"(Claude Code, Codex, OpenClaw, Copilot CLI) that worked on the " +
+			"same project. Use this when the user asks you to act on feedback " +
+			"or work left by another agent, or invokes `/tma1-peer`. Filters " +
+			"by agent_source; empty string returns all peers excluding the " +
+			"caller (the agent invoking this MCP tool).",
 		InputSchema: InputSchema{
 			Type: "object",
 			Properties: map[string]Property{
 				"agent_source": {
 					Type:        "string",
-					Description: "Peer agent: codex / openclaw / copilot_cli. Empty = all peers (top N per agent).",
+					Description: "Peer agent: claude_code / codex / openclaw / copilot_cli. Aliases accepted: cc | claude → claude_code, copilot → copilot_cli. Empty = all peers except the caller (top N per agent).",
 				},
 				"project": {
 					Type: "string",

@@ -40,7 +40,19 @@ type installSink interface {
 //
 // The temp file lives in the same directory as the target so the
 // rename is guaranteed to be on the same filesystem (atomic).
+//
+// Symlinks: resolve first via EvalSymlinks so we rename onto the
+// underlying file, not onto the symlink itself. POSIX rename(2) over
+// a symlink unlinks the symlink and replaces it with the new regular
+// file, which silently breaks layouts like CLAUDE.md → AGENTS.md
+// (this repo's own layout). Writing through the resolved target keeps
+// the symlink intact and both names continue to track the same content.
+// EvalSymlinks failures (target absent, broken/circular link) fall
+// through to the original path — same behaviour as before.
 func writeFileAtomic(path string, data []byte, perm os.FileMode) error {
+	if resolved, err := filepath.EvalSymlinks(path); err == nil {
+		path = resolved
+	}
 	dir := filepath.Dir(path)
 	tmp, err := os.CreateTemp(dir, ".tma1-write-*")
 	if err != nil {
@@ -187,11 +199,38 @@ func instructionsBlock(start, end string) []byte {
 
 TMA1 thickens the Observe step in your reasoning loop. At the start of each
 turn it injects a <tma1-context> block summarising the current session
-(tool history, tokens, current focus, recent files). Use that block when
-deciding what to do next.
+(tool history, tokens, current focus, recent files, build state, anomalies).
+Use that block when deciding what to do next.
+
+Example shape (values illustrative):
+
+` + "```" + `
+<tma1-context>
+project: tma1
+session: a1b2c3d4
+duration: 12 min
+tool_calls: 47
+tokens: in=84210 out=312045
+current_focus: .../internal/perception/peer.go
+tools: Bash×18, Edit×12, Read×9, TaskUpdate×4
+recent_files: .../perception/peer.go, .../mcp/tools.go, .../hooks/install_cc.go
+build: make (running)
+build_last_error (6m ago, may have recovered): exit code 1 ...
+external_human_changes: 3
+external_files: .../path/to/file.go
+anomalies:
+  - [MEDIUM] human_modified_during_session — Re-read the listed files before assuming your in-memory copy is current.
+</tma1-context>
+` + "```" + `
+
+Fields are best-effort — most lines only appear when relevant
+(` + "`anomalies`" + ` / ` + "`build_last_error`" + ` / ` + "`external_*`" + ` only render when there's
+something worth flagging). ` + "`current_focus`" + ` reflects your most recent
+Edit/Write target.
 
 **You should:**
 - Read the <tma1-context> block (when present) before reasoning about the next action
+- Trust ` + "`external_files`" + ` over your in-memory snapshot — re-read those before editing
 - Call the MCP tool ` + "`get_session_state`" + ` if you need a fuller view of your prior tool calls
 - Call ` + "`get_context_bundle`" + ` after compaction or when context feels stale
 ` + end)
@@ -212,6 +251,43 @@ func containsLine(data []byte, line string) bool {
 // slices, used by the marker-matching path in installInstructions.
 func indexOf(haystack, needle []byte) int {
 	return strings.Index(string(haystack), string(needle))
+}
+
+// indexOfStandaloneLine returns the byte offset of the first occurrence
+// of marker that lives on its own line (i.e. the trimmed contents of
+// that line are exactly the marker). Returns -1 if no such line exists.
+//
+// Why this exists: a plain strings.Index match would also fire on marker
+// text that appears inside prose, comments, or code blocks — e.g. an
+// AGENTS.md sentence saying "uninstall removes the <!-- tma1:start -->
+// block" would shadow the real marker and cause installInstructions to
+// replace from the prose match to the real end marker, wiping every
+// line in between. That's exactly the failure that ate 170 lines of
+// this repo's AGENTS.md on 2026-05-22. Match only standalone markers
+// from now on.
+func indexOfStandaloneLine(data []byte, marker string) int {
+	s := string(data)
+	search := 0
+	for search < len(s) {
+		idx := strings.Index(s[search:], marker)
+		if idx < 0 {
+			return -1
+		}
+		idx += search
+		lineStart := idx
+		for lineStart > 0 && s[lineStart-1] != '\n' {
+			lineStart--
+		}
+		lineEnd := idx + len(marker)
+		for lineEnd < len(s) && s[lineEnd] != '\n' {
+			lineEnd++
+		}
+		if strings.TrimSpace(s[lineStart:lineEnd]) == marker {
+			return idx
+		}
+		search = idx + len(marker)
+	}
+	return -1
 }
 
 // joinErrors collapses a slice of errors into one for return from
@@ -381,8 +457,8 @@ func installInstructions(i installSink, projectDir, preferredFile string) (strin
 	desired := instructionsBlock(startMarker, endMarker)
 
 	var newContent []byte
-	if startIdx := indexOf(existing, []byte(startMarker)); startIdx >= 0 {
-		endIdx := indexOf(existing, []byte(endMarker))
+	if startIdx := indexOfStandaloneLine(existing, startMarker); startIdx >= 0 {
+		endIdx := indexOfStandaloneLine(existing, endMarker)
 		if endIdx < 0 {
 			endIdx = len(existing)
 		} else {

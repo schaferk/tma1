@@ -253,6 +253,11 @@ tma1-server install --adapter claude-code|codex [--project DIR] [--dry-run]
                                                      # wire hooks + MCP + skill + AGENTS.md block; --dry-run previews without writing.
                                                      # `claude-code` writes to ~/.claude/* + ~/.claude.json + ~/.claude/{skills,commands}/.
                                                      # `codex`       writes to ~/.codex/{hooks.json,config.toml} + ~/.agents/skills/tma1-peer/.
+tma1-server uninstall --adapter claude-code|codex [--project DIR] [--dry-run] [--purge-data]
+                                                     # reverse of install. --adapter is REQUIRED (no default).
+                                                     # Removes hook registrations, MCP entry, skills, commands, hook script,
+                                                     # and the <!-- tma1:start --> block. --purge-data also wipes
+                                                     # ~/.tma1/data/ and ~/.tma1/bin/. See docs/hooks.md for the full contract.
 tma1-server build [--watch] [--debounce 2s] [--filter-regex PAT [--filter-invert]] \
                   [--tag NAME] [--project DIR] [--no-color] -- <command> [args...]
                                                      # wrap a subprocess; tee output to terminal + tma1_build_events
@@ -286,6 +291,7 @@ tma1-server build [--watch] [--debounce 2s] [--filter-regex PAT [--filter-invert
 | `TMA1_LLM_MODEL` | (auto) | Model override (default: `claude-sonnet-4-20250514` / `gpt-4o-mini`) |
 | `TMA1_QUERY_CONCURRENCY` | `4` | Max concurrent SQL queries from dashboard. Lower (e.g. `2`) if GreptimeDB OOMs on 30d. Range `1`–`32`. Hot-reloadable via `/api/settings`. |
 | `TMA1_ADAPTER` | (empty) | **Install-time only** (`install.sh` / `install.ps1`). Set to `claude-code` or `codex` to run `tma1-server install --adapter <name>` after the service is healthy. Both adapters wire the same agent loop (hooks injection + MCP + `/tma1-peer` skill + AGENTS.md block) in each agent's native config shape. |
+| `TMA1_MCP_CALLER` | (empty) | **Install-time only.** Adapter installers write this into each agent's MCP `env` block (`claude_code` / `codex`). The MCP child reads it to drive caller-aware peer-session exclusion so an agent never sees its own sessions on `/tma1-peer`. |
 | `TMA1_DISABLE_INJECTION` | (unset) | Set to `1` to short-circuit `generateInjection` — `/api/hooks` still records events but returns empty stdout. Escape hatch for dogfooding. |
 | `TMA1_ENABLE_FILE_CALLBACK` | (unset) | Set to `1` to refresh `<project_root>/.tma1-context.md` after each hook event. Off by default — MCP / hook injection covers MCP-capable agents; the file is for Aider / Cursor and adds IO + git-sensor self-noise. |
 | `TMA1_DEBUG_POSTTOOLUSE` | (unset) | Set to `1` to emit a debug marker on every PostToolUse hook regardless of anomalies. Plumbing aid. |
@@ -304,6 +310,7 @@ tma1-server build [--watch] [--debounce 2s] [--filter-regex PAT [--filter-invert
 8. **Single-writer SQL surface.** All sensors + the hook handler quote literals through `internal/sqlutil` (`Escape`, `EscapeLike`, `Quote`) and truncate through `internal/strutil.SafeTruncate` (rune-safe). Cross-package SQL drift is the #1 way bad UTF-8 reaches GreptimeDB; consolidating here keeps the fix landing once.
 9. **Versioned schema migrations.** ALTER TABLE additions live in `internal/greptimedb/schema_migrations.go` as a strict-ascending `[]Migration`, applied after the bare CREATE TABLE init. The `tma1_schema_version` ledger records every applied migration so the next start is idempotent without "swallow duplicate-column errors" heuristics.
 10. **Bounded write queue.** `internal/writeq.Sem` caps in-flight background INSERTs against GreptimeDB at 64. Burst paths (subagent storms, replay) can't fork-bomb the process. A panic in any callback is recovered and counted, never crashes the server.
+11. **Concurrent MCP dispatch.** `internal/mcp/server.go` spawns one goroutine per `tools/call`, with writes serialised through a single mutex. A slow tool can't wedge stdin or block other replies; `Run` waits on in-flight goroutines before returning so their responses aren't dropped.
 
 On first start, tma1 writes a default GreptimeDB config to `~/.tma1/config/standalone.toml` and launches GreptimeDB with `-c`. That default keeps HTTP, MySQL, and Prometheus Remote Storage enabled, disables Postgres, InfluxDB, OpenTSDB, and Jaeger, and applies conservative local resource limits.
 
@@ -323,13 +330,13 @@ On first start, tma1 writes a default GreptimeDB config to `~/.tma1/config/stand
 | Anomalies query API | `server/internal/handler/anomalies.go` — `/api/anomalies`, `/api/anomalies/budget`, `/api/anomalies/follow-rate` (reads `tma1_anomaly_emits`, never re-runs the Detector) |
 | Hook telemetry | `server/internal/handler/hook_telemetry.go` — periodic per-event call + inject counter, flushed via slog |
 | SSE streaming + broadcast | `server/internal/handler/sse.go`, `broadcast.go` |
-| Perception bundler | `server/internal/perception/bundle.go` — Bundle + Digest + RenderSummaryDelta; `client.go` is the local SQL HTTP client |
+| Perception bundler | `server/internal/perception/bundle.go` — Bundle + Digest + RenderSummaryDelta; `client.go` is the local SQL HTTP client. `Bundler.Caller` (set from `TMA1_MCP_CALLER`) drives peer-session self-exclusion. |
 | Anomaly engine | `server/internal/perception/anomaly.go` — 6 rules, channel routing, 10-min suppression, per-rule resolvers, age-evicted history cache |
 | Anomaly emit log | `server/internal/perception/anomaly_emits.go` — fire-and-forget INSERTs routed through the handler's `writeq.Sem` |
-| Peer-session reader | `server/internal/perception/peer.go` — backs `get_peer_sessions` MCP tool + `/tma1-peer` skill |
+| Peer-session reader | `server/internal/perception/peer.go` — backs `get_peer_sessions` MCP tool + `/tma1-peer` skill; caller-aware `peerAgentList()` excludes the invoking agent on empty `agent_source` |
 | Project-root resolution | `server/internal/perception/file_writer.go` (`ResolveProjectRoot`) — also writes `.tma1-context.md` for non-MCP agents when `TMA1_ENABLE_FILE_CALLBACK=1` |
 | Incremental injection cache | `server/internal/perception/injection_cache.go` — per-session digest dedupe so identical context isn't re-emitted every turn |
-| MCP stdio server | `server/internal/mcp/server.go` (loop) + `tools.go` (7 ToolHandlers) + `protocol.go` (JSON-RPC + MCP types) |
+| MCP stdio server | `server/internal/mcp/server.go` (concurrent loop, write-mutex serialised) + `tools.go` (7 ToolHandlers) + `protocol.go` (JSON-RPC + MCP types) |
 | Build sensor | `server/internal/sensor/build/capture.go` (Runner / LongRunner) + `store.go` (writes `tma1_build_events`) |
 | Git/file sensor | `server/internal/sensor/git/sensor.go` (per-project watcher lifecycle) + `watcher.go` (fsnotify + git poll) + `gitignore.go` + `attribution.go` (agent vs human) + `store.go` |
 | Project sensor | `server/internal/sensor/project/sensor.go` (TTL-gated indexer) + `indexer.go` (marker-file heuristics) + `store.go` |
@@ -341,12 +348,15 @@ On first start, tma1 writes a default GreptimeDB config to `~/.tma1/config/stand
 | CC adapter installer | `server/internal/hooks/install_cc.go` — atomic writes to `~/.claude/settings.json` + `~/.claude.json`, embedded skill/command tree sync, owner-prefix-scoped stale sweep so user-installed skills/commands are never deleted |
 | Codex adapter installer | `server/internal/hooks/install_codex.go` — atomic writes to `~/.codex/hooks.json` (JSON merge) + `~/.codex/config.toml` (TOML merge via `BurntSushi/toml`), skill drop into `~/.agents/skills/tma1-peer/` |
 | Shared install helpers | `server/internal/hooks/install_shared.go` — `installSink` interface + `writeFileAtomic`, `readJSONFileStrict`, `syncEmbeddedTree`, owner-prefix `removeStaleUnder`, `installInstructions`, `installGitignore`, `tma1BinaryPath`, `expandHome` |
+| CC adapter uninstaller | `server/internal/hooks/uninstall_cc.go` — reverses install_cc.go; refuse-to-overwrite on malformed JSON, half-marker instructions files surfaced as `UninstallReport.Errors` |
+| Codex adapter uninstaller | `server/internal/hooks/uninstall_codex.go` — reverses install_codex.go (TOML merge variant) |
+| Shared uninstall helpers | `server/internal/hooks/uninstall_shared.go` — `unregisterTMA1Hooks` (id + legacy command-path predicate), `removeInstructionsBlock` (half-state refusal), `removeMCPServerEntry`, `UninstallReport` shape |
 | Codex hook stdin/stdout protocol envelope | `server/internal/handler/hooks.go::wrapInjectionEnvelope` — `?envelope=codex` on `/api/hooks` wraps the four string-content events in `hookSpecificOutput.additionalContext`; Stop passes through verbatim (Codex's block shape `{decision,reason}` matches CC's exactly) |
-| Codex live-hook gate | `server/internal/handler/codex_live.go` — in-memory map of Codex sessions actively POSTing hooks; `transcript/codex.go` consults it via `Watcher.IsLiveSession` and skips its own JSONL parse so we don't double-write rows |
+| Codex live-hook gate | `server/internal/handler/codex_live.go` — in-memory map of Codex sessions actively POSTing hooks; `transcript/codex.go` consults it via `Watcher.IsLiveSession` and skips its own JSONL parse so we don't double-write rows. Now keyed on the Codex conversation UUID (was filename prefix) so hook + JSONL rows actually align. |
 | Hook script installer | `server/internal/hooks/hooks.go` — drops `.sh` / `.ps1` template under `~/.tma1/hooks/` |
 | Hook script templates | `server/internal/hooks/tma1-hook.sh.tmpl` (CC, curl -m 0.5) / `tma1-hook.ps1.tmpl` (CC, Invoke-WebRequest -TimeoutSec 1) / `tma1-hook-codex.sh.tmpl` + `tma1-hook-codex.ps1.tmpl` (Codex variants — POST with `?source=codex&envelope=codex`) |
-| Transcript watcher (CC JSONL) | `server/internal/transcript/watcher.go` |
-| Codex session parser | `server/internal/transcript/codex.go` |
+| Transcript watcher (CC JSONL) | `server/internal/transcript/watcher.go` — includes `codexParentSession` map so subagent rollout files attribute to the parent run's conversation UUID, not the filename prefix |
+| Codex session parser | `server/internal/transcript/codex.go` — `peekCodexMainUUID` pre-scan + `codexFileContext.effectiveSessionID` resolve to the conversation UUID once `session_meta` is parsed |
 | OpenClaw session parser | `server/internal/transcript/openclaw.go` |
 | Copilot CLI session parser | `server/internal/transcript/copilot_cli.go` — `~/.copilot/session-state/`, session rollover on repeated `session.start`, restart-dedup via DB query |
 | Dashboard UI | `server/web/index.html` |
@@ -396,6 +406,7 @@ shellcheck site/public/install.sh
 # 6. End-to-end smoke for the v2 surface (optional, requires a live tma1-server):
 tma1-server install --adapter claude-code --dry-run   # preview without writing
 tma1-server install --adapter codex --dry-run         # same, for Codex CLI
+tma1-server uninstall --adapter claude-code --dry-run # preview reverse
 curl -s "http://localhost:14318/api/anomalies?limit=10" | jq .
 echo '{"hook_event_name":"UserPromptSubmit","session_id":"smoke","cwd":"'"$PWD"'"}' \
   | curl -s -X POST -H 'Content-Type: application/json' --data-binary @- \
@@ -415,11 +426,38 @@ echo '{"hook_event_name":"UserPromptSubmit","session_id":"smoke","cwd":"'"$PWD"'
 
 TMA1 thickens the Observe step in your reasoning loop. At the start of each
 turn it injects a <tma1-context> block summarising the current session
-(tool history, tokens, current focus, recent files). Use that block when
-deciding what to do next.
+(tool history, tokens, current focus, recent files, build state, anomalies).
+Use that block when deciding what to do next.
+
+Example shape (values illustrative):
+
+```
+<tma1-context>
+project: tma1
+session: a1b2c3d4
+duration: 12 min
+tool_calls: 47
+tokens: in=84210 out=312045
+current_focus: .../internal/perception/peer.go
+tools: Bash×18, Edit×12, Read×9, TaskUpdate×4
+recent_files: .../perception/peer.go, .../mcp/tools.go, .../hooks/install_cc.go
+build: make (running)
+build_last_error (6m ago, may have recovered): exit code 1 ...
+external_human_changes: 3
+external_files: .../path/to/file.go
+anomalies:
+  - [MEDIUM] human_modified_during_session — Re-read the listed files before assuming your in-memory copy is current.
+</tma1-context>
+```
+
+Fields are best-effort — most lines only appear when relevant
+(`anomalies` / `build_last_error` / `external_*` only render when there's
+something worth flagging). `current_focus` reflects your most recent
+Edit/Write target.
 
 **You should:**
 - Read the <tma1-context> block (when present) before reasoning about the next action
+- Trust `external_files` over your in-memory snapshot — re-read those before editing
 - Call the MCP tool `get_session_state` if you need a fuller view of your prior tool calls
 - Call `get_context_bundle` after compaction or when context feels stale
 <!-- tma1:end -->

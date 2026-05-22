@@ -334,16 +334,22 @@ func (i *ClaudeCodeInstaller) installMCPServer() (string, bool, error) {
 		"command": binary,
 		"args":    []any{"mcp-serve"},
 	}
+	// TMA1_MCP_CALLER tells the spawned mcp-serve which agent invoked
+	// it. get_peer_sessions uses this to exclude the caller's own
+	// sessions when agent_source is empty — without it, CC's
+	// `/tma1-peer` would surface CC's own backlog as "peers".
+	env := map[string]any{
+		"TMA1_MCP_CALLER": "claude_code",
+	}
 	// Propagate non-default GreptimeDB port so the CC-spawned mcp-serve child
 	// — which runs in CC's environment, not the parent tma1-server's — talks
 	// to the same DB. Without this, a user who ran the server with
 	// TMA1_GREPTIMEDB_HTTP_PORT=14555 would have the MCP child silently fall
 	// back to 14000 and return empty results.
 	if i.GreptimeDBHTTPPort != 0 && i.GreptimeDBHTTPPort != defaultGreptimeDBHTTPPort {
-		desired["env"] = map[string]any{
-			"TMA1_GREPTIMEDB_HTTP_PORT": strconv.Itoa(i.GreptimeDBHTTPPort),
-		}
+		env["TMA1_GREPTIMEDB_HTTP_PORT"] = strconv.Itoa(i.GreptimeDBHTTPPort)
 	}
+	desired["env"] = env
 
 	if cur, ok := servers["tma1"].(map[string]any); ok && mcpEntryEqual(cur, desired) {
 		return cfgPath, false, nil
@@ -464,25 +470,39 @@ func registerTMA1Hooks(settings map[string]any, command string) bool {
 	return mutated
 }
 
-// findEquivalentEntry returns the index of an existing TMA1-equivalent entry,
-// or -1. An entry counts as equivalent if either:
-//   - its first hook's command (after ~/ expansion) equals `command`
-//   - its id field equals `tmaID`
+// findEquivalentEntry returns the index of an existing TMA1-equivalent
+// entry, or -1. Per-entry equivalence is delegated to
+// matchesTMA1HookEntry so the install and uninstall paths can't disagree
+// on what "ours" means.
 func findEquivalentEntry(list []any, command, tmaID string) int {
-	resolved := expandHome(command)
 	for i, item := range list {
-		m, ok := item.(map[string]any)
-		if !ok {
-			continue
-		}
-		if id, _ := m["id"].(string); id == tmaID {
-			return i
-		}
-		if firstCmd := entryCommand(m); firstCmd != "" && expandHome(firstCmd) == resolved {
+		if matchesTMA1HookEntry(item, command, tmaID) {
 			return i
 		}
 	}
 	return -1
+}
+
+// matchesTMA1HookEntry reports whether a single hooks.json /
+// settings.json array entry is owned by TMA1. An entry qualifies if
+// EITHER its `id` field equals tmaID OR its first hook's command
+// (after ~/ expansion) resolves to the same path as the requested
+// command. The command-path check is what lets us recognise legacy
+// entries that pre-date the `id` field — without it, uninstall on an
+// old install would leave dangling hook registrations.
+func matchesTMA1HookEntry(entry any, command, tmaID string) bool {
+	m, ok := entry.(map[string]any)
+	if !ok {
+		return false
+	}
+	if id, _ := m["id"].(string); id == tmaID {
+		return true
+	}
+	first := entryCommand(m)
+	if first == "" {
+		return false
+	}
+	return expandHome(first) == expandHome(command)
 }
 
 // entryCommand returns the first hook's command string from an entry, or "".

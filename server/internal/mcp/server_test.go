@@ -1,6 +1,7 @@
 package mcp
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"encoding/json"
@@ -8,6 +9,7 @@ import (
 	"log/slog"
 	"strings"
 	"testing"
+	"time"
 )
 
 // roundTrip feeds a single JSON-RPC request through the server and returns
@@ -206,4 +208,109 @@ func TestMalformedJSONReturnsParseError(t *testing.T) {
 	if resp.Error == nil || resp.Error.Code != -32700 {
 		t.Errorf("expected parse error -32700, got %+v", resp.Error)
 	}
+}
+
+// slowTool is a test-only ToolHandler that blocks until the test
+// closes its release channel, used to verify the server's
+// concurrency contract: a slow tool MUST NOT block other replies.
+type slowTool struct {
+	name    string
+	release chan struct{}
+}
+
+func (t *slowTool) Definition() Tool {
+	return Tool{
+		Name:        t.name,
+		Description: "test slow tool",
+		InputSchema: InputSchema{Type: "object"},
+	}
+}
+
+func (t *slowTool) Call(ctx context.Context, _ map[string]any) (CallToolResult, error) {
+	select {
+	case <-t.release:
+	case <-ctx.Done():
+	}
+	return CallToolResult{Content: []ContentBlock{{Type: "text", Text: t.name + " done"}}}, nil
+}
+
+// TestServerConcurrentToolsDoNotBlockEachOther pins down the fix for
+// the "Codex 卡住" report: previously a single stuck tools/call would
+// wedge the whole stdio loop, blocking every subsequent reply. After
+// the fix each call runs in its own goroutine, so a slow call still
+// pending must not delay a fast one's response.
+func TestServerConcurrentToolsDoNotBlockEachOther(t *testing.T) {
+	logger := slog.New(slog.NewJSONHandler(io.Discard, nil))
+	slow := &slowTool{name: "slow", release: make(chan struct{})}
+	fast := &slowTool{name: "fast", release: make(chan struct{})}
+	srv := NewServer(logger, slow, fast)
+
+	// Pre-release fast so its Call returns immediately; slow waits.
+	close(fast.release)
+
+	// Pipes simulate the stdio protocol — we drive stdin from one
+	// goroutine and read responses concurrently from stdout.
+	inR, inW := io.Pipe()
+	outR, outW := io.Pipe()
+	srv.SetIO(inR, outW)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	var runErr error
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		runErr = srv.Run(ctx)
+	}()
+
+	// Send slow first, fast second.
+	write := func(req Request) {
+		body, _ := json.Marshal(req)
+		_, _ = inW.Write(append(body, '\n'))
+	}
+	write(Request{JSONRPC: "2.0", ID: 1, Method: "tools/call", Params: mustParams(`{"name":"slow","arguments":{}}`)})
+	write(Request{JSONRPC: "2.0", ID: 2, Method: "tools/call", Params: mustParams(`{"name":"fast","arguments":{}}`)})
+
+	// Read until we see ID=2 land. If concurrency is broken, this
+	// times out because slow is still blocked.
+	reader := bufio.NewReader(outR)
+	deadline := time.After(2 * time.Second)
+	seenFast := false
+	for !seenFast {
+		select {
+		case <-deadline:
+			t.Fatalf("fast reply did not arrive while slow was blocked — handler still serial?")
+		default:
+		}
+		line, err := reader.ReadString('\n')
+		if err != nil {
+			t.Fatalf("read out: %v", err)
+		}
+		var resp Response
+		if err := json.Unmarshal([]byte(strings.TrimSpace(line)), &resp); err != nil {
+			continue
+		}
+		if idFloat, ok := resp.ID.(float64); ok && int(idFloat) == 2 {
+			seenFast = true
+		}
+	}
+
+	// Now unblock slow so the server can return.
+	close(slow.release)
+
+	// Drain the slow response, then close stdin so Run unwinds.
+	if _, err := reader.ReadString('\n'); err != nil {
+		t.Fatalf("read slow reply: %v", err)
+	}
+	_ = inW.Close()
+	_ = outW.Close()
+	<-done
+	if runErr != nil && runErr != io.EOF && runErr != context.Canceled {
+		t.Logf("Run returned: %v", runErr)
+	}
+}
+
+func mustParams(s string) json.RawMessage {
+	return json.RawMessage(s)
 }

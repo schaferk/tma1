@@ -14,6 +14,7 @@ import (
 	"log/slog"
 	"os"
 	"strings"
+	"sync"
 )
 
 const (
@@ -27,11 +28,15 @@ const (
 // ServerVersion can be overridden by callers (e.g. main package sets it from build ldflags).
 var ServerVersion = "dev"
 
-// ToolHandler implements a single MCP tool. The server processes JSON-RPC
-// frames serially in Run's scanner loop, so individual Call invocations
-// don't race each other within one Server. They can still race the host
-// process: every tma1 Bundler/Detector method called from a tool is
-// expected to be safe for concurrent use.
+// ToolHandler implements a single MCP tool. Each tools/call dispatch
+// runs in its own goroutine, so individual Call invocations can race
+// each other within one Server. Every tma1 Bundler/Detector method
+// called from a tool must be safe for concurrent use (they are).
+//
+// Why concurrent: a single slow or stuck tool call must NOT block
+// stdin from being read or other replies from being written. The
+// previous serial loop wedged the whole MCP child the first time any
+// call took long enough for the agent's stdout pipe to buffer up.
 type ToolHandler interface {
 	Definition() Tool
 	Call(ctx context.Context, args map[string]any) (CallToolResult, error)
@@ -43,6 +48,10 @@ type Server struct {
 	logger *slog.Logger
 	in     io.Reader
 	out    io.Writer
+	// writeMu serialises writes to s.out so concurrent tool-call
+	// goroutines can't interleave JSON frames mid-line. Single mutex
+	// is enough — Fprintf is fast vs the SQL roundtrips upstream.
+	writeMu sync.Mutex
 }
 
 // NewServer creates a Server with the given tools.
@@ -67,14 +76,19 @@ func (s *Server) SetIO(in io.Reader, out io.Writer) {
 }
 
 // Run reads JSON-RPC frames from s.in and writes responses to s.out.
-// Returns when stdin reaches EOF or the scanner fails.
+// Each tools/call is dispatched in its own goroutine so a slow tool
+// can't block stdin or other replies. Returns when stdin reaches EOF
+// or the scanner fails; in-flight tool goroutines are then allowed
+// to finish via the WaitGroup so we don't drop their responses.
 func (s *Server) Run(ctx context.Context) error {
 	scanner := bufio.NewScanner(s.in)
 	scanner.Buffer(make([]byte, 0, scannerInitBuf), scannerMaxBuf)
 
+	var inflight sync.WaitGroup
 	for scanner.Scan() {
 		select {
 		case <-ctx.Done():
+			inflight.Wait()
 			return ctx.Err()
 		default:
 		}
@@ -90,11 +104,21 @@ func (s *Server) Run(ctx context.Context) error {
 			continue
 		}
 
-		s.handle(ctx, req)
+		// Run each request concurrently. The handler is responsible
+		// for shipping exactly one response (or none for
+		// notifications); writes are serialised through s.write's
+		// mutex so JSON frames can't interleave.
+		inflight.Add(1)
+		go func(req Request) {
+			defer inflight.Done()
+			s.handle(ctx, req)
+		}(req)
 	}
 
-	if err := scanner.Err(); err != nil {
-		return fmt.Errorf("mcp: scanner error: %w", err)
+	scannerErr := scanner.Err()
+	inflight.Wait()
+	if scannerErr != nil {
+		return fmt.Errorf("mcp: scanner error: %w", scannerErr)
 	}
 	return nil
 }
@@ -173,6 +197,8 @@ func (s *Server) write(v any) {
 		}
 		return
 	}
+	s.writeMu.Lock()
+	defer s.writeMu.Unlock()
 	if _, err := fmt.Fprintf(s.out, "%s\n", data); err != nil && s.logger != nil {
 		s.logger.Error("write mcp response", "err", err)
 	}

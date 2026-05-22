@@ -90,6 +90,12 @@ dev: build
 	@if ! command -v jq >/dev/null 2>&1; then \
 		echo "  (jq not found -- output stays JSON; brew install jq for colourised logs)"; \
 	fi
+	@# MCP children spawned by CC / Codex hold the OLD binary in memory
+	@# even after `server/bin/tma1-server` is rebuilt. Without recycling
+	@# them, every code change lands in the parent server but MCP tools
+	@# keep running stale code. Kill them on each rebuild so the agent's
+	@# next call re-spawns against the fresh binary.
+	@pkill -f 'tma1-server mcp-serve' 2>/dev/null || true
 	@trap 'kill $$PID 2>/dev/null; exit 0' INT TERM; \
 	while true; do \
 		./server/bin/tma1-server > >($(MAKEFILE_DIR)/scripts/tma1-prettylog) 2>&1 & PID=$$!; \
@@ -97,4 +103,5 @@ dev: build
 		echo "Change detected, rebuilding..."; \
 		kill $$PID 2>/dev/null; wait $$PID 2>/dev/null; \
 		$(MAKE) build || continue; \
+		pkill -f 'tma1-server mcp-serve' 2>/dev/null || true; \
 	done
