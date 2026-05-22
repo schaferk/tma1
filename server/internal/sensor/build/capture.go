@@ -453,17 +453,79 @@ func buildCommand(args []string) (*exec.Cmd, error) {
 // applyForceColor injects the "behave as if stdout is a TTY" env vars
 // when enabled. cmd.Env starts nil (inherits process env from libc);
 // once we touch it we must explicitly seed from os.Environ() or the
-// child loses PATH / HOME / etc. The user's own KEY=VALUE prefix args
-// are layered in earlier by buildCommand -- we append on top so the
-// user's explicit values still win.
+// child loses PATH / HOME / etc.
+//
+// Final cmd.Env is deduplicated by key, keeping the LAST occurrence
+// for each. This way:
+//   - inherited os.Environ values lose to our forced defaults, so
+//     FORCE_COLOR=1 (etc.) reach the child even when the host shell
+//     had FORCE_COLOR=0 set;
+//   - the user's own KEY=VAL prefix args, which buildCommand appended
+//     after os.Environ(), still win because they end up appended AFTER
+//     our forced defaults (we extract and re-append them).
+//
+// Before this change behaviour depended on libc's "first vs last
+// occurrence wins" semantics for duplicate env entries; that's stable
+// on glibc/Darwin but undefined elsewhere.
 func applyForceColor(cmd *exec.Cmd, force bool) {
 	if !force {
 		return
 	}
-	if cmd.Env == nil {
-		cmd.Env = os.Environ()
+	// Snapshot what buildCommand set up. nil means "inherit os.Environ
+	// only, no user KEY=VAL prefix"; non-nil means buildCommand already
+	// did `os.Environ() + userKVs` and we need to split the two back.
+	osEnv := os.Environ()
+	var userKVs []string
+	if cmd.Env != nil {
+		// User KVs are the entries appended after os.Environ. Match by
+		// content rather than index so a divergent osEnv between the
+		// two calls (process-level Setenv races) doesn't mis-slice.
+		seen := make(map[string]struct{}, len(osEnv))
+		for _, kv := range osEnv {
+			seen[kv] = struct{}{}
+		}
+		for _, kv := range cmd.Env {
+			if _, ok := seen[kv]; !ok {
+				userKVs = append(userKVs, kv)
+			}
+		}
 	}
-	cmd.Env = append(cmd.Env, colorForcingEnvVars()...)
+	// Assemble: inherited → forced defaults → user KVs. The dedup pass
+	// below keeps the last occurrence of each key so user > forced >
+	// inherited unambiguously.
+	merged := make([]string, 0, len(osEnv)+len(colorForcingEnvVars())+len(userKVs))
+	merged = append(merged, osEnv...)
+	merged = append(merged, colorForcingEnvVars()...)
+	merged = append(merged, userKVs...)
+	cmd.Env = dedupEnvKeepLast(merged)
+}
+
+// dedupEnvKeepLast collapses duplicate KEY=... entries in env, keeping
+// the last occurrence for each key. Entries without `=` (degenerate
+// input) pass through unchanged. Result order matches the surviving
+// occurrence's original position so consumers that walk env in order
+// still see the expected layout.
+func dedupEnvKeepLast(env []string) []string {
+	lastIdx := make(map[string]int, len(env))
+	for i, kv := range env {
+		k, _, ok := strings.Cut(kv, "=")
+		if !ok {
+			continue
+		}
+		lastIdx[k] = i
+	}
+	out := make([]string, 0, len(env))
+	for i, kv := range env {
+		k, _, ok := strings.Cut(kv, "=")
+		if !ok {
+			out = append(out, kv)
+			continue
+		}
+		if lastIdx[k] == i {
+			out = append(out, kv)
+		}
+	}
+	return out
 }
 
 // waitForExit returns the child's exit code (0 on clean exit, signal/abnormal

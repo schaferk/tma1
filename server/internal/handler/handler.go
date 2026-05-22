@@ -80,8 +80,11 @@ func New(greptimeHTTPPort int, tma1Port string, webFS http.FileSystem, logger *s
 		projectSensor = project.NewSensor(project.NewGreptimeStore(greptimeHTTPPort), logger)
 	}
 	// 64 in-flight background writes — enough for a subagent storm,
-	// small enough that a stuck GreptimeDB can't fork-bomb us.
-	writeSem := writeq.New(64)
+	// small enough that a stuck GreptimeDB can't fork-bomb us. Use
+	// the server's structured logger so recovered panics in background
+	// writes show up in the same JSON stream as the rest of the
+	// process, not via slog.Default().
+	writeSem := writeq.NewWithLogger(64, logger)
 	srv := &Server{
 		greptimeHTTPPort:  greptimeHTTPPort,
 		tma1Port:          tma1Port,

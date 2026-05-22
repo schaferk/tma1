@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/tma1-ai/tma1/server/internal/pathutil"
+	"github.com/tma1-ai/tma1/server/internal/sqlutil"
 )
 
 // AttributionWindow is the ±window we look at hook events to classify a
@@ -160,17 +161,8 @@ func (a *HookAttributor) queryCount(ctx context.Context, sql string) (int, error
 	return 0, nil
 }
 
-func escapeSQLLiteral(s string) string {
-	return strings.ReplaceAll(s, "'", "''")
-}
-
-// escapeSQLLikeLiteral escapes s for use as a LIKE pattern literal. Pair
-// with `ESCAPE '!'` in the SQL clause; '!' as the escape character
-// avoids the SQL-string-literal vs Go-string-literal backslash double
-// escape that '\' would otherwise require.
-func escapeSQLLikeLiteral(s string) string {
-	s = strings.ReplaceAll(s, "!", "!!")
-	s = strings.ReplaceAll(s, "%", "!%")
-	s = strings.ReplaceAll(s, "_", "!_")
-	return strings.ReplaceAll(s, "'", "''")
-}
+// escapeSQLLiteral / escapeSQLLikeLiteral are thin aliases over the
+// shared sqlutil package, kept local so existing call sites read the
+// same. sqlutil owns the implementation.
+func escapeSQLLiteral(s string) string     { return sqlutil.Escape(s) }
+func escapeSQLLikeLiteral(s string) string { return sqlutil.EscapeLike(s) }

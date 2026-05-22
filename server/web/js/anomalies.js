@@ -54,7 +54,8 @@ function anom_render() {
   var shown = sevFilter ? items.filter(function (a) { return a.severity === sevFilter; }) : items;
 
   if (shown.length === 0) {
-    listEl.innerHTML = '<div style="color:var(--text-muted);padding:24px;text-align:center;font-size:13px">No anomalies in the active window.</div>';
+    listEl.innerHTML = '<div style="color:var(--text-muted);padding:24px;text-align:center;font-size:13px">' +
+      anom_escape(t('anom.empty')) + '</div>';
     return;
   }
   listEl.innerHTML = shown.map(function (a) { return anom_renderRow(a, true); }).join('');
@@ -75,7 +76,7 @@ function anom_renderRow(a, includeSession) {
     // sess_openDetail floats an overlay above the current view, so we
     // don't need to switchView('sessions') first.
     sess =
-      '<a class="anom-sess-link" title="Open session detail" ' +
+      '<a class="anom-sess-link" title="' + anom_escape(t('anom.session_link_title')) + '" ' +
       'onclick="event.stopPropagation();sess_openDetail(\x27' +
       anom_jsLit(a.session_id) + '\x27,\x27\x27)">' + anom_escape(sid) + '</a>';
   }

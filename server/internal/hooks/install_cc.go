@@ -248,12 +248,16 @@ func (i *ClaudeCodeInstaller) installCommands() ([]string, error) {
 // syncEmbeddedTree walks an embed.FS rooted at `embedRoot`, mirroring
 // each file under `destRoot`. Files whose on-disk content already
 // matches the embedded version are left untouched (so reinstalls don't
-// thrash mtimes). Honors DryRun via writeFile / mkdirAll.
+// thrash mtimes). Files under destRoot that are NOT in the embed are
+// removed -- otherwise a skill / command renamed or dropped upstream
+// would linger in the user's ~/.claude/{skills,commands}/ forever.
+// Honors DryRun via writeFile / mkdirAll / removeStale.
 func (i *ClaudeCodeInstaller) syncEmbeddedTree(src embed.FS, embedRoot, destRoot string) ([]string, error) {
 	if err := i.mkdirAll(destRoot, 0o755); err != nil {
 		return nil, err
 	}
 	var changed []string
+	wanted := map[string]struct{}{} // tracks every target written or already-current
 	walkErr := fs.WalkDir(src, embedRoot, func(p string, d fs.DirEntry, walkErr error) error {
 		if walkErr != nil {
 			return walkErr
@@ -270,6 +274,7 @@ func (i *ClaudeCodeInstaller) syncEmbeddedTree(src embed.FS, embedRoot, destRoot
 			return err
 		}
 		target := filepath.Join(destRoot, rel)
+		wanted[target] = struct{}{}
 		if existing, err := os.ReadFile(target); err == nil && string(existing) == string(want) {
 			return nil
 		}
@@ -285,7 +290,75 @@ func (i *ClaudeCodeInstaller) syncEmbeddedTree(src embed.FS, embedRoot, destRoot
 	if walkErr != nil {
 		return changed, walkErr
 	}
+	// Sweep stale files: anything under destRoot the embed no longer
+	// declares. Walking on-disk after the embed pass means we already
+	// know exactly which targets are legitimate (wanted set above).
+	staleRemoved, err := i.removeStaleUnder(destRoot, wanted)
+	if err != nil {
+		// Don't fail the install on cleanup error -- the desired files
+		// are already in place. Surface the staleness as part of the
+		// changed list so the caller can log it.
+		return changed, fmt.Errorf("remove stale under %s: %w", destRoot, err)
+	}
+	changed = append(changed, staleRemoved...)
 	return changed, nil
+}
+
+// removeStaleUnder walks `root` and removes every file whose path
+// isn't in `keep`. Empty directories left behind are removed too so
+// the user's ~/.claude/{skills,commands}/ doesn't accumulate dead
+// folders.
+//
+// DryRun-aware: in dry-run mode we log what would be deleted and
+// return the would-be paths without touching disk.
+func (i *ClaudeCodeInstaller) removeStaleUnder(root string, keep map[string]struct{}) ([]string, error) {
+	var removed []string
+	var dirs []string // bottom-up sweep for empties
+	// Root may not exist yet on a fresh install (and definitely doesn't
+	// in dry-run mode, where mkdirAll above was a logged no-op). Treat
+	// "no directory" as "no stale to clean".
+	if _, err := os.Stat(root); os.IsNotExist(err) {
+		return removed, nil
+	}
+	walkErr := filepath.WalkDir(root, func(path string, d fs.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		if path == root {
+			return nil
+		}
+		if d.IsDir() {
+			dirs = append(dirs, path)
+			return nil
+		}
+		if _, ok := keep[path]; ok {
+			return nil
+		}
+		if i.DryRun {
+			if i.Logger != nil {
+				i.Logger.Info("[dry-run] would remove stale", "path", path)
+			}
+			removed = append(removed, path+" (stale, would remove)")
+			return nil
+		}
+		if err := os.Remove(path); err != nil {
+			return err
+		}
+		removed = append(removed, path+" (stale, removed)")
+		return nil
+	})
+	if walkErr != nil {
+		return removed, walkErr
+	}
+	// Best-effort: prune now-empty directories from the deepest path
+	// first so a removed leaf doesn't leave behind a forest of empties.
+	for j := len(dirs) - 1; j >= 0; j-- {
+		if i.DryRun {
+			continue
+		}
+		_ = os.Remove(dirs[j]) // fails noisily only when non-empty; that's the signal we want
+	}
+	return removed, nil
 }
 
 // installSettings updates ~/.claude/settings.json to register UserPromptSubmit

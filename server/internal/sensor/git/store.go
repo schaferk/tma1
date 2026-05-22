@@ -10,7 +10,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/tma1-ai/tma1/server/internal/strutil"
+	"github.com/tma1-ai/tma1/server/internal/sqlutil"
 )
 
 // Hard caps to keep individual rows bounded; same philosophy as the build
@@ -102,13 +102,6 @@ func greptimeResponseError(body []byte) error {
 	return nil
 }
 
-// quote returns the SQL NULL keyword for empty input, otherwise a SQL
-// string literal with embedded quotes escaped and the value truncated
-// (rune-safe) to at most maxLen bytes.
-func quote(v string, maxLen int) string {
-	if v == "" {
-		return "NULL"
-	}
-	v = strutil.SafeTruncate(v, maxLen)
-	return "'" + strings.ReplaceAll(v, "'", "''") + "'"
-}
+// quote is a thin alias over sqlutil.Quote -- shared rune-safe
+// SQL-literal helper, identical behaviour across all stores.
+func quote(v string, maxLen int) string { return sqlutil.Quote(v, maxLen) }

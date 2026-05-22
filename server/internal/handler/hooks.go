@@ -14,6 +14,8 @@ import (
 	"time"
 
 	"github.com/tma1-ai/tma1/server/internal/perception"
+	"github.com/tma1-ai/tma1/server/internal/sqlutil"
+	"github.com/tma1-ai/tma1/server/internal/strutil"
 )
 
 // fileChangedDedup tracks last FileChanged timestamp per session+path to suppress duplicates.
@@ -675,11 +677,7 @@ func extractDerivedFields(p hookPayload, toolInput, toolResult string) (filePath
 	// in the JSON ("\n", '\"') are unescaped to keep the column readable.
 	if p.ToolName == "Bash" || p.ToolName == "exec_command" {
 		if m := commandInputRE.FindStringSubmatch(toolInput); len(m) >= 2 {
-			cmd := unescapeJSONString(m[1])
-			if len(cmd) > 200 {
-				cmd = cmd[:200]
-			}
-			cmdPrefix = cmd
+			cmdPrefix = strutil.SafeTruncate(unescapeJSONString(m[1]), 200)
 		}
 	}
 
@@ -692,10 +690,7 @@ func extractDerivedFields(p hookPayload, toolInput, toolResult string) (filePath
 	case "PostToolUseFailure":
 		f := false
 		success = &f
-		errSummary = firstNonEmpty(toolResult, p.Message)
-		if len(errSummary) > 400 {
-			errSummary = errSummary[:400]
-		}
+		errSummary = strutil.SafeTruncate(firstNonEmpty(toolResult, p.Message), 400)
 	}
 	return
 }
@@ -742,14 +737,13 @@ func firstNonEmpty(a, b string) string {
 }
 
 // nullableString renders v as a SQL literal, or NULL when empty. Also
-// truncates to maxLen to keep individual rows bounded.
+// truncates to maxLen bytes (rune-safe via strutil.SafeTruncate so
+// non-ASCII content can't smuggle invalid UTF-8 into GreptimeDB).
 func nullableString(v string, maxLen int) string {
 	if v == "" {
 		return "NULL"
 	}
-	if len(v) > maxLen {
-		v = v[:maxLen]
-	}
+	v = strutil.SafeTruncate(v, maxLen)
 	return "'" + escapeSQLString(v) + "'"
 }
 
@@ -849,16 +843,17 @@ func serializeToolInput(v any) string {
 	return string(b)
 }
 
+// truncateStr caps s at maxLen bytes without splitting a UTF-8 rune.
+// Critical: callers feed this into SQL string literals; a mid-rune cut
+// emits invalid UTF-8 into GreptimeDB. Matches the sensor stores'
+// strutil.SafeTruncate-based quoting.
 func truncateStr(s string, maxLen int) string {
-	if len(s) <= maxLen {
-		return s
-	}
-	return s[:maxLen]
+	return strutil.SafeTruncate(s, maxLen)
 }
 
-func escapeSQLString(s string) string {
-	return strings.ReplaceAll(s, "'", "''")
-}
+// escapeSQLString is a thin alias over sqlutil.Escape -- single source
+// of truth for SQL single-quote escaping across the codebase.
+func escapeSQLString(s string) string { return sqlutil.Escape(s) }
 
 // hookMeta parses the metadata JSON string from a hookPayload.
 func hookMeta(p hookPayload) map[string]any {

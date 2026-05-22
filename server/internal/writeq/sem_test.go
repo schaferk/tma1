@@ -59,26 +59,39 @@ func TestSemAcceptsUpToCapacity(t *testing.T) {
 }
 
 func TestSemReleasesSlotOnPanic(t *testing.T) {
-	// A panicking job must not poison the slot. We don't promise to
-	// recover the panic ourselves (that's the caller's job), but the
-	// deferred slot release must run regardless.
+	// A panicking job must not poison the slot. Sem now recovers the
+	// panic internally (otherwise a single misbehaving callback would
+	// crash the whole server), so the user-side function panics raw
+	// and the slot release still runs.
+	//
+	// The deferred slot release happens AFTER the user-side fn() has
+	// fully unwound, so we can't synchronise on "fn started". Poll the
+	// semaphore until the slot is genuinely free, same pattern as
+	// TestSemAcceptsUpToCapacity.
 	s := New(1)
-	done := make(chan struct{})
-	if !s.Go(func() {
-		defer close(done)
-		defer func() { _ = recover() }()
-		panic("boom")
-	}) {
+	if !s.Go(func() { panic("boom") }) {
 		t.Fatal("expected initial Go to succeed")
 	}
-	<-done
-	// Slot should now be free.
 	var wg sync.WaitGroup
 	wg.Add(1)
-	if !s.Go(func() { defer wg.Done() }) {
+	deadline := time.Now().Add(time.Second)
+	accepted := false
+	for time.Now().Before(deadline) {
+		if s.Go(func() { defer wg.Done() }) {
+			accepted = true
+			break
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	if !accepted {
 		t.Fatal("slot not released after panic")
 	}
 	wg.Wait()
+	// And the panic is counted -- silent failure is the worst-case
+	// outcome we explicitly designed against.
+	if got := s.Panicked(); got != 1 {
+		t.Errorf("Panicked() = %d, want 1", got)
+	}
 }
 
 func TestSemRejectsNil(t *testing.T) {

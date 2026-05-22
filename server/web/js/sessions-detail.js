@@ -84,7 +84,10 @@ function renderSessionDetail(timeline, stats) {
   html += '<button class="sess-panel-toggle" onclick="sess_togglePanel(\x27left\x27)" title="' + t('ui.expand') + '">&#x21C9;</button>';
   html += sess_renderContextBar(stats.context);
   // Anomalies block (filled async after render — see sess_loadDetailAnomalies).
-  html += '<div id="sess-detail-anomalies" style="margin:8px 0"></div>';
+  // Starts hidden so the empty-state path leaves no vertical whitespace;
+  // sess_loadDetailAnomalies flips display back to "" when there are
+  // anomalies to show. Margin only applies when content is present.
+  html += '<div id="sess-detail-anomalies" style="display:none;margin:8px 0"></div>';
   html += sess_renderWaterfall(timeline, stats);
   if (stats.apiCalls.length > 0) html += sess_renderAPICalls(stats);
   html += sess_renderFileHeatmap(stats.files);
@@ -263,29 +266,34 @@ function sess_toggleDurPopover(e, info) {
 async function sess_loadDetailAnomalies(sessionID) {
   var slot = document.getElementById('sess-detail-anomalies');
   if (!slot) return;
+  // Helper: keep the empty-state path symmetric -- both the "no anomalies"
+  // and "fetch failed" branches must clear content AND hide the slot so
+  // its margin doesn't leak whitespace into the layout.
+  function clearSlot() { slot.innerHTML = ''; slot.style.display = 'none'; }
   try {
     var resp = await fetch('/api/anomalies?session_id=' + encodeURIComponent(sessionID));
-    if (!resp.ok) { slot.innerHTML = ''; return; }
+    if (!resp.ok) { clearSlot(); return; }
     var data = await resp.json();
     var items = data.anomalies || [];
-    if (items.length === 0) { slot.innerHTML = ''; return; }
+    if (items.length === 0) { clearSlot(); return; }
 
     var sevCounts = { high: 0, medium: 0, low: 0 };
     items.forEach(function (a) { sevCounts[a.severity] = (sevCounts[a.severity] || 0) + 1; });
     var sevParts = [];
-    if (sevCounts.high) sevParts.push('<span style="color:var(--red)">' + sevCounts.high + ' high</span>');
-    if (sevCounts.medium) sevParts.push('<span style="color:var(--orange)">' + sevCounts.medium + ' med</span>');
-    if (sevCounts.low) sevParts.push('<span style="color:var(--text-dim)">' + sevCounts.low + ' low</span>');
+    if (sevCounts.high) sevParts.push('<span style="color:var(--red)">' + sevCounts.high + ' ' + t('anom.sev.high') + '</span>');
+    if (sevCounts.medium) sevParts.push('<span style="color:var(--orange)">' + sevCounts.medium + ' ' + t('anom.sev.medium') + '</span>');
+    if (sevCounts.low) sevParts.push('<span style="color:var(--text-dim)">' + sevCounts.low + ' ' + t('anom.sev.low') + '</span>');
     var sevSummary = sevParts.length ? ' · ' + sevParts.join(' · ') : '';
 
     var rows = items.map(function (a) { return anom_renderRow(a, false); }).join('');
+    slot.style.display = '';
     slot.innerHTML =
       '<details class="sess-section">' +
-      '<summary>Anomalies (' + items.length + ')' + sevSummary + '</summary>' +
+      '<summary>' + t('anom.session_summary') + ' (' + items.length + ')' + sevSummary + '</summary>' +
       '<div class="anom-detail-list">' + rows + '</div>' +
       '</details>';
   } catch (err) {
     console.error('sess_loadDetailAnomalies', err);
-    slot.innerHTML = '';
+    clearSlot();
   }
 }

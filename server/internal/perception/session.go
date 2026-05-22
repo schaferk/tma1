@@ -6,6 +6,8 @@ import (
 	"sort"
 	"strings"
 	"time"
+
+	"github.com/tma1-ai/tma1/server/internal/sqlutil"
 )
 
 // SessionState is a snapshot of a single agent session.
@@ -82,8 +84,8 @@ func (b *Bundler) GetSessionState(ctx context.Context, sessionID string) (*Sessi
 	// when other selected columns are aggregated → wrap in MAX().
 	headerSQL := fmt.Sprintf(
 		`SELECT MAX(agent_source) AS agent_source,
-		        MIN(ts) AS started_at,
-		        MAX(ts) AS last_ts,
+		        CAST(MIN(ts) AS BIGINT) AS started_at,
+		        CAST(MAX(ts) AS BIGINT) AS last_ts,
 		        COUNT(*) AS tool_calls
 		 FROM tma1_hook_events
 		 WHERE session_id = '%s'
@@ -151,7 +153,7 @@ func (b *Bundler) GetSessionState(ctx context.Context, sessionID string) (*Sessi
 		`SELECT tool_name,
 		        COALESCE(tool_file_path,
 		                 regexp_match(tool_input, '"file_path":"([^"]+)"')[1]) AS fp,
-		        ts
+		        CAST(ts AS BIGINT) AS ts_ms
 		 FROM tma1_hook_events
 		 WHERE session_id = '%s' AND event_type = 'PreToolUse'
 		   AND tool_name IN ('Edit','Write','Read','MultiEdit')
@@ -285,26 +287,11 @@ func (b *Bundler) GetRecentActions(ctx context.Context, sessionID string, limit 
 	return out, nil
 }
 
-func escapeSQL(s string) string {
-	return strings.ReplaceAll(s, "'", "''")
-}
-
-// escapeSQLLike escapes s for use as a literal inside a LIKE pattern.
-// Pair with `ESCAPE '!'` in the SQL clause. Why '!': avoids the
-// backslash/single-quote gymnastics that come with the conventional
-// '\' escape (Go string literal → SQL string literal → LIKE pattern is
-// three rewrites deep, easy to get wrong). '!' is allowed in
-// file_paths but very rare, so collisions are negligible.
-//
-// Use this whenever an unsanitised file_path, command, project name,
-// or other agent-controlled string is interpolated into a LIKE pattern
-// — otherwise a path containing '%' or '_' silently over-matches.
-func escapeSQLLike(s string) string {
-	s = strings.ReplaceAll(s, "!", "!!")
-	s = strings.ReplaceAll(s, "%", "!%")
-	s = strings.ReplaceAll(s, "_", "!_")
-	return strings.ReplaceAll(s, "'", "''")
-}
+// escapeSQL / escapeSQLLike are thin aliases over the shared sqlutil
+// package -- single source of truth for SQL string + LIKE escaping
+// across perception, handler, and sensor packages.
+func escapeSQL(s string) string     { return sqlutil.Escape(s) }
+func escapeSQLLike(s string) string { return sqlutil.EscapeLike(s) }
 
 func indexCols(cols []string) map[string]int {
 	m := make(map[string]int, len(cols))

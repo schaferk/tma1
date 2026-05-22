@@ -1,6 +1,8 @@
 package perception
 
 import (
+	"strconv"
+	"strings"
 	"testing"
 	"time"
 )
@@ -65,14 +67,31 @@ func TestExtractErrorLineCrossLanguage(t *testing.T) {
 	}
 }
 
-func TestLooksLikeTestRunnerAcrossLanguages(t *testing.T) {
-	// Locks the cross-language coverage of R-test-stuck. The earlier
-	// regex-based implementation only matched Go-style "--- FAIL:"
-	// output; this list is the empirical floor of what the rule must
-	// recognise in real coding workflows.
+func TestTestRunnerPrefixesAcrossLanguages(t *testing.T) {
+	// Locks the cross-language coverage of R-test-stuck. The rule's
+	// SQL builds LIKE clauses from testRunnerPrefixes; this test
+	// asserts the prefix set keeps covering the languages we care
+	// about. The matching semantics mirror the SQL LIKE 'prefix%' --
+	// case-sensitive prefix match -- so the test lowercases inputs
+	// because tool_command_prefix arrives lowercased at ingest.
+	matches := func(cmd string) bool {
+		cmd = strings.TrimSpace(strings.ToLower(cmd))
+		if cmd == "" {
+			return false
+		}
+		for _, p := range testRunnerPrefixes {
+			if strings.HasPrefix(cmd, p) {
+				rest := cmd[len(p):]
+				if rest == "" || rest[0] == ' ' || rest[0] == '\t' {
+					return true
+				}
+			}
+		}
+		return false
+	}
 	positive := []string{
 		"go test ./...",
-		"GO TEST ./pkg",            // case-insensitive
+		"GO TEST ./pkg", // case-insensitive
 		"cargo test --workspace",
 		"cargo nextest run",
 		"pytest -k foo",
@@ -97,7 +116,7 @@ func TestLooksLikeTestRunnerAcrossLanguages(t *testing.T) {
 		"mix test --trace",
 	}
 	for _, cmd := range positive {
-		if !looksLikeTestRunner(cmd) {
+		if !matches(cmd) {
 			t.Errorf("expected test-runner match: %q", cmd)
 		}
 	}
@@ -106,16 +125,16 @@ func TestLooksLikeTestRunnerAcrossLanguages(t *testing.T) {
 		"",
 		"   ",
 		"go build",
-		"go testify",   // word-boundary guard: not "go test"
+		"go testify", // word-boundary guard: not "go test"
 		"cargo build",
 		"npm install",
 		"npm run dev",
-		"make test",   // intentionally NOT covered -- Makefile target names are project-defined
+		"make test", // intentionally NOT covered -- Makefile target names are project-defined
 		"./bin/foo",
 		"docker compose up",
 	}
 	for _, cmd := range negative {
-		if looksLikeTestRunner(cmd) {
+		if matches(cmd) {
 			t.Errorf("expected NO match: %q", cmd)
 		}
 	}
@@ -145,6 +164,41 @@ func TestAnomalyCacheInvalidate(t *testing.T) {
 	c.invalidate("s1")
 	if _, ok := c.get("s1"); ok {
 		t.Error("invalidate did not drop entry")
+	}
+}
+
+func TestAnomalyCacheHistoryEvictsStaleSessions(t *testing.T) {
+	// Verifies the history map drops sessions whose newest emit is
+	// older than historyMaxAge, while keeping fresh ones. The
+	// suppression path runs the eviction inline so a long-running
+	// server can't accumulate dead session state.
+	c := newAnomalyCache(time.Hour)
+
+	// Seed historyGCMinSize+1 sessions with stale emits so the GC
+	// threshold is crossed and the scan actually runs.
+	staleTs := time.Now().Add(-2 * historyMaxAge)
+	for i := 0; i < historyGCMinSize+1; i++ {
+		sid := "stale-" + strconv.Itoa(i)
+		c.history[sid] = map[string]emitState{
+			"k|high|": {LastEmittedAt: staleTs},
+		}
+	}
+	// One fresh session that must survive.
+	c.history["fresh"] = map[string]emitState{
+		"k|high|": {LastEmittedAt: time.Now()},
+	}
+
+	// Trigger eviction via the normal suppression path.
+	c.suppressWithResolution("trigger", []Anomaly{{Kind: "k", Severity: "high"}}, nil)
+
+	if _, ok := c.history["fresh"]; !ok {
+		t.Error("fresh session was evicted")
+	}
+	if _, ok := c.history["stale-0"]; ok {
+		t.Error("stale session was retained")
+	}
+	if len(c.history) > 2 { // "fresh" + "trigger"
+		t.Errorf("expected ≤ 2 surviving sessions, got %d", len(c.history))
 	}
 }
 

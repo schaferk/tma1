@@ -4,6 +4,8 @@ import (
 	"context"
 	"fmt"
 	"time"
+
+	"github.com/tma1-ai/tma1/server/internal/strutil"
 )
 
 // BuildStatus is a compact snapshot of recent build activity for a project,
@@ -134,7 +136,10 @@ func (b *Bundler) GetBuildStatus(ctx context.Context, project string) (*BuildSta
 	if _, lr, err := b.client.Query(ctx, lastErrSQL); err == nil && len(lr) > 0 {
 		msg := stringAt(lr[0], 0)
 		if len(msg) > 400 {
-			msg = msg[:400] + "…"
+			// Rune-safe truncation — build errors carry stderr that may
+			// be non-ASCII (locale-localised compiler messages, paths
+			// with accented chars).
+			msg = strutil.SafeTruncate(msg, 400) + "…"
 		}
 		status.LastErrorMessage = msg
 		status.LastErrorAt = time.UnixMilli(int64At(lr[0], 1))

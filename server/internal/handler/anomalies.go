@@ -335,13 +335,20 @@ type toolCallRow struct {
 	FilePath string
 }
 
+// fetchEmitsMaxRows caps the emit-log scan for the follow-rate
+// endpoint. Sized to fit comfortably inside querySQL's 1 MB body cap
+// (~200 bytes / row × 5000 ≈ 1 MB ceiling, plenty of headroom). Real
+// dogfood produces O(100) emits / day so this is a safety net, not a
+// pressure ceiling.
+const fetchEmitsMaxRows = 5000
+
 func (s *Server) fetchEmits(ctx context.Context, days int) ([]emitRow, error) {
 	sql := fmt.Sprintf(
 		`SELECT CAST(ts AS BIGINT) AS ts_ms, session_id, kind, related_files
 		 FROM tma1_anomaly_emits
 		 WHERE ts > now() - INTERVAL '%d days'
-		 ORDER BY ts ASC`,
-		days,
+		 ORDER BY ts ASC LIMIT %d`,
+		days, fetchEmitsMaxRows,
 	)
 	body, err := s.querySQL(ctx, sql)
 	if err != nil {
@@ -375,9 +382,24 @@ func (s *Server) fetchEmits(ctx context.Context, days int) ([]emitRow, error) {
 	return out, nil
 }
 
+// fetchToolCallsMaxSessions caps the IN-list size so a long
+// follow-rate window can't ship an SQL statement of unbounded length
+// to GreptimeDB. Sessions beyond this are dropped (the follow-rate
+// denominator stays accurate -- only the matching numerator shrinks).
+const fetchToolCallsMaxSessions = 500
+
+// fetchToolCallsMaxRows caps the rows returned from tma1_hook_events
+// for the follow-rate join. Same 1 MB body-cap reasoning as
+// fetchEmitsMaxRows: ~200 bytes / row × 5000 stays well inside the
+// limit even for sessions with long tool histories.
+const fetchToolCallsMaxRows = 5000
+
 func (s *Server) fetchToolCallsForSessions(ctx context.Context, sessions []string, days int) (map[string][]toolCallRow, error) {
 	if len(sessions) == 0 {
 		return map[string][]toolCallRow{}, nil
+	}
+	if len(sessions) > fetchToolCallsMaxSessions {
+		sessions = sessions[:fetchToolCallsMaxSessions]
 	}
 	quoted := make([]string, 0, len(sessions))
 	for _, sid := range sessions {
@@ -391,8 +413,8 @@ func (s *Server) fetchToolCallsForSessions(ctx context.Context, sessions []strin
 		 WHERE session_id IN (%s)
 		   AND event_type = 'PreToolUse'
 		   AND ts > now() - INTERVAL '%d days'
-		 ORDER BY session_id, ts ASC`,
-		strings.Join(quoted, ","), days,
+		 ORDER BY session_id, ts ASC LIMIT %d`,
+		strings.Join(quoted, ","), days, fetchToolCallsMaxRows,
 	)
 	body, err := s.querySQL(ctx, sql)
 	if err != nil {

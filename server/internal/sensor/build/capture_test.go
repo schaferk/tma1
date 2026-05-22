@@ -47,6 +47,66 @@ func TestApplyForceColorNoOpWhenDisabled(t *testing.T) {
 	}
 }
 
+func TestApplyForceColorUserKVWinsOverDefault(t *testing.T) {
+	// The user opting out via a leading KEY=VAL prefix (FORCE_COLOR=0)
+	// must beat our injected default (FORCE_COLOR=1). dedupEnvKeepLast
+	// guarantees this regardless of libc dedup behaviour.
+	cmd := exec.Command("/bin/echo", "hi")
+	cmd.Env = append([]string{}, "FORCE_COLOR=0") // simulate user override
+	// Prepend os.Environ so applyForceColor sees the layout buildCommand
+	// produces: inherited env + user KVs.
+	cmd.Env = append(append([]string{}, "PATH=/usr/bin", "HOME=/tmp"), cmd.Env...)
+	applyForceColor(cmd, true)
+	got := map[string]string{}
+	for _, kv := range cmd.Env {
+		if idx := strings.Index(kv, "="); idx >= 0 {
+			got[kv[:idx]] = kv[idx+1:]
+		}
+	}
+	if got["FORCE_COLOR"] != "0" {
+		t.Errorf("user override lost: FORCE_COLOR=%q, want 0", got["FORCE_COLOR"])
+	}
+	// And the other forced defaults still take effect.
+	if got["CLICOLOR_FORCE"] != "1" {
+		t.Errorf("default not applied: CLICOLOR_FORCE=%q, want 1", got["CLICOLOR_FORCE"])
+	}
+}
+
+func TestDedupEnvKeepLast(t *testing.T) {
+	in := []string{
+		"PATH=/usr/bin",
+		"FORCE_COLOR=0",
+		"FORCE_COLOR=1",  // wins over the first occurrence
+		"NOEQUALS",        // pass-through
+		"FORCE_COLOR=2",  // wins over both prior FORCE_COLORs
+	}
+	out := dedupEnvKeepLast(in)
+	// Expected: PATH, NOEQUALS, FORCE_COLOR=2 (last).
+	var path, force, noeq string
+	for _, kv := range out {
+		switch {
+		case strings.HasPrefix(kv, "PATH="):
+			path = kv
+		case strings.HasPrefix(kv, "FORCE_COLOR="):
+			force = kv
+		case kv == "NOEQUALS":
+			noeq = kv
+		}
+	}
+	if path != "PATH=/usr/bin" {
+		t.Errorf("PATH lost: %q", path)
+	}
+	if force != "FORCE_COLOR=2" {
+		t.Errorf("FORCE_COLOR keep-last failed: %q", force)
+	}
+	if noeq != "NOEQUALS" {
+		t.Errorf("malformed entry dropped: %q", noeq)
+	}
+	if len(out) != 3 {
+		t.Errorf("len = %d, want 3, got %v", len(out), out)
+	}
+}
+
 // memWriter is an in-memory EventWriter for tests.
 type memWriter struct {
 	mu     sync.Mutex

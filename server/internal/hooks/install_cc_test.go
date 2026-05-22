@@ -380,6 +380,42 @@ func TestInstallCommandsCopiesEmbeddedTree(t *testing.T) {
 	}
 }
 
+func TestInstallCommandsRemovesStaleFiles(t *testing.T) {
+	// A leftover file under ~/.claude/commands/ that the embed.FS no
+	// longer carries must be swept away on the next install. Without
+	// this a renamed-or-removed command would linger forever on every
+	// user's machine.
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+
+	cmdsDir := filepath.Join(home, ".claude", "commands")
+	if err := os.MkdirAll(cmdsDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	stalePath := filepath.Join(cmdsDir, "tma1-removed.md")
+	if err := os.WriteFile(stalePath, []byte("old command, no longer in embed"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	inst := &ClaudeCodeInstaller{
+		DataDir: filepath.Join(home, ".tma1"),
+		Port:    14318,
+		Logger:  slog.Default(),
+	}
+	if _, err := inst.installCommands(); err != nil {
+		t.Fatalf("installCommands: %v", err)
+	}
+
+	if _, err := os.Stat(stalePath); !os.IsNotExist(err) {
+		t.Errorf("stale file should be removed, stat err = %v", err)
+	}
+	// And the embedded file is still present.
+	wantPath := filepath.Join(cmdsDir, "tma1-peer.md")
+	if _, err := os.Stat(wantPath); err != nil {
+		t.Errorf("embedded file missing after sync: %v", err)
+	}
+}
+
 func TestInstallDryRunWritesNothing(t *testing.T) {
 	// DryRun must report what *would* happen but leave the filesystem
 	// untouched — critical because the installer writes to ~/.claude.json

@@ -472,7 +472,7 @@ func (d *Detector) latestErrorLineForPrefix(ctx context.Context, sessionID, pref
 // list both compiler-style colon variants and free-text language-
 // specific tokens, ordered so the most discriminating match first.
 var errorLineMarkers = []string{
-	"error[", "error:", " error:",          // compilers (rustc E-codes, gcc/clang colon)
+	"error[", "error:",                     // compilers (rustc E-codes, gcc/clang colon)
 	"failed:", "failed ", "failure:",       // pytest "FAILED ", generic
 	"--- fail", "fail:",                    // go test
 	"panic:", "fatal:",                     // go panic, generic fatal
@@ -752,26 +752,6 @@ func (d *Detector) ruleTestStuck(ctx context.Context, sessionID string) ([]Anoma
 		})
 	}
 	return out, nil
-}
-
-// looksLikeTestRunner returns true when cmd's leading tokens match any
-// entry in testRunnerPrefixes. Used by tests + future callers that
-// need the heuristic outside of SQL.
-func looksLikeTestRunner(cmd string) bool {
-	cmd = strings.TrimSpace(strings.ToLower(cmd))
-	if cmd == "" {
-		return false
-	}
-	for _, p := range testRunnerPrefixes {
-		if strings.HasPrefix(cmd, p) {
-			// require word boundary so "go testify" doesn't match "go test"
-			rest := cmd[len(p):]
-			if rest == "" || rest[0] == ' ' || rest[0] == '\t' {
-				return true
-			}
-		}
-	}
-	return false
 }
 
 // ───────────────────────────────────────────────────────────────────────
@@ -1058,6 +1038,22 @@ func (c *anomalyCache) invalidate(sessionID string) {
 // emits are silent, short enough that long-running issues come back.
 const suppressionWindow = 10 * time.Minute
 
+// historyMaxAge bounds how long a session's emit history is retained
+// without any new activity. Beyond this, the session is considered dead
+// and its history evicted so the map can't grow unbounded across a
+// long-running server.
+//
+// Set generously (24h) so a session that resumes after a workday gap
+// still benefits from suppression. Re-emit after eviction is identical
+// to a brand-new session -- the worst case is one duplicate anomaly,
+// which is far cheaper than a leak.
+const historyMaxAge = 24 * time.Hour
+
+// historyGCMinSize is the threshold below which evictHistoryLocked
+// short-circuits. Keeps the per-call cost negligible for small servers
+// while still bounding the map when it grows.
+const historyGCMinSize = 64
+
 func (c *anomalyCache) suppress(sessionID string, candidates []Anomaly) []Anomaly {
 	return c.suppressWithResolution(sessionID, candidates, nil)
 }
@@ -1124,5 +1120,40 @@ func (c *anomalyCache) suppressWithResolution(sessionID string, candidates []Ano
 		a.FirstEmittedAt = st.FirstEmittedAt
 		kept = append(kept, a)
 	}
+	c.evictHistoryLocked(now)
 	return kept
+}
+
+// evictHistoryLocked drops sessions whose most recent emit landed more
+// than historyMaxAge ago. Runs under c.mu (callers already hold it).
+//
+// Strategy: walk the whole map. The map is small in practice -- a few
+// hundred sessions at most on a busy single-developer machine -- so a
+// linear scan is cheaper than maintaining a heap or sorted structure.
+// historyGCMinSize gates the scan so the common case (fresh server,
+// dozens of sessions) pays nothing.
+func (c *anomalyCache) evictHistoryLocked(now time.Time) {
+	if len(c.history) < historyGCMinSize {
+		return
+	}
+	cutoff := now.Add(-historyMaxAge)
+	for sid, keys := range c.history {
+		newest := newestEmit(keys)
+		if !newest.IsZero() && newest.Before(cutoff) {
+			delete(c.history, sid)
+		}
+	}
+}
+
+// newestEmit returns the most recent LastEmittedAt across all keys for a
+// session, or the zero time when there are none (treated as "no signal,
+// don't evict yet").
+func newestEmit(keys map[string]emitState) time.Time {
+	var t time.Time
+	for _, st := range keys {
+		if st.LastEmittedAt.After(t) {
+			t = st.LastEmittedAt
+		}
+	}
+	return t
 }

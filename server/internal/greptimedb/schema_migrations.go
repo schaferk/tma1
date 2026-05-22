@@ -7,6 +7,7 @@ import (
 	"log/slog"
 	"net/http"
 	"net/url"
+	"sort"
 	"strings"
 	"time"
 )
@@ -138,11 +139,12 @@ func RunSchemaMigrations(httpPort int, logger *slog.Logger) error {
 }
 
 // pendingMigrations returns the entries in `all` whose Version exceeds
-// `current`. Factored out so the version-selection logic is unit-
-// testable without a live GreptimeDB.
+// `current`, in ascending Version order. Factored out so the
+// version-selection logic is unit-testable without a live GreptimeDB.
 //
-// Caller is responsible for `all` being sorted by Version ascending —
-// schemaMigrations is hand-curated so the slice order matches.
+// The slice is sorted defensively even though schemaMigrations is
+// hand-curated -- a mid-list insertion mistake would otherwise apply
+// migrations out of order and stamp the wrong ledger version.
 func pendingMigrations(current int, all []Migration) []Migration {
 	var out []Migration
 	for _, m := range all {
@@ -150,6 +152,9 @@ func pendingMigrations(current int, all []Migration) []Migration {
 			out = append(out, m)
 		}
 	}
+	sort.SliceStable(out, func(i, j int) bool {
+		return out[i].Version < out[j].Version
+	})
 	return out
 }
 

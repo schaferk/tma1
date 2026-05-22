@@ -10,7 +10,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/tma1-ai/tma1/server/internal/strutil"
+	"github.com/tma1-ai/tma1/server/internal/sqlutil"
 )
 
 // Hard limits to keep individual rows reasonable. The full output is still
@@ -116,16 +116,9 @@ func greptimeResponseError(body []byte) error {
 	return nil
 }
 
-// quoteString returns the SQL NULL keyword for empty input, otherwise a
-// SQL string literal with embedded quotes escaped and the value
-// truncated (rune-safe) to at most maxLen bytes.
-func quoteString(v string, maxLen int) string {
-	if v == "" {
-		return "NULL"
-	}
-	v = strutil.SafeTruncate(v, maxLen)
-	return "'" + strings.ReplaceAll(v, "'", "''") + "'"
-}
+// quoteString is a thin alias over sqlutil.Quote -- same rune-safe
+// behaviour, shared implementation.
+func quoteString(v string, maxLen int) string { return sqlutil.Quote(v, maxLen) }
 
 func quoteIntOrNull(v int) string {
 	if v == 0 {

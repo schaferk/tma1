@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/tma1-ai/tma1/server/internal/pathutil"
+	"github.com/tma1-ai/tma1/server/internal/strutil"
 )
 
 // Bundle is the complete perception snapshot returned to agents.
@@ -389,7 +390,10 @@ func oneLine(s string, maxLen int) string {
 	}
 	out := strings.TrimSpace(b.String())
 	if len(out) > maxLen {
-		out = out[:maxLen] + "…"
+		// Rune-safe cut so a multi-byte error message (Chinese
+		// stderr, accented filenames) doesn't ship invalid UTF-8
+		// into the bundle JSON.
+		out = strutil.SafeTruncate(out, maxLen) + "…"
 	}
 	return out
 }
