@@ -450,21 +450,43 @@ func TestRegisterTMA1HooksCoversAllNativeEvents(t *testing.T) {
 		t.Fatal("hooks section not created")
 		return
 	}
-	for _, event := range []string{
-		"UserPromptSubmit",
-		"PreToolUse",
-		"PostToolUse",
+	expected := []string{
 		"SessionStart",
 		"SessionEnd",
-		"PreCompact",
-		"Stop",
+		"PreToolUse",
+		"PostToolUse",
+		"PostToolUseFailure",
+		"UserPromptSubmit",
+		"SubagentStart",
 		"SubagentStop",
 		"Notification",
-	} {
+		"Stop",
+		"PreCompact",
+		"PostCompact",
+		"PermissionRequest",
+		"PermissionDenied",
+		"TaskCreated",
+		"TaskCompleted",
+		"FileChanged",
+		"CwdChanged",
+		"InstructionsLoaded",
+		"Elicitation",
+		"ElicitationResult",
+		"WorktreeCreate",
+		"WorktreeRemove",
+		"StopFailure",
+		"Setup",
+		"TeammateIdle",
+		"ConfigChange",
+	}
+	for _, event := range expected {
 		entries, _ := hooks[event].([]any)
 		if len(entries) == 0 {
 			t.Errorf("hook event %q not registered", event)
 		}
+	}
+	if got, want := len(hooks), len(expected); got != want {
+		t.Errorf("registered hook event count = %d, want %d", got, want)
 	}
 }
 

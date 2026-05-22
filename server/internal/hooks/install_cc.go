@@ -47,6 +47,36 @@ type ClaudeCodeInstaller struct {
 // configured port deserves an explicit env override in the MCP entry.
 const defaultGreptimeDBHTTPPort = 14000
 
+var claudeCodeHookEvents = []string{
+	"SessionStart",
+	"SessionEnd",
+	"PreToolUse",
+	"PostToolUse",
+	"PostToolUseFailure",
+	"UserPromptSubmit",
+	"SubagentStart",
+	"SubagentStop",
+	"Notification",
+	"Stop",
+	"PreCompact",
+	"PostCompact",
+	"PermissionRequest",
+	"PermissionDenied",
+	"TaskCreated",
+	"TaskCompleted",
+	"FileChanged",
+	"CwdChanged",
+	"InstructionsLoaded",
+	"Elicitation",
+	"ElicitationResult",
+	"WorktreeCreate",
+	"WorktreeRemove",
+	"StopFailure",
+	"Setup",
+	"TeammateIdle",
+	"ConfigChange",
+}
+
 // Install runs all three steps. Returns the list of touched paths and the
 // first error encountered (subsequent steps are still attempted on failure
 // so partial installs don't leave the user stuck).
@@ -480,27 +510,7 @@ func registerTMA1Hooks(settings map[string]any, command string) bool {
 	}
 
 	mutated := false
-	// Events TMA1 registers itself. The matcher is "" (all tools) -- server-
-	// side dispatch decides which event types deserve injection per phase.
-	//
-	// The list must cover EVERY native CC hook event whose payload the
-	// server stores in tma1_hook_events or queries in anomaly rules.
-	// Missing PreToolUse means R-stale-view never fires (no Read events),
-	// tool counts under-count, current_focus stays empty, and follow-rate
-	// validation can't tell whether the agent re-Read the listed file.
-	// Lifecycle / subagent / notification events likewise feed the
-	// session timeline + canvas; dropping them silently strips features.
-	for _, event := range []string{
-		"UserPromptSubmit",
-		"PreToolUse",
-		"PostToolUse",
-		"SessionStart",
-		"SessionEnd",
-		"PreCompact",
-		"Stop",
-		"SubagentStop",
-		"Notification",
-	} {
+	for _, event := range claudeCodeHookEvents {
 		list, _ := hooks[event].([]any)
 		idx := findEquivalentEntry(list, command, tmaID)
 

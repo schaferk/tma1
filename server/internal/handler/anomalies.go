@@ -99,7 +99,7 @@ func (s *Server) collectAnomalies(ctx context.Context, sessionID string, totalLi
 
 	out := make([]map[string]any, 0, len(resp.Output[0].Records.Rows))
 	for _, r := range resp.Output[0].Records.Rows {
-		if len(r) < 8 {
+		if len(r) < 9 {
 			continue
 		}
 		// Prefer first_emitted_at as the user-facing timestamp -- it's
