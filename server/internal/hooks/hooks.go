@@ -38,6 +38,17 @@ func EnsureHookScript(dataDir string, port int, logger *slog.Logger) (string, er
 	return writeScript(filepath.Join(dir, "tma1-hook.sh"), content, logger)
 }
 
+// HookScriptPath returns the path EnsureHookScript would write to,
+// without touching disk. Used by the dry-run install path so the
+// report still names the file even when we skip the write.
+func HookScriptPath(dataDir string) string {
+	name := "tma1-hook.sh"
+	if runtime.GOOS == "windows" {
+		name = "tma1-hook.ps1"
+	}
+	return filepath.Join(dataDir, "hooks", name)
+}
+
 func writeScript(path, content string, logger *slog.Logger) (string, error) {
 	existing, err := os.ReadFile(path)
 	if err == nil && string(existing) == content {
