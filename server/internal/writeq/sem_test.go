@@ -28,21 +28,33 @@ func TestSemAcceptsUpToCapacity(t *testing.T) {
 	}
 
 	close(release)
-	// Give the released goroutines a moment to finish before re-checking.
+	// "Slot released" happens AFTER the user fn returns, inside Sem.Go's
+	// deferred <-s.ch. Waiting on ran==2 only proves both fns started,
+	// not that the deferred release fired -- so a naive Go() right after
+	// that check races the release and can falsely report "expected
+	// acceptance after drain". Poll-retry instead: keep trying to enqueue
+	// a fresh job until the semaphore actually has room.
 	deadline := time.Now().Add(time.Second)
+	accepted := false
 	for time.Now().Before(deadline) {
-		if ran.Load() == 2 {
+		if s.Go(func() { ran.Add(1) }) {
+			accepted = true
 			break
 		}
 		time.Sleep(5 * time.Millisecond)
 	}
-	if ran.Load() != 2 {
-		t.Errorf("ran = %d, want 2", ran.Load())
+	if !accepted {
+		t.Error("never accepted after drain")
 	}
-
-	// After draining, new jobs should be accepted again.
-	if !s.Go(func() { ran.Add(1) }) {
-		t.Error("expected acceptance after drain")
+	// Three total runs: the two that blocked on release plus the one
+	// we enqueued post-drain.
+	wantAtLeast := int32(3)
+	endByrun := time.Now().Add(time.Second)
+	for ran.Load() < wantAtLeast && time.Now().Before(endByrun) {
+		time.Sleep(5 * time.Millisecond)
+	}
+	if ran.Load() < wantAtLeast {
+		t.Errorf("ran = %d, want >= %d", ran.Load(), wantAtLeast)
 	}
 }
 

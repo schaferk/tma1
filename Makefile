@@ -1,6 +1,11 @@
 MAKEFILE_DIR:=$(shell dirname $(realpath $(firstword $(MAKEFILE_LIST))))
 GO_PACKAGES:=./cmd/... ./internal/... ./web
 
+# Force bash so the dev recipe's `> >(...)` process substitution works
+# on hosts whose /bin/sh is dash (Debian / Ubuntu). The other recipes
+# are POSIX so this is a strict superset of the prior behaviour.
+SHELL := /bin/bash
+
 .PHONY: build build-linux build-windows vet lint lint-js test check install install-hooks clean run dev sync-plugin sync-skills
 
 # Where `make install` lays down the binary. Matches the install.sh convention
@@ -84,7 +89,7 @@ dev: build
 	fi
 	@trap 'kill $$PID 2>/dev/null; exit 0' INT TERM; \
 	while true; do \
-		(./server/bin/tma1-server 2>&1 | $(MAKEFILE_DIR)/scripts/tma1-prettylog) & PID=$$!; \
+		./server/bin/tma1-server > >($(MAKEFILE_DIR)/scripts/tma1-prettylog) 2>&1 & PID=$$!; \
 		fswatch -1 -r --exclude='/bin/' --include='\.go$$' --include='\.html$$' --include='\.css$$' --include='\.js$$' --include='\.sql$$' --exclude='.*' $(MAKEFILE_DIR)/server; \
 		echo "Change detected, rebuilding..."; \
 		kill $$PID 2>/dev/null; wait $$PID 2>/dev/null; \
