@@ -257,8 +257,7 @@ async function sess_loadDetail(sessionId, agentSource) {
   // Infer agent source from hook data when not provided (e.g. search
   // results pass empty agent_source). Iterate until we find a row with
   // a non-empty source — early rows may be agent-less SessionStart
-  // pings. Must happen BEFORE the Codex transcript normalisation
-  // (sess_normalizeCodexTranscriptMessages keys off agentSource).
+  // pings.
   if (!agentSource) {
     for (var srcIdx = 0; srcIdx < hookEvents.length; srcIdx++) {
       if (hookEvents[srcIdx].agent_source) {
@@ -309,9 +308,16 @@ async function sess_loadDetail(sessionId, agentSource) {
     }
   }
   // Messages: skip tool_use/tool_result if already covered by a hook-based tool pair.
+  // Also skip the synthetic empty-content assistant rows the Codex
+  // parser writes (insertCodexModelMessage to carry model name into
+  // KPI lookup, insertCodexUsageMessage to carry per-call usage into
+  // the apiCalls fallback). They have no displayable transcript text;
+  // letting them render produces blank assistant entries — one per
+  // Codex turn for the usage row, ~80+ per active session.
   for (var mi = 0; mi < messages.length; mi++) {
     var msg = messages[mi];
     if ((msg.message_type === 'tool_use' || msg.message_type === 'tool_result') && msg.tool_use_id && pairedIds[msg.tool_use_id]) continue;
+    if (msg.message_type === 'assistant' && !(msg.content && msg.content.length) && !msg.tool_use_id) continue;
     timeline.push({ ts: tsToMs(msg.ts), source: 'message', data: msg });
   }
   timeline.sort(function(a, b) { return a.ts - b.ts; });
