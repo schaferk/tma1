@@ -30,6 +30,19 @@ func Escape(s string) string {
 	return strings.ReplaceAll(s, "'", "''")
 }
 
+// likeEscaper performs the four EscapeLike substitutions in a single
+// pass. NewReplacer's non-overlapping guarantee means a literal `\%`
+// in the input still produces `\\\%` (backslash escaped to `\\`, then
+// the original `%` escaped to `\%`), matching the previous sequential
+// ReplaceAll behaviour byte-for-byte. Cached at package level so the
+// internal trie is built once per process, not per call.
+var likeEscaper = strings.NewReplacer(
+	`\`, `\\`,
+	`%`, `\%`,
+	`_`, `\_`,
+	`'`, `''`,
+)
+
 // EscapeLike escapes s for use as a literal inside a LIKE pattern,
 // then applies Escape so the result is safe inside a single-quoted
 // SQL literal too. GreptimeDB's LIKE only accepts backslash as the
@@ -40,10 +53,7 @@ func Escape(s string) string {
 // other agent-controlled string is interpolated into a LIKE pattern;
 // otherwise a path containing '%' or '_' silently over-matches.
 func EscapeLike(s string) string {
-	s = strings.ReplaceAll(s, `\`, `\\`) // backslash itself first
-	s = strings.ReplaceAll(s, `%`, `\%`)
-	s = strings.ReplaceAll(s, `_`, `\_`)
-	return strings.ReplaceAll(s, "'", "''")
+	return likeEscaper.Replace(s)
 }
 
 // Quote returns the SQL literal NULL for an empty input, otherwise a

@@ -25,6 +25,13 @@ func TestEscapeLike(t *testing.T) {
 		{`back\slash`, `back\\slash`},
 		{"bang!", "bang!"}, // '!' no longer special — passes through.
 		{`O'Brien_%\`, `O''Brien\_\%\\`},
+		// Paranoid cases that pin down the "escape backslash first" order
+		// guarantee. The Replacer implementation must NOT re-process its
+		// own output, otherwise `\%` would round-trip to `\\\\\%` instead
+		// of `\\\%`.
+		{`\%`, `\\\%`},
+		{`\_`, `\\\_`},
+		{`\\%`, `\\\\\%`},
 	}
 	for _, c := range cases {
 		if got := EscapeLike(c.in); got != c.want {

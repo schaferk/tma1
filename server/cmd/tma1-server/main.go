@@ -286,6 +286,14 @@ func main() {
 		defer cancel()
 		_ = httpSrv.Shutdown(ctx)
 
+		// HTTP is done accepting requests, but background INSERTs from
+		// the writeq may still be in flight. Drain them before tearing
+		// GreptimeDB down so the last few hook/anomaly events aren't
+		// lost on shutdown. Bounded so a stuck DB can't block exit.
+		if !srv.DrainWrites(2 * time.Second) {
+			logger.Warn("writeq drain timed out, some background writes may have been dropped")
+		}
+
 		stopGDB()
 	}()
 

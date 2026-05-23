@@ -36,10 +36,73 @@ func (w *FileWriter) Write(ctx context.Context, sessionID, cwd string) (string, 
 	md := renderMarkdown(bundle)
 
 	target := filepath.Join(root, ".tma1-context.md")
-	if err := os.WriteFile(target, []byte(md), 0o644); err != nil {
+	if err := writeFileAtomic(target, []byte(md), 0o644); err != nil {
 		return "", fmt.Errorf("write %s: %w", target, err)
 	}
 	return target, nil
+}
+
+// writeFileAtomic writes data to a sibling tmp file then renames into
+// place, so a reader (an agent's Read tool, an editor reload) never
+// observes a half-written .tma1-context.md. os.WriteFile truncates and
+// re-writes in place, which leaves a torn window proportional to the
+// payload size — small in absolute terms but big enough that we've seen
+// agents pick up a partial bundle in dogfood.
+//
+// Symlinks: resolve first via EvalSymlinks so the rename targets the
+// underlying file, not the symlink itself. POSIX rename(2) over a
+// symlink replaces the symlink with the new regular file, which would
+// silently break a `.tma1-context.md → /shared/path/.tma1-context.md`
+// layout. EvalSymlinks failures (target absent / broken link) fall
+// through to the original path — same behaviour as the previous
+// os.WriteFile path, which also followed symlinks but lacked the
+// torn-write protection added here.
+func writeFileAtomic(target string, data []byte, perm os.FileMode) error {
+	if resolved, err := filepath.EvalSymlinks(target); err == nil {
+		target = resolved
+	} else if info, lerr := os.Lstat(target); lerr == nil && info.Mode()&os.ModeSymlink != 0 {
+		// Dangling symlink: EvalSymlinks failed but the path itself is
+		// a symlink whose target doesn't exist yet. os.WriteFile follows
+		// symlinks on open(O_CREAT|O_TRUNC|O_WRONLY), so it creates the
+		// link's target file through the symlink, leaving the link
+		// itself intact. Torn-write protection has no value in this
+		// branch — a reader traversing the same dangling symlink can't
+		// read anything anyway — so trading temp+rename for a single
+		// os.WriteFile is the simpler correct path.
+		return os.WriteFile(target, data, perm)
+	}
+	// Preserve an existing target's mode rather than forcing perm on
+	// every update — os.WriteFile only applied perm on first create, so
+	// a user who chmod'd .tma1-context.md to 0600 expects that to stick.
+	// On a fresh write the supplied perm is used.
+	effectivePerm := perm
+	if info, err := os.Stat(target); err == nil {
+		effectivePerm = info.Mode().Perm()
+	}
+	dir := filepath.Dir(target)
+	f, err := os.CreateTemp(dir, ".tma1-context-*.tmp")
+	if err != nil {
+		return err
+	}
+	tmp := f.Name()
+	// Best-effort cleanup if anything below fails before rename.
+	defer func() {
+		if _, statErr := os.Stat(tmp); statErr == nil {
+			_ = os.Remove(tmp)
+		}
+	}()
+	if _, err := f.Write(data); err != nil {
+		_ = f.Close()
+		return err
+	}
+	if err := f.Chmod(effectivePerm); err != nil {
+		_ = f.Close()
+		return err
+	}
+	if err := f.Close(); err != nil {
+		return err
+	}
+	return os.Rename(tmp, target)
 }
 
 // renderMarkdown produces a longer, more readable view of the bundle

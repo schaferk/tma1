@@ -22,7 +22,7 @@ const showcase: ShowcaseEntry[] = [
   { kind: 'loop' },                                                                                                                                              // 01 closes-loop
   { kind: 'peer' },                                                                                                                                              // 02 cross-agent peer
   { kind: 'image', dark: '/screenshots/anomaly-dark.webp',  light: '/screenshots/anomaly-light.webp',  w: 3024, h: 1706 },                                      // 03 anomalies
-  { kind: 'image', dark: '/screenshots/sessions-dark.webp', light: '/screenshots/sessions-light.webp', w: 3024, h: 1704, video: '/screenshots/session-live.mp4' }, // 04 sessions
+  { kind: 'image', dark: '/screenshots/sessions-dark.webp', light: '/screenshots/sessions-light.webp', w: 3006, h: 1722, video: '/screenshots/session-live.mp4' }, // 04 sessions
   { kind: 'image', dark: '/screenshots/tools-dark.webp',    light: '/screenshots/tools-light.webp',    w: 3010, h: 1706 },                                      // 05 tools
   { kind: 'image', dark: '/screenshots/cost-dark.webp',     light: '/screenshots/cost-light.webp',     w: 3024, h: 1704 },                                      // 06 cost
   { kind: 'image', dark: '/screenshots/security-dark.webp', light: '/screenshots/security-light.webp', w: 3010, h: 1154 },                                      // 07 security
@@ -705,6 +705,11 @@ const showcase: ShowcaseEntry[] = [
   .showcase-media-stack .showcase-video {
     position: absolute; inset: 0; opacity: 0;
     transition: opacity 0.8s ease;
+    /* Video sits on top of the still image with inset:0, so without
+       pointer-events:none it catches every click and the lightbox
+       handler (bound to .showcase-frame img) never fires. The video
+       is decorative — clicks belong to the underlying screenshot. */
+    pointer-events: none;
   }
   .showcase-media-stack .showcase-video.active { opacity: 1; }
   .showcase-frame--padded .showcase-frame__body {
@@ -962,6 +967,10 @@ const showcase: ShowcaseEntry[] = [
     var video = stack.querySelector('.showcase-video');
     if (!video) return;
     var started = false;
+    // 6s hold lets a reader take in the static screenshot (context-
+    // window breakdown, waterfall, KPI strip) before the live canvas
+    // animation pulls focus. 3s was too tight for the detail view.
+    var stillHoldMs = 6000;
     function cycle() {
       setTimeout(function() {
         video.currentTime = 0;
@@ -972,7 +981,7 @@ const showcase: ShowcaseEntry[] = [
           video.classList.remove('active');
           cycle();
         });
-      }, 3000);
+      }, stillHoldMs);
     }
     var observer = new IntersectionObserver(function(entries) {
       if (entries[0].isIntersecting && !started) {
