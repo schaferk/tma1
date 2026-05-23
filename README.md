@@ -1,10 +1,10 @@
 # TMA1
 
-> Close the loop around your agent.
+> A monolith for your agent's loop. Silent until it talks back.
 
 TMA1 is local-first observability for LLM agents, powered by GreptimeDB.
-It records agent work on your machine, then feeds the useful parts back
-into the next turn through hooks and MCP tools.
+It records every LLM call on your machine, then routes what it sees back
+into the agent's next turn through hooks and MCP tools.
 
 One binary. No Docker. No Grafana. No cloud account.
 
