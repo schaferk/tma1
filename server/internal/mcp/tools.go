@@ -208,7 +208,7 @@ func (t PeerSessionsTool) Call(ctx context.Context, args map[string]any) (CallTo
 		project = perception.ResolveProjectRoot(cwd)
 	}
 
-	sessions, err := t.Bundler.GetPeerSessions(ctx, agent, project, limit, msgLimit, sinceMin)
+	sessions, partialFailures, err := t.Bundler.GetPeerSessions(ctx, agent, project, limit, msgLimit, sinceMin)
 	if err != nil {
 		return errorResult(fmt.Sprintf("get peer sessions: %v", err)), nil
 	}
@@ -223,13 +223,19 @@ func (t PeerSessionsTool) Call(ctx context.Context, args map[string]any) (CallTo
 		// Surface the freshest session's age at the top so the agent can
 		// decide quickly whether the peer work is current.
 		payload["most_recent_session"] = map[string]any{
-			"agent_source":    sessions[0].AgentSource,
-			"session_id":      sessions[0].SessionID,
-			"last_activity":   sessions[0].LastActivityAt,
+			"agent_source":     sessions[0].AgentSource,
+			"session_id":       sessions[0].SessionID,
+			"last_activity":    sessions[0].LastActivityAt,
 			"last_activity_ago": sessions[0].LastActivityAgo,
 		}
 	} else {
 		payload["note"] = "no peer sessions found for this project in the time window"
+	}
+	// Surface per-agent failures from the all-peers fan-out. The skill
+	// instructs the agent to check this before treating empty sessions
+	// as "no activity" — a non-empty map means the result is incomplete.
+	if len(partialFailures) > 0 {
+		payload["partial_failures"] = partialFailures
 	}
 	out, err := json.MarshalIndent(payload, "", "  ")
 	if err != nil {
@@ -489,7 +495,15 @@ func (t AnomaliesTool) Call(ctx context.Context, args map[string]any) (CallToolR
 		return CallToolResult{Content: []ContentBlock{{Type: "text", Text: string(out)}}}, nil
 	}
 
-	anomalies := t.Bundler.Detector().Detect(ctx, sessionID)
+	// IMPORTANT: pull-channel callers MUST use DetectPreview, not Detect.
+	// Detect advances the per-rule suppression window (LastEmittedAt = now)
+	// and INSERTs into tma1_anomaly_emits — both side effects silently
+	// weaken the next push-channel Stop block. DetectPreview runs the
+	// same rules + resolvers but never writes state.
+	anomalies, err := t.Bundler.DetectPreview(ctx, sessionID)
+	if err != nil {
+		return errorResult(fmt.Sprintf("preview anomalies: %v", err)), nil
+	}
 	payload := map[string]any{
 		"session_id": sessionID,
 		"anomalies":  anomalies,

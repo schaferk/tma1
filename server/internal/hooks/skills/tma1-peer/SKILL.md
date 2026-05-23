@@ -1,6 +1,6 @@
 ---
 name: tma1-peer
-description: "Pull recent session content from peer coding agents (Codex, OpenClaw, Copilot CLI) that worked on the same project. Use when the user wants you to read another agent's review feedback, see what someone else tried, or otherwise act on cross-agent context — invoked as `/tma1-peer [agent] [count]`."
+description: "Pull recent session content from peer coding agents (Codex, OpenClaw, Copilot CLI) that worked on the same project. Invoke when the user wants you to read another agent's review feedback, see what someone else tried, or act on cross-agent context. Trigger phrases: \"what did codex do\", \"what did openclaw do\", \"what did copilot do\", \"peer sessions\", \"cross-agent context\", \"/tma1-peer\"."
 argument-hint: "[agent] [count]"
 allowed-tools: ["mcp__tma1__get_peer_sessions"]
 ---
@@ -36,7 +36,7 @@ copy-pasting it manually.
    - **Anything else** → reply to the user: `unknown peer agent "<X>"; available: codex, openclaw, copilot, all` and STOP — do not call the tool with an unrecognized name.
 3. **Call the MCP tool `mcp__tma1__get_peer_sessions`** with:
    - `agent_source`: parsed agent (or empty string)
-   - `limit`: parsed count (default 1, cap 5)
+   - `limit`: parsed count (default 1, server-side clamp to [1, 5])
    - `message_limit`: 30
 4. **Read the returned conversation messages** and use them as direct input
    for your next reasoning step. **Do not paraphrase** — when acting on
@@ -45,17 +45,27 @@ copy-pasting it manually.
 
 ## What the tool returns
 
-A JSON payload with `sessions` array. Each session has:
+A JSON payload with two top-level fields worth knowing about:
 
-- `session_id`, `agent_source`, `started_at`, `last_activity_at`, `duration_minutes`
-- `tool_call_count`, `tokens_input`, `tokens_output`, `cwd`
-- `messages`: chronological list of user / assistant / thinking messages
-- `recent_tool_names`: top 5 tools the peer agent used
-- `files_touched`: distinct file paths the peer Read / Edited
+- **`sessions`** — array, each entry has:
+  - `session_id`, `agent_source`, `started_at`, `last_activity_at`, `last_activity_ago`, `duration_minutes`
+  - `tool_call_count`, `tokens_input`, `tokens_output`, `cwd`
+  - `messages`: chronological list of user / assistant / thinking messages
+  - `recent_tool_names`: top 5 tools the peer agent used
+  - `files_touched`: distinct file paths the peer Read / Edited
+- **`most_recent_session`** — shortcut to the freshest peer's `agent_source` +
+  `last_activity_at` + `last_activity_ago`. Use this for your first-line
+  summary so the user instantly knows whether the peer work is current.
+- **`partial_failures`** — map of `agent → error_message`. Present **only**
+  when one or more per-agent queries failed in the all-peers fan-out
+  (`agent_source: ""`). **Read this before treating empty `sessions` as
+  "no peer activity"** — a non-empty map means the result is incomplete;
+  tell the user which peer(s) couldn't be reached rather than asserting
+  silence.
 
-Empty `sessions` means no peer activity found in the time window — tell
-the user "no recent <agent> sessions on this project" rather than
-fabricating context.
+Empty `sessions` with **no** `partial_failures` means no peer activity
+found in the time window — tell the user "no recent <agent> sessions on
+this project" rather than fabricating context.
 
 ## Examples
 

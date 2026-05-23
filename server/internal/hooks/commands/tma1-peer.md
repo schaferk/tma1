@@ -4,67 +4,39 @@ argument-hint: "[agent] [count]"
 allowed-tools: ["mcp__tma1__get_peer_sessions"]
 ---
 
-# TMA1 Peer-Agent Lens
+# TMA1 Peer-Agent Lens — `/tma1-peer`
 
-You're invoked because the user wants to see what a peer coding agent
-left on this project — typically because they ran another agent to
-review code or execute a task, and now want you to act on that work
-without copy-pasting between terminals.
+Invoked because the user wants to see what a peer coding agent left on this
+project. Full reference + examples live in `skills/tma1-peer/SKILL.md`; this
+file carries the essential rules for the explicit-invocation path.
 
-## Syntax
+## Parse `$ARGUMENTS`
 
-```
-/tma1-peer                 # all peers, latest 1 session each
-/tma1-peer codex           # codex, latest 1 session
-/tma1-peer codex 3         # codex, latest 3 sessions
-/tma1-peer openclaw        # openclaw, latest 1
-/tma1-peer copilot 2       # copilot_cli (alias), latest 2
-/tma1-peer all 2           # all peers, 2 each
-```
+- 1st token (optional) → agent name. Normalize:
+  - `codex` → `codex`
+  - `openclaw` → `openclaw`
+  - `copilot` / `copilot_cli` → `copilot_cli`
+  - `all` / `*` / empty → `""` (all peers, server excludes the caller)
+  - **Anything else** → reply `unknown peer agent "<X>"; available: codex, openclaw, copilot, all` and **STOP**.
+- 2nd token (optional) → integer, default `1`, clamped to `[1, 5]` server-side.
 
-## How to handle the invocation
+## Call the tool
 
-1. **Parse the arguments** after `/tma1-peer`:
-   - First token (optional): agent name
-   - Second token (optional): count (integer 1-5)
-2. **Normalize the agent name**:
-   - `codex` → `codex`
-   - `openclaw` → `openclaw`
-   - `copilot` or `copilot_cli` → `copilot_cli`
-   - `all`, `*`, or empty → `""` (means all peers, excludes Claude Code)
-   - **Anything else** → reply to the user: `unknown peer agent "<X>"; available: codex, openclaw, copilot, all` and STOP — do not call the tool with an unrecognized name.
-3. **Call the MCP tool `mcp__tma1__get_peer_sessions`** with:
-   - `agent_source`: parsed agent (or empty string)
-   - `limit`: parsed count (default 1, cap 5)
-   - `message_limit`: 30
-4. **Read the returned conversation messages** and use them as direct input
-   for your next reasoning step. **Do not paraphrase** — when acting on
-   peer feedback, quote the specific points the peer made so the user can
-   verify you got it right.
+`mcp__tma1__get_peer_sessions` with:
+- `agent_source`: the normalized name (or `""`)
+- `limit`: parsed count
+- `message_limit`: `30`
 
-## What the tool returns
+## Use the response
 
-A JSON payload with `sessions` array. Each session has:
+A JSON payload with:
+- `sessions[]` — each carries `session_id` / `agent_source` / `last_activity_at` / `last_activity_ago` / `duration_minutes` / `tool_call_count` / `messages` / `recent_tool_names` / `files_touched` / `cwd`.
+- `most_recent_session` — top-level shortcut with the freshest peer's `agent_source` + `last_activity_ago`; use it for your first-line summary so the user immediately knows whether the peer work is current.
+- `partial_failures` — `agent → error` map, present **only** when one or more peer queries failed in the all-peers fan-out. Check this before treating empty `sessions` as silence.
+- `note` — present only when `sessions` is empty AND no partial failures.
 
-- `session_id`, `agent_source`, `started_at`, `last_activity_at`, `duration_minutes`
-- `tool_call_count`, `tokens_input`, `tokens_output`, `cwd`
-- `messages`: chronological list of user / assistant / thinking messages
-- `recent_tool_names`: top 5 tools the peer agent used
-- `files_touched`: distinct file paths the peer Read / Edited
-
-Empty `sessions` means no peer activity found in the time window — tell
-the user "no recent <agent> sessions on this project" rather than
-fabricating context.
-
-## Examples
-
-User: `/tma1-peer codex`
-You: (call tool with `agent_source: "codex", limit: 1, message_limit: 30`)
-You: "Codex reviewed `auth.go` 12 min ago and left three concrete issues:
-     1. ... 2. ... 3. ... Want me to address all three or pick one?"
-
-User: `/tma1-peer`
-You: (call tool with `agent_source: "", limit: 1`)
-You: "Two peers active recently — Codex (5 min ago, reviewing auth.go) and
-     Copilot CLI (20 min ago, deployed staging). Which do you want me
-     to dig into?"
+Rules:
+- **Quote concrete points the peer made.** Do not paraphrase. The user uses this command specifically to read the peer's exact words, not your summary.
+- List `files_touched` if the next step is "fix what they flagged".
+- Empty `sessions` **with no `partial_failures`** → reply `no recent <agent> sessions on this project in the active window` and stop.
+- Empty `sessions` **with `partial_failures`** → tell the user which peer(s) failed (quote the error) instead of asserting silence. Don't fabricate.

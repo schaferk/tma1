@@ -6,8 +6,15 @@
 # Pin a specific version:
 #   $env:TMA1_VERSION = 'v0.1.0'; irm https://tma1.ai/install.ps1 | iex
 #
-# Set up the Claude Code adapter (hooks + MCP + /tma1-peer skill) in one shot:
+# Wire one or both agent adapters (hooks + MCP + /tma1-peer skill) in one shot:
 #   $env:TMA1_ADAPTER = 'claude-code'; irm https://tma1.ai/install.ps1 | iex
+#   $env:TMA1_ADAPTER = 'codex';        irm https://tma1.ai/install.ps1 | iex
+#   $env:TMA1_ADAPTER = 'claude-code,codex'; irm https://tma1.ai/install.ps1 | iex
+#   $env:TMA1_ADAPTER = 'all';          irm https://tma1.ai/install.ps1 | iex     # same as both
+# (Adapter install via iex writes only global files — hooks, MCP entries,
+# skills/commands. Project-local CLAUDE.md / AGENTS.md blocks are NOT touched
+# because the script runs from whatever cwd; run `tma1-server install --adapter
+# <name>` from a project dir to seed those.)
 #
 # Uninstall:
 #   Unregister-ScheduledTask -TaskName 'TMA1 Server' -Confirm:$false
@@ -19,8 +26,10 @@ $Repo = 'tma1-ai/tma1'
 $InstallDir = if ($env:TMA1_INSTALL_DIR) { $env:TMA1_INSTALL_DIR } else { Join-Path $env:USERPROFILE '.tma1\bin' }
 $TMA1Port = if ($env:TMA1_PORT) { $env:TMA1_PORT } else { '14318' }
 $TMA1DataDir = if ($env:TMA1_DATA_DIR) { $env:TMA1_DATA_DIR } else { Join-Path $env:USERPROFILE '.tma1' }
-# Optional adapter to wire into a specific agent. `claude-code` registers
-# hooks, MCP server, and the /tma1-peer skill. Empty = skip.
+# Adapter(s) to wire into agents. Empty = skip. Accepts a comma-separated list
+# or the alias `all` (= claude-code,codex). Each adapter registers hooks, MCP,
+# and the /tma1-peer skill globally. Project-local files are skipped here —
+# see Register-Adapter for why.
 $TMA1Adapter = if ($env:TMA1_ADAPTER) { $env:TMA1_ADAPTER } else { '' }
 
 function Write-Info  { param([string]$msg) Write-Host "==> $msg" -ForegroundColor Cyan }
@@ -124,6 +133,14 @@ function Install-TMA1 {
         Write-Info "Extracting to $InstallDir..."
         New-Item -ItemType Directory -Path $InstallDir -Force | Out-Null
         tar -xzf $archivePath -C $InstallDir
+
+        # Create a `tma1.cmd` shim alongside tma1-server.exe. Symbolic links
+        # on Windows require Developer Mode or admin, which most users don't
+        # have; a thin .cmd wrapper avoids that constraint entirely. The Go
+        # main.go dispatches on os.Args[1] regardless of argv[0], so both
+        # invocations share behavior.
+        $shimPath = Join-Path $InstallDir 'tma1.cmd'
+        Set-Content -Path $shimPath -Value "@`"%~dp0tma1-server.exe`" %*" -Encoding ASCII
     } finally {
         Remove-Item -Recurse -Force $tmpDir -ErrorAction SilentlyContinue
     }
@@ -166,21 +183,37 @@ function Register-TMA1Task {
     Write-Info 'TMA1 service started.'
 }
 
-# --- Adapter setup: register tma1 into the target agent ---
-# Runs `tma1-server install --adapter <name>` once the binary is in place
-# and the service is up. Idempotent on repeat install. Empty TMA1_ADAPTER
-# skips silently.
+# --- Adapter setup: register tma1 into one or more agents ---
+# Parses $TMA1Adapter as a comma-separated list (or `all`, which expands to
+# claude-code,codex) and invokes `tma1-server.exe install --adapter <name>
+# --skip-project-files` for each. Idempotent on repeat install.
+#
+# Project-local files (CLAUDE.md / AGENTS.md instructions block, .gitignore
+# entries) are intentionally skipped here: iex runs from whatever cwd the
+# user happens to be in, so writing a block to a random directory's
+# CLAUDE.md is worse than not writing one. Users wire project-local files
+# later by `cd <project>; tma1-server install --adapter <name>`.
 function Register-Adapter {
     if (-not $TMA1Adapter) { return }
     $binPath = Join-Path $InstallDir 'tma1-server.exe'
     if (-not (Test-Path $binPath)) {
-        Write-Warn "Adapter '$TMA1Adapter' requested but $binPath is missing; skipping."
+        Write-Warn "Adapter requested ('$TMA1Adapter') but $binPath is missing; skipping."
         return
     }
-    Write-Info "Registering $TMA1Adapter adapter (hooks + MCP + skill)..."
-    & $binPath install --adapter $TMA1Adapter
-    if ($LASTEXITCODE -ne 0) {
-        Write-Warn "Adapter registration failed. You can retry with: `"$binPath`" install --adapter $TMA1Adapter"
+
+    $list = if ($TMA1Adapter -eq 'all') { 'claude-code,codex' } else { $TMA1Adapter }
+    $adapters = $list -split ',' | ForEach-Object { $_.Trim() } | Where-Object { $_ -ne '' }
+
+    foreach ($name in $adapters) {
+        if ($name -notin @('claude-code', 'codex')) {
+            Write-Warn "Unknown adapter '$name' — skipping. Valid: claude-code, codex, all."
+            continue
+        }
+        Write-Info "Registering $name adapter (hooks + MCP + skill, global-only)..."
+        & $binPath install --adapter $name --skip-project-files
+        if ($LASTEXITCODE -ne 0) {
+            Write-Warn "Adapter '$name' registration failed. Retry: `"$binPath`" install --adapter $name"
+        }
     }
 }
 
@@ -202,48 +235,79 @@ function Wait-ForHealth {
 }
 
 # --- Post-install hints ---
+# Branches on whether $TMA1Adapter was set:
+#  - set     → adapter(s) wired; tell user how to add project-local files later
+#  - empty   → wiring options (one-shot adapter vs manual OTel env vars)
 function Show-PostInstall {
     $binPath = Join-Path $InstallDir 'tma1-server.exe'
-    Write-Info "Installed tma1-server to $binPath"
+    Write-Info "Installed tma1-server to $binPath  (alias: tma1.cmd)"
     Write-Host ''
 
-    # PATH hint
+    # PATH guidance is the first actionable item — everything else below
+    # assumes `tma1` is callable. Conditional so repeat installs stay quiet
+    # for users whose PATH is already set.
     if (-not ($env:PATH -split ';' | Where-Object { $_ -eq $InstallDir })) {
-        Write-Host 'Add TMA1 to your PATH (run once):'
-        Write-Host ''
+        Write-Info "Add $InstallDir to your PATH (one-time):"
         Write-Host "  [Environment]::SetEnvironmentVariable('PATH', `"$InstallDir;`" + [Environment]::GetEnvironmentVariable('PATH', 'User'), 'User')"
+        Write-Host '  (run once in PowerShell, then open a new terminal)'
         Write-Host ''
     }
 
-    Write-Host "Configure your agent:"
+    Write-Host "Dashboard:  http://localhost:${TMA1Port}"
+    Write-Host "Data dir:   $TMA1DataDir"
     Write-Host ''
-    Write-Host "  Claude Code (%USERPROFILE%\.claude\settings.json):"
+    Write-Host 'Useful commands:'
+    Write-Host '  tma1 install --adapter claude-code    # wire Claude Code (hooks + MCP + skill)'
+    Write-Host '  tma1 install --adapter codex          # wire Codex'
+    Write-Host '  tma1 build -- <command>               # wrap a build, tee output to TMA1'
+    Write-Host '  tma1 uninstall --adapter <name>       # reverse an adapter install'
     Write-Host ''
-    Write-Host '    "env": {'
-    Write-Host "      `"OTEL_EXPORTER_OTLP_ENDPOINT`": `"http://localhost:${TMA1Port}/v1/otlp`","
-    Write-Host '      "OTEL_EXPORTER_OTLP_PROTOCOL": "http/protobuf",'
-    Write-Host '      "OTEL_METRICS_EXPORTER": "otlp",'
-    Write-Host '      "OTEL_LOGS_EXPORTER": "otlp"'
-    Write-Host '    }'
-    Write-Host ''
-    Write-Host "  Codex (%USERPROFILE%\.codex\config.toml):"
-    Write-Host ''
-    Write-Host '    [otel]'
-    Write-Host '    log_user_prompt = true'
-    Write-Host '    [otel.exporter.otlp-http]'
-    Write-Host "    endpoint = `"http://localhost:${TMA1Port}/v1/logs`""
-    Write-Host '    protocol = "binary"'
-    Write-Host '    [otel.trace_exporter.otlp-http]'
-    Write-Host "    endpoint = `"http://localhost:${TMA1Port}/v1/traces`""
-    Write-Host '    protocol = "binary"'
-    Write-Host '    [otel.metrics_exporter.otlp-http]'
-    Write-Host "    endpoint = `"http://localhost:${TMA1Port}/v1/metrics`""
-    Write-Host '    protocol = "binary"'
-    Write-Host ''
-    Write-Host "Dashboard: http://localhost:${TMA1Port}"
-    Write-Host "GreptimeDB config: $TMA1DataDir\config\standalone.toml"
-    Write-Host '  Generated automatically on first start and reused on later restarts.'
-    Write-Host '  Edit it if you want to tune GreptimeDB CPU or memory limits.'
+
+    if ($TMA1Adapter) {
+        Write-Host "Adapter(s) wired globally: $TMA1Adapter"
+        Write-Host '  - Hooks, MCP server entry, and /tma1-peer skill installed for each.'
+        Write-Host '  - Project-local CLAUDE.md / AGENTS.md blocks were NOT written here.'
+        Write-Host '    To seed the TMA1 context block in a project, cd into it and run:'
+        Write-Host '      tma1 install --adapter <claude-code|codex>'
+        Write-Host ''
+    } else {
+        Write-Host 'Next: wire TMA1 into an agent.'
+        Write-Host ''
+        Write-Host 'Option A - One-shot adapter (recommended; hooks + MCP + /tma1-peer):'
+        Write-Host '  tma1 install --adapter claude-code'
+        Write-Host '  tma1 install --adapter codex'
+        Write-Host '  (run from a project directory to also seed CLAUDE.md / AGENTS.md)'
+        Write-Host ''
+        Write-Host '  Or re-run this installer with $env:TMA1_ADAPTER set:'
+        Write-Host "    `$env:TMA1_ADAPTER = 'claude-code'; irm https://tma1.ai/install.ps1 | iex"
+        Write-Host "    `$env:TMA1_ADAPTER = 'claude-code,codex'; irm https://tma1.ai/install.ps1 | iex"
+        Write-Host ''
+        Write-Host 'Option B - Manual OTel config only (no hooks, no MCP, no skill):'
+        Write-Host '  Claude Code (%USERPROFILE%\.claude\settings.json):'
+        Write-Host '    "env": {'
+        Write-Host "      `"OTEL_EXPORTER_OTLP_ENDPOINT`": `"http://localhost:${TMA1Port}/v1/otlp`","
+        Write-Host '      "OTEL_EXPORTER_OTLP_PROTOCOL": "http/protobuf",'
+        Write-Host '      "OTEL_METRICS_EXPORTER": "otlp",'
+        Write-Host '      "OTEL_LOGS_EXPORTER": "otlp"'
+        Write-Host '    }'
+        Write-Host ''
+        Write-Host '  Codex (%USERPROFILE%\.codex\config.toml):'
+        Write-Host '    [otel]'
+        Write-Host '    log_user_prompt = true'
+        Write-Host '    [otel.exporter.otlp-http]'
+        Write-Host "    endpoint = `"http://localhost:${TMA1Port}/v1/logs`""
+        Write-Host '    protocol = "binary"'
+        Write-Host '    [otel.trace_exporter.otlp-http]'
+        Write-Host "    endpoint = `"http://localhost:${TMA1Port}/v1/traces`""
+        Write-Host '    protocol = "binary"'
+        Write-Host '    [otel.metrics_exporter.otlp-http]'
+        Write-Host "    endpoint = `"http://localhost:${TMA1Port}/v1/metrics`""
+        Write-Host '    protocol = "binary"'
+        Write-Host ''
+    }
+
+    Write-Host "GreptimeDB config:  $TMA1DataDir\config\standalone.toml"
+    Write-Host '  (generated on first start; edit to tune CPU / memory limits)'
     Write-Host ''
 }
 

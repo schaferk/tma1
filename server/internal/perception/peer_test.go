@@ -1,6 +1,10 @@
 package perception
 
-import "testing"
+import (
+	"context"
+	"strings"
+	"testing"
+)
 
 func TestNormalizePeerAgent(t *testing.T) {
 	cases := []struct {
@@ -50,21 +54,91 @@ func TestPeerCwdFilter(t *testing.T) {
 		{"/Users/dennis/tma1", "AND (cwd = '/Users/dennis/tma1' OR cwd LIKE '/Users/dennis/tma1/%') "},
 		// Trailing slash normalized.
 		{"/Users/dennis/tma1/", "AND (cwd = '/Users/dennis/tma1' OR cwd LIKE '/Users/dennis/tma1/%') "},
-		// Bare name falls back to legacy basename LIKE.
-		{"tma1", "AND cwd LIKE '%/tma1%' "},
+		// Bare name now matches either separator before the basename so
+		// Windows-stored cwds with the same name still surface. `\\` in
+		// the pattern is a LIKE-escaped literal backslash.
+		{"tma1", `AND (cwd LIKE '%/tma1%' OR cwd LIKE '%\\tma1%') `},
 		// SQL injection in the input gets escaped (single quote doubled).
-		{"foo'bar", "AND cwd LIKE '%/foo''bar%' "},
+		{"foo'bar", `AND (cwd LIKE '%/foo''bar%' OR cwd LIKE '%\\foo''bar%') `},
 		// LIKE wildcards in project name are neutralised via backslash
 		// (GreptimeDB's only supported LIKE escape char).
-		{"a%b_c", `AND cwd LIKE '%/a\%b\_c%' `},
+		{"a%b_c", `AND (cwd LIKE '%/a\%b\_c%' OR cwd LIKE '%\\a\%b\_c%') `},
 		// '!' is no longer special — passes through literally.
-		{"go!foo", "AND cwd LIKE '%/go!foo%' "},
-		// Backslash in input gets escaped so it stays literal in the pattern.
-		{`a\b`, `AND cwd LIKE '%/a\\b%' `},
+		{"go!foo", `AND (cwd LIKE '%/go!foo%' OR cwd LIKE '%\\go!foo%') `},
+		// Backslash in a bare name gets doubled (literal in pattern) on
+		// both alternatives.
+		{`a\b`, `AND (cwd LIKE '%/a\\b%' OR cwd LIKE '%\\a\\b%') `},
+
+		// Windows absolute: drive-letter with backslashes. Builds both
+		// separator variants so the predicate matches whichever way the
+		// agent stored cwd. Backslash in pattern is `\\` (LIKE escape).
+		{
+			`C:\Users\dennis\tma1`,
+			`AND (cwd = 'C:/Users/dennis/tma1' OR cwd LIKE 'C:/Users/dennis/tma1/%' OR cwd = 'C:\Users\dennis\tma1' OR cwd LIKE 'C:\\Users\\dennis\\tma1\\%') `,
+		},
+		// Windows absolute: drive-letter with forward-slashes (e.g.
+		// posted by a shell that pre-normalised). Same dual predicate.
+		{
+			`C:/Users/dennis/tma1`,
+			`AND (cwd = 'C:/Users/dennis/tma1' OR cwd LIKE 'C:/Users/dennis/tma1/%' OR cwd = 'C:\Users\dennis\tma1' OR cwd LIKE 'C:\\Users\\dennis\\tma1\\%') `,
+		},
+		// Lowercase drive letter is valid Windows too.
+		{
+			`d:\src\repo`,
+			`AND (cwd = 'd:/src/repo' OR cwd LIKE 'd:/src/repo/%' OR cwd = 'd:\src\repo' OR cwd LIKE 'd:\\src\\repo\\%') `,
+		},
+		// Trailing separator (either style) is normalised away before
+		// building the prefix-match LIKE.
+		{
+			`C:\Users\dennis\tma1\`,
+			`AND (cwd = 'C:/Users/dennis/tma1' OR cwd LIKE 'C:/Users/dennis/tma1/%' OR cwd = 'C:\Users\dennis\tma1' OR cwd LIKE 'C:\\Users\\dennis\\tma1\\%') `,
+		},
+		// UNC path — handled as Windows absolute.
+		{
+			`\\server\share\repo`,
+			`AND (cwd = '//server/share/repo' OR cwd LIKE '//server/share/repo/%' OR cwd = '\\server\share\repo' OR cwd LIKE '\\\\server\\share\\repo\\%') `,
+		},
 	}
 	for _, c := range cases {
 		if got := peerCwdFilter(c.in); got != c.want {
 			t.Errorf("peerCwdFilter(%q) = %q, want %q", c.in, got, c.want)
+		}
+	}
+}
+
+func TestIsWindowsAbsPath(t *testing.T) {
+	cases := []struct {
+		in   string
+		want bool
+	}{
+		// Drive letters, both separators, both cases.
+		{`C:\foo`, true},
+		{`C:/foo`, true},
+		{`d:\src`, true},
+		{`z:/x`, true},
+		// UNC.
+		{`\\server\share`, true},
+		// POSIX absolute — not a Windows abs path.
+		{`/Users/dennis`, false},
+		// Bare names.
+		{`tma1`, false},
+		{`foo`, false},
+		// Drive-letter-shaped but missing separator: not absolute.
+		{`C:foo`, false},
+		{`C:`, false},
+		// Empty / short inputs.
+		{``, false},
+		{`C`, false},
+		{`C:`, false},
+		// Non-letter first char rules out drive-letter form.
+		{`1:\foo`, false},
+		{`#:\foo`, false},
+		// Single backslash prefix (not UNC).
+		{`\foo`, false},
+	}
+	for _, c := range cases {
+		if got := isWindowsAbsPath(c.in); got != c.want {
+			t.Errorf("isWindowsAbsPath(%q) = %v, want %v", c.in, got, c.want)
 		}
 	}
 }
@@ -80,6 +154,75 @@ func TestValidPeerAgentsCoversAllFourAdapters(t *testing.T) {
 			t.Errorf("expected %q to be a valid peer agent", want)
 		}
 	}
+}
+
+func TestClampPeerLimit(t *testing.T) {
+	// Behavior the doc claims and the UX needs: limit clamped into [1,5],
+	// not silently coerced to 1 on overflow. /tma1-peer codex 10 should
+	// behave as if the user typed 5.
+	cases := []struct {
+		in, want int
+	}{
+		{-1, 1},
+		{0, 1},
+		{1, 1},
+		{3, 3},
+		{5, 5},
+		{6, 5},
+		{100, 5},
+	}
+	for _, c := range cases {
+		if got := clampPeerLimit(c.in); got != c.want {
+			t.Errorf("clampPeerLimit(%d) = %d, want %d", c.in, got, c.want)
+		}
+	}
+}
+
+func TestGetPeerSessions_RejectsCallerSelf(t *testing.T) {
+	// Defense-in-depth: skill markdown is supposed to reject self-name
+	// at the prompt layer, but an LLM occasionally bypasses prompt
+	// rules. Server-side must error so a Codex user typing
+	// `/tma1-peer codex` never gets Codex's own sessions back.
+	//
+	// Uses normalized + alias inputs to lock the post-normalize
+	// comparison (cc → claude_code, claude → claude_code, etc.).
+	cases := []struct {
+		caller, agentSource string
+	}{
+		{"claude_code", "claude_code"},
+		{"claude_code", "cc"},
+		{"claude_code", "claude"},
+		{"codex", "codex"},
+		{"codex", "CODEX"},
+		{"openclaw", "openclaw"},
+		{"copilot_cli", "copilot"},
+		{"copilot_cli", "copilot-cli"},
+	}
+	for _, c := range cases {
+		b := &Bundler{Caller: c.caller}
+		_, _, err := b.GetPeerSessions(context.Background(), c.agentSource, "tma1", 1, 20, 60)
+		if err == nil {
+			t.Errorf("caller=%q agentSource=%q: expected error, got nil", c.caller, c.agentSource)
+			continue
+		}
+		if !strings.Contains(err.Error(), "calling agent") {
+			t.Errorf("caller=%q agentSource=%q: error %q does not mention caller; expected self-exclusion message", c.caller, c.agentSource, err.Error())
+		}
+	}
+
+	// Caller="" (HTTP API path with no TMA1_MCP_CALLER env var) must
+	// not trigger self-exclusion — direct callers retain freedom to
+	// query any agent. We recover from the inevitable nil-client panic
+	// and assert the *check* itself didn't fire (no self-exclusion
+	// error raised before the client was dereferenced).
+	func() {
+		defer func() { _ = recover() }()
+		b := &Bundler{Caller: ""}
+		_, _, err := b.GetPeerSessions(context.Background(), "claude_code", "tma1", 1, 20, 60)
+		if err != nil && strings.Contains(err.Error(), "calling agent") {
+			t.Errorf("Caller=\"\" should not trigger self-exclusion, got %q", err.Error())
+		}
+	}()
 }
 
 func TestPeerAgentListExcludesCaller(t *testing.T) {

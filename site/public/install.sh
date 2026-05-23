@@ -10,8 +10,15 @@
 # Force reinstall (wipes all data):
 #   curl -fsSL https://tma1.ai/install.sh | TMA1_FORCE=1 bash
 #
-# Set up the Claude Code adapter (hooks + MCP + /tma1-peer skill) in one shot:
+# Wire one or both agent adapters (hooks + MCP + /tma1-peer skill) in one shot:
 #   curl -fsSL https://tma1.ai/install.sh | TMA1_ADAPTER=claude-code bash
+#   curl -fsSL https://tma1.ai/install.sh | TMA1_ADAPTER=codex bash
+#   curl -fsSL https://tma1.ai/install.sh | TMA1_ADAPTER=claude-code,codex bash
+#   curl -fsSL https://tma1.ai/install.sh | TMA1_ADAPTER=all bash        # same as both
+# (Adapter install via curl-pipe writes only global files — hooks, MCP entries,
+# skills/commands. Project-local CLAUDE.md / AGENTS.md blocks are NOT touched
+# because curl-pipe runs in whatever cwd the user happens to be in; run
+# `tma1-server install --adapter <name>` from a project dir to seed those.)
 #
 # Uninstall:
 #   macOS:  launchctl bootout gui/$(id -u) ~/Library/LaunchAgents/ai.tma1.server.plist && rm ~/Library/LaunchAgents/ai.tma1.server.plist
@@ -24,8 +31,10 @@ INSTALL_DIR="${TMA1_INSTALL_DIR:-$HOME/.tma1/bin}"
 TMA1_PORT="${TMA1_PORT:-14318}"
 TMA1_FORCE="${TMA1_FORCE:-0}"
 TMA1_GREPTIMEDB_VERSION="${TMA1_GREPTIMEDB_VERSION:-latest}"
-# Optional adapter to wire into a specific agent. Currently `claude-code`
-# registers hooks, MCP server, and the /tma1-peer skill. Empty = skip.
+# Adapter(s) to wire into agents. Empty = skip. Accepts a comma-separated list
+# or the alias `all` (= claude-code,codex). Each adapter registers hooks, MCP,
+# and the /tma1-peer skill globally. Project-local files are skipped here —
+# see register_adapter() for why.
 TMA1_ADAPTER="${TMA1_ADAPTER:-}"
 
 info()  { printf "\033[1;34m==>\033[0m %s\n" "$1"; }
@@ -106,6 +115,14 @@ download() {
   mkdir -p "$INSTALL_DIR"
   tar -xzf "${tmp_dir}/${archive}" -C "$INSTALL_DIR"
   chmod +x "${INSTALL_DIR}/tma1-server"
+
+  # Create a `tma1` shorthand alongside tma1-server. The long name is the
+  # canonical binary (referenced by launchd/systemd units, GitHub release
+  # artifacts, and existing docs); the short name is a developer-facing
+  # alias for `tma1 install`, `tma1 build`, etc. Both invoke the same
+  # binary because Go's main.go dispatches on os.Args[1] regardless of
+  # argv[0]. Replace any pre-existing file/symlink at the target.
+  ln -sf "tma1-server" "${INSTALL_DIR}/tma1"
 }
 
 # --- Download GreptimeDB binary via official install script ---
@@ -335,71 +352,129 @@ setup_service() {
   esac
 }
 
-# --- Add to PATH hint ---
+# --- Post-install hints ---
+# Branches on whether TMA1_ADAPTER was set:
+#  - set     → adapter(s) wired; tell user how to add project-local files later
+#  - empty   → wiring options (one-shot adapter vs manual OTel env vars)
 post_install() {
-  info "Installed tma1-server to ${INSTALL_DIR}/tma1-server"
+  info "Installed tma1-server to ${INSTALL_DIR}/tma1-server  (alias: tma1)"
   echo ""
 
   local data_dir="${TMA1_DATA_DIR:-$HOME/.tma1}"
   local greptime_config_path="${data_dir}/config/standalone.toml"
 
-  # Check if already in PATH
-  if ! command -v tma1-server >/dev/null 2>&1; then
-    echo "Add TMA1 to your PATH:"
-    echo ""
+  # PATH guidance is the first actionable item — everything else below
+  # assumes `tma1` is callable. Conditional so repeat installs stay quiet
+  # for users whose PATH is already set.
+  if ! command -v tma1 >/dev/null 2>&1 && ! command -v tma1-server >/dev/null 2>&1; then
+    info "Add ${INSTALL_DIR} to your PATH (one-time):"
     echo "  export PATH=\"${INSTALL_DIR}:\$PATH\""
-    echo ""
-    echo "Then add the line above to your shell profile (~/.bashrc, ~/.zshrc, etc.)."
+    echo "  (append the line above to ~/.bashrc, ~/.zshrc, or your shell profile)"
     echo ""
   fi
 
-  echo "Configure your agent (e.g. Claude Code ~/.claude/settings.json):"
+  echo "Dashboard:  http://localhost:${TMA1_PORT}"
+  echo "Data dir:   ${data_dir}"
   echo ""
-  echo '  "env": {'
-  echo "    \"OTEL_EXPORTER_OTLP_ENDPOINT\": \"http://localhost:${TMA1_PORT}/v1/otlp\","
-  echo '    "OTEL_EXPORTER_OTLP_PROTOCOL": "http/protobuf",'
-  echo '    "OTEL_METRICS_EXPORTER": "otlp",'
-  echo '    "OTEL_LOGS_EXPORTER": "otlp"'
-  echo '  }'
+  echo "Useful commands:"
+  echo "  tma1 install --adapter claude-code    # wire Claude Code (hooks + MCP + skill)"
+  echo "  tma1 install --adapter codex          # wire Codex"
+  echo "  tma1 build -- <command>               # wrap a build, tee output to TMA1"
+  echo "  tma1 uninstall --adapter <name>       # reverse an adapter install"
   echo ""
-  echo "Codex (~/.codex/config.toml):"
-  echo ""
-  echo '  [otel]'
-  echo '  log_user_prompt = true'
-  echo '  [otel.exporter.otlp-http]'
-  echo "  endpoint = \"http://localhost:${TMA1_PORT}/v1/logs\""
-  echo '  protocol = "binary"'
-  echo '  [otel.trace_exporter.otlp-http]'
-  echo "  endpoint = \"http://localhost:${TMA1_PORT}/v1/traces\""
-  echo '  protocol = "binary"'
-  echo '  [otel.metrics_exporter.otlp-http]'
-  echo "  endpoint = \"http://localhost:${TMA1_PORT}/v1/metrics\""
-  echo '  protocol = "binary"'
-  echo ""
-  echo "Dashboard: http://localhost:${TMA1_PORT}"
-  echo "GreptimeDB config: ${greptime_config_path}"
-  echo "  Generated automatically on first start and reused on later restarts."
-  echo "  Edit it if you want to tune GreptimeDB CPU or memory limits."
+
+  if [ -n "$TMA1_ADAPTER" ]; then
+    echo "Adapter(s) wired globally: ${TMA1_ADAPTER}"
+    echo "  - Hooks, MCP server entry, and /tma1-peer skill installed for each."
+    echo "  - Project-local CLAUDE.md / AGENTS.md blocks were NOT written here."
+    echo "    To seed the TMA1 context block in a project, cd into it and run:"
+    echo "      tma1 install --adapter <claude-code|codex>"
+    echo ""
+  else
+    echo "Next: wire TMA1 into an agent."
+    echo ""
+    echo "Option A — One-shot adapter (recommended; hooks + MCP + /tma1-peer):"
+    echo "  tma1 install --adapter claude-code"
+    echo "  tma1 install --adapter codex"
+    echo "  (run from a project directory to also seed CLAUDE.md / AGENTS.md)"
+    echo ""
+    echo "  Or re-run this installer with TMA1_ADAPTER set:"
+    echo "    curl -fsSL https://tma1.ai/install.sh | TMA1_ADAPTER=claude-code bash"
+    echo "    curl -fsSL https://tma1.ai/install.sh | TMA1_ADAPTER=claude-code,codex bash"
+    echo ""
+    echo "Option B — Manual OTel config only (no hooks, no MCP, no skill):"
+    echo "  Claude Code (~/.claude/settings.json):"
+    echo '    "env": {'
+    echo "      \"OTEL_EXPORTER_OTLP_ENDPOINT\": \"http://localhost:${TMA1_PORT}/v1/otlp\","
+    echo '      "OTEL_EXPORTER_OTLP_PROTOCOL": "http/protobuf",'
+    echo '      "OTEL_METRICS_EXPORTER": "otlp",'
+    echo '      "OTEL_LOGS_EXPORTER": "otlp"'
+    echo '    }'
+    echo ""
+    echo "  Codex (~/.codex/config.toml):"
+    echo '    [otel]'
+    echo '    log_user_prompt = true'
+    echo '    [otel.exporter.otlp-http]'
+    echo "    endpoint = \"http://localhost:${TMA1_PORT}/v1/logs\""
+    echo '    protocol = "binary"'
+    echo '    [otel.trace_exporter.otlp-http]'
+    echo "    endpoint = \"http://localhost:${TMA1_PORT}/v1/traces\""
+    echo '    protocol = "binary"'
+    echo '    [otel.metrics_exporter.otlp-http]'
+    echo "    endpoint = \"http://localhost:${TMA1_PORT}/v1/metrics\""
+    echo '    protocol = "binary"'
+    echo ""
+  fi
+
+  echo "GreptimeDB config:  ${greptime_config_path}"
+  echo "  (generated on first start; edit to tune CPU / memory limits)"
   echo ""
 }
 
-# --- Adapter setup: register tma1 into the target agent ---
-# Runs `tma1-server install --adapter <name>` once the binary is in place
-# and the service is up. Idempotent on repeat install. Empty TMA1_ADAPTER
-# skips silently.
+# --- Adapter setup: register tma1 into one or more agents ---
+# Parses TMA1_ADAPTER as a comma-separated list (or `all`, which expands to
+# claude-code,codex) and invokes `tma1-server install --adapter <name>
+# --skip-project-files` for each. Idempotent on repeat install.
+#
+# Project-local files (CLAUDE.md / AGENTS.md instructions block, .gitignore
+# entries) are intentionally skipped here: curl-pipe runs in whatever cwd
+# the user happens to be in, so writing a block to a random directory's
+# CLAUDE.md is worse than not writing one. Users wire project-local files
+# later by `cd <project> && tma1-server install --adapter <name>`.
 register_adapter() {
   if [ -z "$TMA1_ADAPTER" ]; then
     return
   fi
   local bin="${INSTALL_DIR}/tma1-server"
   if [ ! -x "$bin" ]; then
-    warn "Adapter '${TMA1_ADAPTER}' requested but ${bin} is not executable; skipping."
+    warn "Adapter requested ('${TMA1_ADAPTER}') but ${bin} is not executable; skipping."
     return
   fi
-  info "Registering ${TMA1_ADAPTER} adapter (hooks + MCP + skill)..."
-  if ! "$bin" install --adapter "$TMA1_ADAPTER" 2>&1; then
-    warn "Adapter registration failed. You can retry with: ${bin} install --adapter ${TMA1_ADAPTER}"
+
+  local list="$TMA1_ADAPTER"
+  if [ "$list" = "all" ]; then
+    list="claude-code,codex"
   fi
+
+  local adapters name
+  IFS=',' read -ra adapters <<< "$list"
+  for name in "${adapters[@]}"; do
+    # Strip surrounding whitespace so "claude-code, codex" is accepted.
+    name="${name#"${name%%[![:space:]]*}"}"
+    name="${name%"${name##*[![:space:]]}"}"
+    [ -z "$name" ] && continue
+    case "$name" in
+      claude-code|codex) ;;
+      *)
+        warn "Unknown adapter '${name}' — skipping. Valid: claude-code, codex, all."
+        continue
+        ;;
+    esac
+    info "Registering ${name} adapter (hooks + MCP + skill, global-only)..."
+    if ! "$bin" install --adapter "$name" --skip-project-files 2>&1; then
+      warn "Adapter '${name}' registration failed. Retry: ${bin} install --adapter ${name}"
+    fi
+  done
 }
 
 # --- Force reinstall: wipe existing data ---

@@ -4,10 +4,74 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/tma1-ai/tma1/server/internal/sqlutil"
 )
+
+// ListEmittedAnomalies returns anomalies recorded in tma1_anomaly_emits
+// for sessionID over the last 24 hours, most-recent first. Side-effect-
+// free: it issues a read-only SELECT and never advances the suppression
+// window or writes to the emit log.
+//
+// Pull-channel callers (the MCP `get_anomalies` tool, the dashboard's
+// `/api/anomalies` poll) MUST use this instead of Detector.Detect. The
+// HTTP handler already follows this rule with an inline query; this
+// method gives the MCP path the same guarantee.
+//
+// Empty sessionID returns nil. limit ≤ 0 defaults to 50; values above
+// 500 are clamped (matches the dashboard handler's bounds).
+func (d *Detector) ListEmittedAnomalies(ctx context.Context, sessionID string, limit int) ([]Anomaly, error) {
+	if d == nil || d.client == nil {
+		return nil, nil
+	}
+	sessionID = strings.TrimSpace(sessionID)
+	if sessionID == "" {
+		return nil, nil
+	}
+	if limit <= 0 {
+		limit = 50
+	}
+	if limit > 500 {
+		limit = 500
+	}
+
+	sql := fmt.Sprintf(
+		`SELECT kind, severity, "channel", evidence, suggestion, related_files,
+		        CAST(first_emitted_at AS BIGINT) AS first_ms
+		 FROM tma1_anomaly_emits
+		 WHERE session_id = '%s' AND ts > now() - INTERVAL '24 hours'
+		 ORDER BY ts DESC LIMIT %d`,
+		sqlutil.Escape(sessionID), limit,
+	)
+	_, rows, err := d.client.Query(ctx, sql)
+	if err != nil {
+		return nil, fmt.Errorf("list emitted anomalies: %w", err)
+	}
+
+	out := make([]Anomaly, 0, len(rows))
+	for _, r := range rows {
+		if len(r) < 7 {
+			continue
+		}
+		a := Anomaly{
+			Kind:       stringAt(r, 0),
+			Severity:   stringAt(r, 1),
+			Channel:    stringAt(r, 2),
+			Evidence:   stringAt(r, 3),
+			Suggestion: stringAt(r, 4),
+		}
+		if raw := stringAt(r, 5); raw != "" {
+			_ = json.Unmarshal([]byte(raw), &a.RelatedFiles)
+		}
+		if firstMs := int64At(r, 6); firstMs > 0 {
+			a.FirstEmittedAt = time.UnixMilli(firstMs)
+		}
+		out = append(out, a)
+	}
+	return out, nil
+}
 
 // logEmits writes one row per anomaly into tma1_anomaly_emits. Each row
 // is an INSERT fired in its own goroutine — the hook's response budget

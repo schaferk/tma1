@@ -4,7 +4,12 @@ interface Props {
   description?: string;
   lang?: string;
 }
-const { title, description = 'Local observability for your AI agents. Tokens, cost, latency, and full conversation replay — on your machine.', lang = 'en' } = Astro.props;
+const { title, description = 'Local observability for agents that feeds useful context back into the next turn.', lang = 'en' } = Astro.props;
+
+const siteOrigin = Astro.site?.toString().replace(/\/$/, '') ?? 'https://tma1.ai';
+const canonicalUrl = new URL(Astro.url.pathname, Astro.site ?? 'https://tma1.ai/').toString();
+const ogImage = `${siteOrigin}/screenshots/hero-light.webp`;
+const ogLocale = lang === 'zh' ? 'zh_CN' : lang === 'es' ? 'es_ES' : 'en_US';
 ---
 <!DOCTYPE html>
 <html lang={lang}>
@@ -12,8 +17,25 @@ const { title, description = 'Local observability for your AI agents. Tokens, co
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <meta name="description" content={description} />
+  <link rel="canonical" href={canonicalUrl} />
   <link rel="icon" type="image/svg+xml" href="/favicon.svg" />
   <title>{title}</title>
+
+  <!-- Open Graph -->
+  <meta property="og:type" content="website" />
+  <meta property="og:site_name" content="TMA1" />
+  <meta property="og:title" content={title} />
+  <meta property="og:description" content={description} />
+  <meta property="og:url" content={canonicalUrl} />
+  <meta property="og:image" content={ogImage} />
+  <meta property="og:image:alt" content="TMA1 Dashboard" />
+  <meta property="og:locale" content={ogLocale} />
+
+  <!-- Twitter -->
+  <meta name="twitter:card" content="summary_large_image" />
+  <meta name="twitter:title" content={title} />
+  <meta name="twitter:description" content={description} />
+  <meta name="twitter:image" content={ogImage} />
   <script data-goatcounter="https://tma1.goatcounter.com/count" async src="//gc.zgo.at/count.js"></script>
   <script is:inline>
   (function() {

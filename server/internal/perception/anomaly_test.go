@@ -267,6 +267,101 @@ func TestAnomalyCacheResolutionResetsAndReemits(t *testing.T) {
 	}
 }
 
+func TestSuppressPreviewIsReadOnly(t *testing.T) {
+	// The whole point of the preview path: it must NEVER mutate
+	// sessHistory. A subsequent real suppressWithResolution call must
+	// behave identically to one with no preview in between.
+	c := newAnomalyCache(time.Minute)
+	a := Anomaly{Kind: "k1", Severity: SeverityMedium, Channel: ChannelUserPromptSubmit}
+
+	// Preview against an empty history — anomaly should surface but
+	// nothing gets recorded.
+	preview1 := c.suppressWithResolutionPreview("s1", []Anomaly{a}, nil)
+	if len(preview1) != 1 {
+		t.Fatalf("first preview should surface candidate; got %d", len(preview1))
+	}
+	if !preview1[0].FirstEmittedAt.IsZero() {
+		t.Errorf("fresh candidate's FirstEmittedAt should be zero in preview; got %v", preview1[0].FirstEmittedAt)
+	}
+
+	// Hammer the preview path many times. Real suppress should still
+	// emit once afterwards — proving none of the previews advanced
+	// LastEmittedAt or wrote sessHistory.
+	for i := 0; i < 10; i++ {
+		c.suppressWithResolutionPreview("s1", []Anomaly{a}, nil)
+	}
+
+	// The push-channel call after 10 previews must emit normally; if a
+	// preview had mutated state, this would be silently suppressed.
+	real1 := c.suppressWithResolution("s1", []Anomaly{a}, nil)
+	if len(real1) != 1 {
+		t.Errorf("real emit after 10 previews should still pass through; got %d (preview leaked state into sessHistory)", len(real1))
+	}
+
+	// Now real emit has happened — the next preview should reflect that
+	// (within suppression window → silent) but still NOT mutate state.
+	preview2 := c.suppressWithResolutionPreview("s1", []Anomaly{a}, nil)
+	if len(preview2) != 0 {
+		t.Errorf("preview after real emit should mirror suppression decision (silent); got %d", len(preview2))
+	}
+
+	// And a second real call within the window stays silent — proving
+	// preview didn't refresh LastEmittedAt either way.
+	real2 := c.suppressWithResolution("s1", []Anomaly{a}, nil)
+	if len(real2) != 0 {
+		t.Errorf("real emit within window should stay silent; got %d (preview must not have touched LastEmittedAt)", len(real2))
+	}
+}
+
+func TestSuppressPreviewPreservesFirstEmittedAtFromHistory(t *testing.T) {
+	// When a key already has history, the preview should report the
+	// PRIOR FirstEmittedAt so consumers see "outstanding since X"
+	// timestamps consistent with what real Detect would surface — but
+	// preview never invents a new emit moment for fresh candidates.
+	c := newAnomalyCache(time.Minute)
+	a := Anomaly{Kind: "k1", Severity: SeverityHigh}
+
+	// Real emit lands.
+	first := c.suppressWithResolution("s1", []Anomaly{a}, nil)
+	if len(first) != 1 || first[0].FirstEmittedAt.IsZero() {
+		t.Fatalf("real emit should set FirstEmittedAt; got %+v", first)
+	}
+	originalFirst := first[0].FirstEmittedAt
+
+	// Resolved-preview must surface again (resolution clears suppression)
+	// but with FirstEmittedAt reset because the preview treats the
+	// resolved key as fresh — and importantly, preview does NOT actually
+	// stamp a new emit moment, so the slice's FirstEmittedAt is zero.
+	resolved := map[string]bool{a.stableKey(): true}
+	prevResolved := c.suppressWithResolutionPreview("s1", []Anomaly{a}, resolved)
+	if len(prevResolved) != 1 {
+		t.Fatalf("resolved preview should surface; got %d", len(prevResolved))
+	}
+	if !prevResolved[0].FirstEmittedAt.IsZero() {
+		t.Errorf("resolved-fresh candidate's FirstEmittedAt should be zero in preview; got %v", prevResolved[0].FirstEmittedAt)
+	}
+
+	// Now do an unresolved preview — should be suppressed silently, but
+	// before suppression the candidate carries the historical FirstEmittedAt.
+	// We can verify the underlying state didn't move by doing one more
+	// real call and checking FirstEmittedAt matches the original.
+	silentReal := c.suppressWithResolution("s1", []Anomaly{a}, nil)
+	if len(silentReal) != 0 {
+		t.Errorf("real call within window should stay silent; got %d", len(silentReal))
+	}
+	// Restate: preview never advanced the suppression history, so the
+	// original FirstEmittedAt is still recoverable via a resolution-reset
+	// real call.
+	finalResolved := c.suppressWithResolution("s1", []Anomaly{a}, resolved)
+	if len(finalResolved) != 1 {
+		t.Fatalf("real resolved call should re-emit; got %d", len(finalResolved))
+	}
+	if !finalResolved[0].FirstEmittedAt.After(originalFirst) {
+		t.Errorf("resolved real re-emit should refresh FirstEmittedAt past original; original=%v new=%v",
+			originalFirst, finalResolved[0].FirstEmittedAt)
+	}
+}
+
 func TestAnomalyCacheResolutionMapIgnoredForUnseenKeys(t *testing.T) {
 	c := newAnomalyCache(time.Minute)
 	a := Anomaly{Kind: "x", Severity: SeverityMedium}

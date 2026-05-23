@@ -46,7 +46,7 @@ the `get_peer_sessions` tool on that server with:
 | Argument        | Value                                                  |
 | --------------- | ------------------------------------------------------ |
 | `agent_source`  | the canonical name from the table above (or `""`)      |
-| `limit`         | the parsed count, default `1`, hard cap `5`            |
+| `limit`         | the parsed count, default `1`, server-side clamp to `[1, 5]` |
 | `message_limit` | `30`                                                   |
 
 If your runtime addresses MCP tools by a prefixed name (for example
@@ -56,13 +56,23 @@ backing TMA1's perception layer.
 
 ## Use the returned content directly
 
-The response is a JSON object with a `sessions` array. Each entry has:
+The response is a JSON object with two top-level fields worth knowing
+about:
 
-- Identity: `session_id`, `agent_source`, `started_at`,
-  `last_activity_at`, `last_activity_ago`, `duration_minutes`, `cwd`.
-- Volume: `tool_call_count`, `tokens_input`, `tokens_output`.
-- Content: `messages` (chronological user / assistant / thinking),
-  `recent_tool_names`, `files_touched`.
+- `sessions` array — each entry has:
+  - Identity: `session_id`, `agent_source`, `started_at`,
+    `last_activity_at`, `last_activity_ago`, `duration_minutes`, `cwd`.
+  - Volume: `tool_call_count`, `tokens_input`, `tokens_output`.
+  - Content: `messages` (chronological user / assistant / thinking),
+    `recent_tool_names`, `files_touched`.
+- `most_recent_session` — shortcut to the freshest peer's `agent_source` +
+  `last_activity_at` + `last_activity_ago`. Use this for your first-line
+  summary so the user instantly knows whether the peer work is current.
+- `partial_failures` — map of `agent → error_message`. Present **only**
+  when one or more per-agent queries failed in the all-peers fan-out
+  (`agent_source: ""`). **Check this before treating empty `sessions`
+  as "no peer activity"** — a non-empty map means the result is
+  incomplete; tell the user which peer(s) couldn't be reached.
 
 When you act on what the peer left:
 
@@ -74,9 +84,10 @@ When you act on what the peer left:
 - **Surface the timing.** "Claude left this 12 min ago" is more useful
   than "recently".
 
-If `sessions` is empty, reply
+If `sessions` is empty AND `partial_failures` is absent, reply
 `no recent <agent> sessions on this project in the active window`
-and stop — do not fabricate context.
+and stop — do not fabricate context. If `partial_failures` is present,
+quote the failed agent(s) instead of asserting silence.
 
 ## Examples
 

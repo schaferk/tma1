@@ -73,14 +73,25 @@ var validPeerAgents = map[string]bool{
 //     that haven't been updated.
 //
 // Each returned session carries up to `messageLimit` recent messages.
+//
+// Return shape:
+//   - sessions: peer sessions, most-recent first (across all peers in
+//     the empty-agentSource path).
+//   - partialFailures: agent → error message map. Populated ONLY in the
+//     all-peers path when one or more per-agent queries fail. Callers
+//     must check this before treating an empty `sessions` slice as
+//     "no peer activity" — a non-empty `partialFailures` means the
+//     result is incomplete.
+//   - error: returned for input-validation / caller-exclusion failures.
+//     Per-agent SQL errors in the all-peers path are NOT bubbled up
+//     here; they go into partialFailures so one failing peer doesn't
+//     blank out the others.
 func (b *Bundler) GetPeerSessions(
 	ctx context.Context,
 	agentSource, project string,
 	limit, messageLimit, sinceMin int,
-) ([]PeerSession, error) {
-	if limit <= 0 || limit > 5 {
-		limit = 1
-	}
+) ([]PeerSession, map[string]string, error) {
+	limit = clampPeerLimit(limit)
 	if messageLimit <= 0 || messageLimit > 100 {
 		messageLimit = 20
 	}
@@ -89,11 +100,22 @@ func (b *Bundler) GetPeerSessions(
 	}
 	agentSource = normalizePeerAgent(agentSource)
 	if agentSource != "" && !validPeerAgents[agentSource] {
-		return nil, fmt.Errorf("invalid agent_source %q (valid: claude_code, codex, openclaw, copilot_cli, or empty for all peers)", agentSource)
+		return nil, nil, fmt.Errorf("invalid agent_source %q (valid: claude_code, codex, openclaw, copilot_cli, or empty for all peers)", agentSource)
+	}
+
+	// Caller-aware self-exclusion on the explicit-agent path. The
+	// "all peers" branch already excludes Caller via peerAgentList();
+	// without this guard a Codex user asking `/tma1-peer codex`
+	// would receive Codex's own sessions — an echo chamber. Skip
+	// silently if Caller is empty (e.g. HTTP API path with no
+	// TMA1_MCP_CALLER set) so direct callers keep their freedom.
+	if agentSource != "" && b.Caller != "" && agentSource == b.Caller {
+		return nil, nil, fmt.Errorf("agent_source %q is the calling agent; peer sessions exclude self (use an empty agent_source for all-peers or pick a different one)", agentSource)
 	}
 
 	if agentSource != "" {
-		return b.getPeerSessionsOneAgent(ctx, agentSource, project, limit, messageLimit, sinceMin)
+		sessions, err := b.getPeerSessionsOneAgent(ctx, agentSource, project, limit, messageLimit, sinceMin)
+		return sessions, nil, err
 	}
 
 	// All-peers path: top-N per peer agent. Each agent is queried
@@ -105,7 +127,9 @@ func (b *Bundler) GetPeerSessions(
 
 	type agentResult struct {
 		idx      int
+		agent    string
 		sessions []PeerSession
+		err      error
 	}
 	resCh := make(chan agentResult, len(agents))
 	var wg sync.WaitGroup
@@ -114,11 +138,11 @@ func (b *Bundler) GetPeerSessions(
 		go func(idx int, agent string) {
 			defer wg.Done()
 			sessions, err := b.getPeerSessionsOneAgent(ctx, agent, project, limit, messageLimit, sinceMin)
-			if err != nil {
-				// best-effort: one agent's failure must not blank out the others.
-				return
-			}
-			resCh <- agentResult{idx: idx, sessions: sessions}
+			// Both success and failure go through the channel so the
+			// reassembly step below can surface per-agent failures to
+			// the caller. Pre-fix, errors were silently dropped here
+			// and partial failures looked identical to "no sessions".
+			resCh <- agentResult{idx: idx, agent: agent, sessions: sessions, err: err}
 		}(idx, agent)
 	}
 	wg.Wait()
@@ -126,7 +150,17 @@ func (b *Bundler) GetPeerSessions(
 
 	// Reassemble in agent-name order so test output stays stable.
 	gathered := make([][]PeerSession, len(agents))
+	var partialFailures map[string]string
 	for r := range resCh {
+		if r.err != nil {
+			if partialFailures == nil {
+				partialFailures = make(map[string]string, 1)
+			}
+			partialFailures[r.agent] = r.err.Error()
+			b.logger.Debug("peer sessions: agent query failed",
+				"agent", r.agent, "err", r.err)
+			continue
+		}
 		gathered[r.idx] = r.sessions
 	}
 	var all []PeerSession
@@ -138,7 +172,7 @@ func (b *Bundler) GetPeerSessions(
 	sort.SliceStable(all, func(i, j int) bool {
 		return all[i].LastActivityAt.After(all[j].LastActivityAt)
 	})
-	return all, nil
+	return all, partialFailures, nil
 }
 
 // getPeerSessionsOneAgent runs the two-pass query for a single, non-empty
@@ -232,25 +266,85 @@ func (b *Bundler) getPeerSessionsOneAgent(
 	return out, nil
 }
 
-// peerCwdFilter builds the `AND cwd …` clause used to scope sessions to a
-// project. Absolute paths get a true prefix match (no basename collision);
-// anything else falls back to the legacy basename LIKE.
+// peerCwdFilter builds the `AND cwd …` clause used to scope sessions
+// to a project. Three input shapes are recognised:
 //
-// Empty input means "no project filter — match every session in the time
-// window".
+//   - POSIX absolute ("/Users/.../tma1") — exact + LIKE prefix using
+//     forward-slash.
+//   - Windows absolute ("C:\Users\...\tma1", "C:/Users/.../tma1", or
+//     UNC "\\server\share\...") — exact + LIKE prefix matched against
+//     BOTH separator styles. Different Windows shells post cwd with
+//     different separators; matching only one would silently miss
+//     sessions stored the other way.
+//   - Bare name ("tma1") — legacy basename LIKE, matched after either
+//     separator. Lower precision; the prefix-match branches above are
+//     preferred whenever the caller has an absolute path.
+//
+// We deliberately avoid stdlib filepath helpers (filepath.IsAbs,
+// filepath.ToSlash, etc.). cwd values come from remote agents which
+// may run on a different OS than the TMA1 server, so the host's
+// native separator is irrelevant — we classify the path purely by
+// inspecting the string.
+//
+// Empty input means "no project filter — every session in the
+// time window matches".
 func peerCwdFilter(project string) string {
 	project = strings.TrimSpace(project)
 	if project == "" {
 		return ""
 	}
+
+	// POSIX absolute.
 	if strings.HasPrefix(project, "/") {
 		root := strings.TrimRight(project, "/")
-		// Match the root exactly OR any subdirectory under it. Anchoring
-		// with the trailing slash prevents `/foo` from matching `/foobar`.
 		return fmt.Sprintf("AND (cwd = '%s' OR cwd LIKE '%s/%%') ",
 			escapeSQL(root), escapeSQLLike(root))
 	}
-	return fmt.Sprintf("AND cwd LIKE '%%/%s%%' ", escapeSQLLike(project))
+
+	// Windows absolute. GreptimeDB's LIKE uses `\` as the escape
+	// character (sqlutil package comment), so a literal backslash
+	// before `%` is rendered as `\\%`. escapeSQLLike has already
+	// doubled the backslashes inside the root, so the trailing
+	// separator gets its own `\\\\` in the Go format string (→
+	// `\\` after fmt.Sprintf → literal `\` in the SQL pattern).
+	if isWindowsAbsPath(project) {
+		trimmed := strings.TrimRight(project, `/\`)
+		fwd := strings.ReplaceAll(trimmed, `\`, `/`)
+		bsl := strings.ReplaceAll(trimmed, `/`, `\`)
+		return fmt.Sprintf(
+			"AND (cwd = '%s' OR cwd LIKE '%s/%%' OR cwd = '%s' OR cwd LIKE '%s\\\\%%') ",
+			escapeSQL(fwd), escapeSQLLike(fwd),
+			escapeSQL(bsl), escapeSQLLike(bsl),
+		)
+	}
+
+	// Bare-name fallback. Match the basename preceded by either
+	// separator style so a Windows-stored cwd with the same basename
+	// still surfaces.
+	name := escapeSQLLike(project)
+	return fmt.Sprintf(
+		"AND (cwd LIKE '%%/%s%%' OR cwd LIKE '%%\\\\%s%%') ",
+		name, name,
+	)
+}
+
+// isWindowsAbsPath returns true for the two Windows absolute-path
+// shapes that show up in agent-posted cwd values: drive-letter paths
+// ("C:\foo" / "C:/foo") and UNC paths ("\\server\share\..."). Pure
+// string inspection — the host OS of the TMA1 server is irrelevant
+// when classifying a remote agent's path.
+func isWindowsAbsPath(p string) bool {
+	if len(p) >= 3 && isASCIILetter(p[0]) && p[1] == ':' && (p[2] == '/' || p[2] == '\\') {
+		return true
+	}
+	if strings.HasPrefix(p, `\\`) {
+		return true
+	}
+	return false
+}
+
+func isASCIILetter(b byte) bool {
+	return (b >= 'A' && b <= 'Z') || (b >= 'a' && b <= 'z')
 }
 
 // enrichPeerSession fills Messages / RecentToolNames / FilesTouched /
@@ -378,6 +472,21 @@ func (b *Bundler) enrichPeerSession(ctx context.Context, ps *PeerSession, messag
 //
 // Extracted to a method so the caller-aware exclusion has a unit-test
 // foothold without standing up a fake SQL backend.
+// clampPeerLimit constrains the per-agent session limit into [1, 5].
+// Out-of-range inputs are clamped to the nearest boundary rather than
+// silently defaulting to 1 — `/tma1-peer codex 10` should yield 5
+// sessions, not 1, otherwise the cap-vs-default mismatch in the docs
+// becomes a UX surprise.
+func clampPeerLimit(n int) int {
+	if n <= 0 {
+		return 1
+	}
+	if n > 5 {
+		return 5
+	}
+	return n
+}
+
 func (b *Bundler) peerAgentList() []string {
 	agents := make([]string, 0, len(validPeerAgents))
 	for a := range validPeerAgents {
