@@ -10,7 +10,7 @@ file index. Read this when you need to know *where* something is or
 | Path | Role |
 |------|------|
 | `server/` | Go binary: GreptimeDB process manager + HTTP server + dashboard + v2 agent-loop surface |
-| `server/cmd/tma1-server/` | Entry point + embedded FS mount + subcommand routing (`mcp-serve`, `install`, `build`) |
+| `server/cmd/tma1-server/` | Entry point + embedded FS mount + subcommand routing (`mcp-serve`, `install`, `uninstall`, `build`) |
 | `server/internal/config/` | Env var config loading + persisted `~/.tma1/settings.json` |
 | `server/internal/install/` | Download and verify GreptimeDB binary |
 | `server/internal/greptimedb/` | Start, stop, health-check GreptimeDB process + Flow init + versioned schema migrations + per-table DDL (`flows.go` / `anomaly_emits.go` / `build.go` / `external.go` / `project.go`) |
@@ -21,7 +21,7 @@ file index. Read this when you need to know *where* something is or
 | `server/internal/sensor/build/` | `tma1-server build [--watch] -- <cmd>` subprocess capture: stdout/stderr tee + batched writes into `tma1_build_events`, force-colour env injection |
 | `server/internal/sensor/git/` | fsnotify file watcher + 30 s git poll + agent-vs-human attribution honouring `.gitignore` + static ignore list; writes `tma1_external_changes` |
 | `server/internal/sensor/project/` | Lazy project-state indexer (language / build / test / key files / top-level dirs) with 24 h TTL gate; writes `tma1_project_state` |
-| `server/internal/mcp/` | JSON-RPC 2.0 stdio MCP server (7 tools backed by the perception bundler) — runs as a CC-spawned child via `tma1-server mcp-serve` |
+| `server/internal/mcp/` | JSON-RPC 2.0 stdio MCP server (7 tools backed by the perception bundler) — runs as a child of each agent (CC, Codex) via `tma1-server mcp-serve`. Pull-channel tools (`get_anomalies`) use side-effect-free `DetectPreview` so reading state can't silently consume the suppression window and weaken the next Stop block. |
 | `server/internal/writeq/` | Bounded write semaphore (max-in-flight cap, drop counter, recovered-panic counter) used by hook ingest + anomaly emit to keep GreptimeDB from being fork-bombed |
 | `server/internal/sqlutil/` | Single-source SQL helpers (`Escape`, `EscapeLike`, `Quote`) shared by perception, handler, sensors |
 | `server/internal/strutil/` | UTF-8-safe truncation (`SafeTruncate`) used wherever we cap a string before INSERT |
@@ -257,9 +257,9 @@ column lists + sample queries that get published with the skill.
 | Hook telemetry | `server/internal/handler/hook_telemetry.go` — periodic per-event call + inject counter, flushed via slog |
 | SSE streaming + broadcast | `server/internal/handler/sse.go`, `broadcast.go` |
 | Perception bundler | `server/internal/perception/bundle.go` — Bundle + Digest + RenderSummaryDelta; `client.go` is the local SQL HTTP client. `Bundler.Caller` (set from `TMA1_MCP_CALLER`) drives peer-session self-exclusion. |
-| Anomaly engine | `server/internal/perception/anomaly.go` — 6 rules, channel routing, 10-min suppression, per-rule resolvers, age-evicted history cache |
+| Anomaly engine | `server/internal/perception/anomaly.go` — 6 rules, channel routing, 10-min suppression, per-rule resolvers, age-evicted history cache. Two public entry points: `Detect` (push-channel — mutates `sessHistory`, INSERTs to `tma1_anomaly_emits`, advances `LastEmittedAt`) and `DetectPreview` (pull-channel — runs the same rules + resolvers but reads suppression state without writing; used by MCP `get_anomalies`) |
 | Anomaly emit log | `server/internal/perception/anomaly_emits.go` — fire-and-forget INSERTs routed through the handler's `writeq.Sem` |
-| Peer-session reader | `server/internal/perception/peer.go` — backs `get_peer_sessions` MCP tool + `/tma1-peer` skill; caller-aware `peerAgentList()` excludes the invoking agent on empty `agent_source` |
+| Peer-session reader | `server/internal/perception/peer.go` — backs `get_peer_sessions` MCP tool + `/tma1-peer` skill. Caller-aware exclusion works on BOTH the all-peers fan-out (via `peerAgentList()`) AND the explicit-agent path (rejects requests where `agent_source == TMA1_MCP_CALLER` after normalization). `peerCwdFilter` handles POSIX absolute, Windows absolute (drive-letter + UNC, both separator styles), and bare-name fallback. All-peers fan-out captures per-agent SQL failures and surfaces them via a `partial_failures` map in the MCP payload so callers can distinguish "no sessions" from "1-of-N queries failed". `limit` clamps to `[1, 5]` |
 | Project-root resolution | `server/internal/perception/file_writer.go` (`ResolveProjectRoot`) — also writes `.tma1-context.md` for non-MCP agents when `TMA1_ENABLE_FILE_CALLBACK=1` |
 | Incremental injection cache | `server/internal/perception/injection_cache.go` — per-session digest dedupe so identical context isn't re-emitted every turn |
 | MCP stdio server | `server/internal/mcp/server.go` (concurrent loop, write-mutex serialised) + `tools.go` (7 ToolHandlers) + `protocol.go` (JSON-RPC + MCP types) |
