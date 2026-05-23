@@ -101,12 +101,25 @@ function sess_renderWaterfall(timeline, stats) {
       if (cEnd > sessionEnd) sessionEnd = cEnd;
     }
 
-    // 1. Build subagent spans from hookEvents in timeline.
+    // 1. Build turn and subagent spans from hookEvents in timeline.
+    // Codex emits TaskCreated/TaskCompleted per turn; if we have those
+    // we hang LLM + tool spans under their turn so the waterfall shows
+    // turn boundaries instead of one flat list. CC sessions never emit
+    // TaskCreated, so turnSpans stays empty and parenting falls back
+    // to 'root' — identical to the prior behaviour.
+    var turnSpans = {};
     var agentSpans = {};
     for (var ai = 0; ai < timeline.length; ai++) {
       var te = timeline[ai];
       if (te.source !== 'hook') continue;
-      if (te.data.event_type === 'SubagentStart' && te.data.agent_id) {
+      if (te.data.event_type === 'TaskCreated' && te.data.tool_use_id) {
+        turnSpans[te.data.tool_use_id] = {
+          id: 'turn:' + te.data.tool_use_id, type: 'Turn',
+          start_ts: te.ts, end_ts: sessionEnd
+        };
+      } else if (te.data.event_type === 'TaskCompleted' && te.data.tool_use_id && turnSpans[te.data.tool_use_id]) {
+        turnSpans[te.data.tool_use_id].end_ts = te.ts;
+      } else if (te.data.event_type === 'SubagentStart' && te.data.agent_id) {
         agentSpans[te.data.agent_id] = {
           id: te.data.agent_id, type: te.data.agent_type || 'subagent',
           start_ts: te.ts, end_ts: sessionEnd
@@ -126,17 +139,36 @@ function sess_renderWaterfall(timeline, stats) {
       }
     }
     spans = [];
+    // Turns are emitted oldest-first so the waterfall draws them top-down.
+    // Iteration order in `parentTurnIdAt` goes newest→oldest so a span
+    // whose ts lies inside multiple still-open turns (turn N's end_ts
+    // stayed at sessionEnd because TaskCompleted never arrived) attaches
+    // to the LATEST containing turn — pre-fix it always picked the
+    // oldest open turn and swallowed every subsequent span.
+    var turnIds = Object.keys(turnSpans);
+    turnIds.sort(function(a, b) { return turnSpans[a].start_ts - turnSpans[b].start_ts; });
+    function parentTurnIdAt(ts) {
+      for (var pti = turnIds.length - 1; pti >= 0; pti--) {
+        var turn = turnSpans[turnIds[pti]];
+        if (ts >= turn.start_ts && ts <= turn.end_ts) return turn.id;
+      }
+      return 'root';
+    }
+    for (var tii = 0; tii < turnIds.length; tii++) {
+      var trn = turnSpans[turnIds[tii]];
+      spans.push({ id: trn.id, parentId: 'root', name: trn.type, spanType: 'agent', start_ts: trn.start_ts, end_ts: trn.end_ts, data: trn });
+    }
     var agentIds = Object.keys(agentSpans);
     for (var si = 0; si < agentIds.length; si++) {
       var ag = agentSpans[agentIds[si]];
       var agName = ag.type + (taskDescById[ag.id] ? ' · ' + taskDescById[ag.id] : '');
-      spans.push({ id: ag.id, parentId: 'root', name: agName, spanType: 'agent', start_ts: ag.start_ts, end_ts: ag.end_ts, data: ag });
+      spans.push({ id: ag.id, parentId: parentTurnIdAt(ag.start_ts), name: agName, spanType: 'agent', start_ts: ag.start_ts, end_ts: ag.end_ts, data: ag });
     }
 
     for (var ti = 0; ti < timeline.length; ti++) {
       var item = timeline[ti];
       if (item.source === 'tool_pair') {
-        var pid = (item.data.agent_id && agentSpans[item.data.agent_id]) ? item.data.agent_id : 'root';
+        var pid = (item.data.agent_id && agentSpans[item.data.agent_id]) ? item.data.agent_id : parentTurnIdAt(item.data.start_ts);
         spans.push({
           id: item.data.tool_use_id || ('tool_' + ti), parentId: pid,
           name: item.data.tool_name || '?', spanType: 'tool',
@@ -152,7 +184,7 @@ function sess_renderWaterfall(timeline, stats) {
       var cTs = c.ts || 0;
       var cDur = c.durationMs || 0;
       spans.push({
-        id: 'api_' + ci2, parentId: 'root',
+        id: 'api_' + ci2, parentId: parentTurnIdAt(cTs),
         name: (c.model || 'LLM').replace(/^claude-/, '').replace(/-\d{8}$/, ''),
         spanType: 'llm', start_ts: cTs, end_ts: cTs + cDur, data: c
       });
@@ -343,6 +375,7 @@ function sess_toggleWaterfallDetail(container, row, idx) {
     if (s.data.outputTokens) pairs.push(['output_tokens', s.data.outputTokens]);
     if (s.data.cacheTokens) pairs.push(['cache_read_tokens', s.data.cacheTokens]);
     if (s.data.cacheCreationTokens) pairs.push(['cache_creation_tokens', s.data.cacheCreationTokens]);
+    if (s.data.reasoningTokens) pairs.push(['reasoning_tokens', s.data.reasoningTokens]);
     if (s.data.ttftMs) pairs.push(['ttft_ms', s.data.ttftMs]);
     if (s.data.speed) pairs.push(['speed', s.data.speed]);
     if (s.data.cost) pairs.push(['cost', '$' + s.data.cost.toFixed(4)]);

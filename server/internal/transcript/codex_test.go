@@ -71,16 +71,18 @@ func TestProcessCodexLineCarriesConversationIDIntoSubagentLifecycle(t *testing.T
 		`{"timestamp":"2026-03-27T18:11:00Z","type":"event_msg","payload":{"type":"task_complete"}}`,
 		seen, fctx)
 
-	sqls := []string{waitForSQL(t, sqlCh), waitForSQL(t, sqlCh)}
+	// 3 inserts: SubagentStart, TaskCompleted, SubagentStop. All must
+	// carry the conversation UUID.
+	sqls := []string{waitForSQL(t, sqlCh), waitForSQL(t, sqlCh), waitForSQL(t, sqlCh)}
 	var sawStart, sawStop bool
 	for _, sql := range sqls {
 		if !strings.Contains(sql, "conv-123") {
 			t.Fatalf("expected insert to include conversation_id, got %s", sql)
 		}
-		if strings.Contains(sql, "SubagentStart") {
+		if strings.Contains(sql, "'SubagentStart'") {
 			sawStart = true
 		}
-		if strings.Contains(sql, "SubagentStop") {
+		if strings.Contains(sql, "'SubagentStop'") {
 			sawStop = true
 		}
 	}
@@ -333,18 +335,22 @@ func TestCodexLiveGateSkipsSubagentEvents(t *testing.T) {
 	w.processCodexLine("rollout-test",
 		`{"timestamp":"2026-05-22T05:00:00Z","type":"session_meta","payload":{"id":"conv-x","source":{"subagent":"review"}}}`,
 		seen, fctx)
-	// task_complete on a subagent file → SubagentStop (must NOT be gated).
+	// task_complete on a subagent file → TaskCompleted + SubagentStop.
+	// TaskCompleted is JSONL-only (no Codex hook for it), so it joins
+	// the lifecycle events that survive the gate.
 	w.processCodexLine("rollout-test",
 		`{"timestamp":"2026-05-22T05:00:01Z","type":"event_msg","payload":{"type":"task_complete"}}`,
 		seen, fctx)
 
-	sqls := []string{waitForSQL(t, sqlCh), waitForSQL(t, sqlCh)}
+	// 3 inserts total: SubagentStart, TaskCompleted, SubagentStop. The
+	// async insert goroutines arrive in undefined order so collect all.
+	sqls := []string{waitForSQL(t, sqlCh), waitForSQL(t, sqlCh), waitForSQL(t, sqlCh)}
 	var sawStart, sawStop bool
 	for _, sql := range sqls {
-		if strings.Contains(sql, "SubagentStart") {
+		if strings.Contains(sql, "'SubagentStart'") {
 			sawStart = true
 		}
-		if strings.Contains(sql, "SubagentStop") {
+		if strings.Contains(sql, "'SubagentStop'") {
 			sawStop = true
 		}
 	}
@@ -354,8 +360,11 @@ func TestCodexLiveGateSkipsSubagentEvents(t *testing.T) {
 }
 
 // TestCodexLiveGateSuppressesHookCoveredEvents confirms the gate still
-// fires for events the hook adapter actually posts (PreToolUse /
-// PostToolUse), so we don't double-write rows.
+// fires for tma1_hook_events writes for events the hook adapter
+// actually posts (PreToolUse / PostToolUse), so we don't double-write
+// hook rows. tma1_messages writes are intentionally NOT gated — the
+// hook handler never writes messages, so the parser must keep doing it
+// (see codexLiveGate doc comment).
 func TestCodexLiveGateSuppressesHookCoveredEvents(t *testing.T) {
 	sqlCh := make(chan string, 4)
 	ts := httptest.NewServer(httpTestHandler(sqlCh))
@@ -373,17 +382,254 @@ func TestCodexLiveGateSuppressesHookCoveredEvents(t *testing.T) {
 	seen := make(map[string]struct{})
 	fctx := &codexFileContext{fileID: "codex:rollout-test", live: true}
 
-	// function_call → PreToolUse (hook-covered, MUST be gated).
+	// function_call: hook-covered PreToolUse MUST be gated, but the
+	// tool_use tma1_messages row survives so transcript replay stays
+	// intact.
 	w.processCodexLine("rollout-test",
 		`{"timestamp":"2026-05-22T05:00:00Z","type":"response_item","payload":{"type":"function_call","name":"bash","call_id":"c1"}}`,
 		seen, fctx)
 
+	deadline := time.After(150 * time.Millisecond)
+	for {
+		select {
+		case sql := <-sqlCh:
+			if strings.Contains(sql, "tma1_hook_events") {
+				t.Fatalf("expected gate to suppress tma1_hook_events insert, got %s", sql)
+			}
+			// tma1_messages tool_use is expected; keep draining.
+		case <-deadline:
+			return
+		}
+	}
+}
+
+// TestParseCodexSessionMetaNestedSubagent locks in the parse path for
+// the Codex 0.131.0 auto-review subagent shape
+// ({"subagent":{"other":"guardian"}}). Without the guardian rewrite,
+// the dashboard's per-subagent rollups split auto-review under a
+// brand-new agent_type instead of the codex-auto-review bucket the
+// frontend filters expect.
+func TestParseCodexSessionMetaNestedSubagent(t *testing.T) {
+	meta := parseCodexSessionMeta([]byte(`{"id":"conv-1","source":{"subagent":{"other":"guardian"}},"cwd":"/tmp/project"}`))
+	if meta.id != "conv-1" || meta.cwd != "/tmp/project" || meta.subagent != "codex-auto-review" {
+		t.Fatalf("unexpected meta: %#v", meta)
+	}
+}
+
+// TestProcessCodexResponseItemEmitsToolMessages locks in the dual
+// emission introduced by this change: function_call /
+// function_call_output write both a tma1_hook_events row (used by the
+// waterfall) AND a tma1_messages row (used by transcript / replay).
+// Pre-change, only the hook row landed, so Codex transcripts couldn't
+// surface tool args/results outside the waterfall.
+func TestProcessCodexResponseItemEmitsToolMessages(t *testing.T) {
+	sqlCh := make(chan string, 4)
+	ts := httptest.NewServer(httpTestHandler(sqlCh))
+	defer ts.Close()
+
+	oldClient := httpClient
+	httpClient = ts.Client()
+	defer func() { httpClient = oldClient }()
+
+	w := &Watcher{
+		sqlURL: ts.URL,
+		logger: slog.New(slog.NewTextHandler(io.Discard, nil)),
+	}
+	seen := make(map[string]struct{})
+	fctx := &codexFileContext{model: "gpt-5.5", conversationID: "conv-tool"}
+
+	w.processCodexLine("rollout-2026-03-27T18-10-59",
+		`{"timestamp":"2026-03-27T18:11:01Z","type":"response_item","payload":{"type":"function_call","name":"exec_command","call_id":"call-1","arguments":"{\"cmd\":\"go test ./...\"}"}}`,
+		seen, fctx)
+	w.processCodexLine("rollout-2026-03-27T18-10-59",
+		`{"timestamp":"2026-03-27T18:11:02Z","type":"response_item","payload":{"type":"function_call_output","call_id":"call-1","output":"ok"}}`,
+		seen, fctx)
+
+	sqls := []string{
+		waitForSQL(t, sqlCh),
+		waitForSQL(t, sqlCh),
+		waitForSQL(t, sqlCh),
+		waitForSQL(t, sqlCh),
+	}
+	assertAnySQLContains(t, sqls, "tma1_hook_events", "PreToolUse", "exec_command", "call-1")
+	assertAnySQLContains(t, sqls, "tma1_hook_events", "PostToolUse", "call-1", "ok")
+	assertAnySQLContains(t, sqls, "tma1_messages", "tool_use", "exec_command", "call-1", "gpt-5.5")
+	assertAnySQLContains(t, sqls, "tma1_messages", "tool_result", "call-1", "ok", "gpt-5.5")
+}
+
+// TestProcessCodexWebSearchEndEmitsToolMessages pins the projection of
+// a single Codex web_search_end event: PreToolUse + PostToolUse hook
+// pair (so the waterfall draws the tool span) plus ONE tool_use
+// message for the input. We deliberately do NOT write a tool_result
+// message — Codex's web_search_end carries the query/action but no
+// results payload, and emitting `tool_input` as `tool_result` would
+// inflate context-length heuristics keyed off result length.
+func TestProcessCodexWebSearchEndEmitsToolMessages(t *testing.T) {
+	sqlCh := make(chan string, 4)
+	ts := httptest.NewServer(httpTestHandler(sqlCh))
+	defer ts.Close()
+
+	oldClient := httpClient
+	httpClient = ts.Client()
+	defer func() { httpClient = oldClient }()
+
+	w := &Watcher{
+		sqlURL: ts.URL,
+		logger: slog.New(slog.NewTextHandler(io.Discard, nil)),
+	}
+	seen := make(map[string]struct{})
+	fctx := &codexFileContext{model: "gpt-5.5", conversationID: "conv-search"}
+
+	w.processCodexLine("rollout-2026-03-27T18-10-59",
+		`{"timestamp":"2026-03-27T18:11:03Z","type":"event_msg","payload":{"type":"web_search_end","call_id":"ws-1","query":"xdisp cursor","action":{"type":"search","query":"xdisp cursor"}}}`,
+		seen, fctx)
+
+	sqls := []string{
+		waitForSQL(t, sqlCh),
+		waitForSQL(t, sqlCh),
+		waitForSQL(t, sqlCh),
+	}
+	assertAnySQLContains(t, sqls, "tma1_hook_events", "PreToolUse", "web_search", "ws-1", "xdisp cursor")
+	assertAnySQLContains(t, sqls, "tma1_hook_events", "PostToolUse", "web_search", "ws-1")
+	assertAnySQLContains(t, sqls, "tma1_messages", "tool_use", "web_search", "ws-1", "gpt-5.5")
+
+	// No tool_result row should land for web_search.
+	for _, sql := range sqls {
+		if strings.Contains(sql, "tma1_messages") && strings.Contains(sql, "tool_result") {
+			t.Fatalf("expected no tool_result message for web_search_end, got %s", sql)
+		}
+	}
+
+	// No 4th insert (only 3 total).
 	select {
 	case sql := <-sqlCh:
-		t.Fatalf("expected no insert for hook-covered PreToolUse when live, got %s", sql)
+		t.Fatalf("expected exactly 3 inserts for web_search_end, got extra: %s", sql)
 	case <-time.After(150 * time.Millisecond):
-		// expected — gate suppressed the insert
 	}
+}
+
+// TestProcessCodexResponseItemEmitsReasoningSummary locks in the
+// reasoning → thinking projection. Codex 0.131.0 emits reasoning items
+// with text under `summary` blocks; this test pins the older summary
+// path so a Codex version downgrade doesn't silently drop thinking
+// rows from the transcript.
+func TestProcessCodexResponseItemEmitsReasoningSummary(t *testing.T) {
+	sqlCh := make(chan string, 1)
+	ts := httptest.NewServer(httpTestHandler(sqlCh))
+	defer ts.Close()
+
+	oldClient := httpClient
+	httpClient = ts.Client()
+	defer func() { httpClient = oldClient }()
+
+	w := &Watcher{
+		sqlURL: ts.URL,
+		logger: slog.New(slog.NewTextHandler(io.Discard, nil)),
+	}
+	seen := make(map[string]struct{})
+	fctx := &codexFileContext{model: "gpt-5.5"}
+
+	w.processCodexLine("rollout-2026-03-27T18-10-59",
+		`{"timestamp":"2026-03-27T18:11:03Z","type":"response_item","payload":{"type":"reasoning","summary":[{"type":"summary_text","text":"Need inspect parser."}]}}`,
+		seen, fctx)
+
+	sql := waitForSQL(t, sqlCh)
+	for _, want := range []string{"tma1_messages", "thinking", "Need inspect parser.", "gpt-5.5"} {
+		if !strings.Contains(sql, want) {
+			t.Fatalf("expected SQL to contain %q, got %s", want, sql)
+		}
+	}
+}
+
+// TestProcessCodexTokenCountWritesUsageRow locks in the Codex
+// `event_msg.token_count` → tma1_messages projection that lets the
+// sessions.js Codex fallback derive apiCalls from messages when
+// OTel data isn't available. Without this row, reasoning_tokens
+// has no writer on the JSONL path and the dashboard's reasoning
+// column would always show zero for Codex sessions that aren't
+// reporting OTel.
+func TestProcessCodexTokenCountWritesUsageRow(t *testing.T) {
+	sqlCh := make(chan string, 1)
+	ts := httptest.NewServer(httpTestHandler(sqlCh))
+	defer ts.Close()
+
+	oldClient := httpClient
+	httpClient = ts.Client()
+	defer func() { httpClient = oldClient }()
+
+	w := &Watcher{
+		sqlURL: ts.URL,
+		logger: slog.New(slog.NewTextHandler(io.Discard, nil)),
+	}
+	seen := make(map[string]struct{})
+	fctx := &codexFileContext{model: "gpt-5.5", conversationID: "conv-usage"}
+
+	w.processCodexLine("rollout-2026-05-20T15-51-00",
+		`{"timestamp":"2026-05-20T22:51:41.859Z","type":"event_msg","payload":{"type":"token_count","info":{"last_token_usage":{"input_tokens":37347,"cached_input_tokens":34688,"output_tokens":1549,"reasoning_output_tokens":516,"total_tokens":39412}}}}`,
+		seen, fctx)
+
+	sql := waitForSQL(t, sqlCh)
+	for _, want := range []string{
+		"tma1_messages",
+		// 'usage' message_type is dedicated for synthetic per-call
+		// usage rows so the timeline can drop them by type instead
+		// of an empty-content heuristic.
+		"'usage', 'assistant'",
+		"'gpt-5.5'",
+		"37347", "1549", "34688", "516",
+	} {
+		if !strings.Contains(sql, want) {
+			t.Fatalf("expected SQL to contain %q, got %s", want, sql)
+		}
+	}
+}
+
+// TestProcessCodexTokenCountSkipsEmptyUsage pins down the zero-skip
+// behaviour: Codex emits a token_count immediately after session
+// handshake where every counter is 0; persisting those would add
+// noise to the apiCalls fallback (zero-cost zero-token rows).
+func TestProcessCodexTokenCountSkipsEmptyUsage(t *testing.T) {
+	sqlCh := make(chan string, 1)
+	ts := httptest.NewServer(httpTestHandler(sqlCh))
+	defer ts.Close()
+
+	oldClient := httpClient
+	httpClient = ts.Client()
+	defer func() { httpClient = oldClient }()
+
+	w := &Watcher{
+		sqlURL: ts.URL,
+		logger: slog.New(slog.NewTextHandler(io.Discard, nil)),
+	}
+	seen := make(map[string]struct{})
+	fctx := &codexFileContext{model: "gpt-5.5"}
+
+	w.processCodexLine("rollout-2026-05-20T15-51-00",
+		`{"timestamp":"2026-05-20T22:51:00.000Z","type":"event_msg","payload":{"type":"token_count","info":{"last_token_usage":{"input_tokens":0,"cached_input_tokens":0,"output_tokens":0,"reasoning_output_tokens":0,"total_tokens":0}}}}`,
+		seen, fctx)
+
+	select {
+	case sql := <-sqlCh:
+		t.Fatalf("expected no insert for zero usage, got %s", sql)
+	case <-time.After(150 * time.Millisecond):
+	}
+}
+
+func assertAnySQLContains(t *testing.T, sqls []string, wants ...string) {
+	t.Helper()
+	for _, sql := range sqls {
+		ok := true
+		for _, want := range wants {
+			if !strings.Contains(sql, want) {
+				ok = false
+				break
+			}
+		}
+		if ok {
+			return
+		}
+	}
+	t.Fatalf("expected one SQL to contain %q, got %q", wants, sqls)
 }
 
 func httpTestHandler(sqlCh chan<- string) http.HandlerFunc {

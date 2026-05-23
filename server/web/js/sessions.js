@@ -245,7 +245,7 @@ async function sess_loadDetail(sessionId, agentSource) {
     ).catch(function() { return null; }),
     query(
       "SELECT ts, session_id, message_type, tool_name, tool_use_id, content, model, " +
-      "input_tokens, output_tokens, cache_read_tokens, cache_creation_tokens, duration_ms " +
+      "input_tokens, output_tokens, cache_read_tokens, cache_creation_tokens, reasoning_tokens, duration_ms " +
       "FROM tma1_messages WHERE session_id = '" + sid + "' ORDER BY ts ASC LIMIT 50000"
     ).catch(function() { return null; }),
   ]);
@@ -254,9 +254,17 @@ async function sess_loadDetail(sessionId, agentSource) {
   var hookEvents = phase1[0] ? rowsToObjects(phase1[0]) : [];
   var messages = phase1[1] ? rowsToObjects(phase1[1]) : [];
 
-  // Infer agent source from hook data when not provided (e.g. search results).
-  if (!agentSource && hookEvents.length > 0) {
-    agentSource = hookEvents[0].agent_source || '';
+  // Infer agent source from hook data when not provided (e.g. search
+  // results pass empty agent_source). Iterate until we find a row with
+  // a non-empty source — early rows may be agent-less SessionStart
+  // pings.
+  if (!agentSource) {
+    for (var srcIdx = 0; srcIdx < hookEvents.length; srcIdx++) {
+      if (hookEvents[srcIdx].agent_source) {
+        agentSource = hookEvents[srcIdx].agent_source;
+        break;
+      }
+    }
   }
 
   // Merge tool pairs from hooks (PostToolUse with matching PreToolUse).
@@ -300,9 +308,20 @@ async function sess_loadDetail(sessionId, agentSource) {
     }
   }
   // Messages: skip tool_use/tool_result if already covered by a hook-based tool pair.
+  // Skip the synthetic 'usage' rows the Codex parser writes
+  // (insertCodexModelMessage to carry model name into the KPI lookup,
+  // insertCodexUsageMessage to carry per-call token usage into the
+  // apiCalls fallback). They have no displayable content; the
+  // dedicated message_type lets us drop them by type instead of an
+  // empty-content heuristic that could mis-fire on real data.
+  // Legacy fallback: pre-rename data wrote synthetic rows as
+  // message_type='assistant' with empty content — also drop those
+  // so old sessions stay clean.
   for (var mi = 0; mi < messages.length; mi++) {
     var msg = messages[mi];
     if ((msg.message_type === 'tool_use' || msg.message_type === 'tool_result') && msg.tool_use_id && pairedIds[msg.tool_use_id]) continue;
+    if (msg.message_type === 'usage') continue;
+    if (msg.message_type === 'assistant' && !(msg.content && msg.content.length) && !msg.tool_use_id) continue;
     timeline.push({ ts: tsToMs(msg.ts), source: 'message', data: msg });
   }
   timeline.sort(function(a, b) { return a.ts - b.ts; });
@@ -315,7 +334,9 @@ async function sess_loadDetail(sessionId, agentSource) {
   var apiErrors = [];
 
   if (agentSource === 'codex') {
-    // Codex: query OTel logs by conversation_id.
+    // Codex: prefer OTel logs (richer + cost_usd via app billing)
+    // and fall back to assistant rows written by the JSONL parser
+    // from event_msg.token_count when OTel data isn't present.
     var conversationIds = sess_collectConversationIds(hookEvents);
     if (conversationIds.length > 0 && timeline.length > 0) {
       var tsBetween = "timestamp BETWEEN '" + new Date(timeline[0].ts - 60000).toISOString() + "' AND '" + new Date(timeline[timeline.length - 1].ts + 60000).toISOString() + "'";
@@ -329,8 +350,37 @@ async function sess_loadDetail(sessionId, agentSource) {
         apiCalls = sess_parseCodexOTel(otelRows, conversationIds);
       }
     }
+    if (apiCalls.length === 0) {
+      // JSONL fallback. insertCodexUsageMessage writes one 'usage' row
+      // per Codex token_count event with input/output/cache/reasoning
+      // populated; insertCodexModelMessage writes a model-only 'usage'
+      // row with every token column NULL. The > 0 guard below skips
+      // the latter so model-only rows never become spurious calls.
+      for (var ci = 0; ci < messages.length; ci++) {
+        var cm = messages[ci];
+        if (cm.message_type !== 'usage') continue;
+        var cIn = Number(cm.input_tokens) || 0;
+        var cOut = Number(cm.output_tokens) || 0;
+        var cReasoning = Number(cm.reasoning_tokens) || 0;
+        if (cIn === 0 && cOut === 0 && cReasoning === 0) continue;
+        var cCache = Number(cm.cache_read_tokens) || 0;
+        var cPrice = sess_lookupPrice(cm.model);
+        apiCalls.push({
+          ts: tsToMs(cm.ts), model: cm.model || '',
+          inputTokens: cIn, outputTokens: cOut,
+          reasoningTokens: cReasoning,
+          cacheTokens: cCache, cacheCreationTokens: 0,
+          // OpenAI o-series bills reasoning at the output rate, so
+          // mirror the cost shape sess_parseCodexOTel uses.
+          cost: cIn * cPrice.input / 1000000 + (cOut + cReasoning) * cPrice.output / 1000000,
+          durationMs: Number(cm.duration_ms) || 0, toolUseIds: [],
+        });
+      }
+    }
   } else if (agentSource === 'openclaw') {
     // OpenClaw: usage + duration data is already in tma1_messages (parsed from JSONL transcript).
+    // OpenClaw fronts Anthropic models, which fold thinking tokens
+    // into output_tokens — reasoning is not surfaced here.
     for (var oi = 0; oi < messages.length; oi++) {
       var om = messages[oi];
       if (om.message_type !== 'assistant') continue;
@@ -355,6 +405,9 @@ async function sess_loadDetail(sessionId, agentSource) {
     });
 
     if (hasUsageInMessages) {
+      // CC fronts Anthropic models; thinking is already inside
+      // output_tokens, so reasoning is not surfaced as a separate
+      // column on the dashboard.
       for (var ui = 0; ui < messages.length; ui++) {
         var um = messages[ui];
         if (um.message_type !== 'assistant') continue;

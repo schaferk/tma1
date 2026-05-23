@@ -25,9 +25,18 @@ function renderSessionDetail(timeline, stats) {
   var costLabel = stats.costSource === 'otel' ? t('sessions.kpi_cost') : t('sessions.kpi_cost') + ' ~';
   html += '<div class="sess-kpi"><span class="sess-kpi-label">' + costLabel + '</span><span class="sess-kpi-value cost">' + (stats.cost > 0 ? fmtCost(stats.cost) : '\u2014') + '</span></div>';
 
-  // Tokens KPI.
+  // Tokens KPI. The reasoning slot only renders for Codex sessions
+  // — Codex / OpenAI o-series report reasoning_token_count as a
+  // separate bucket from output_tokens and bill it at the output
+  // rate (cost calc in sess_parseCodexOTel and the JSONL fallback
+  // both include it). CC + OpenClaw use Anthropic models where
+  // thinking is already inside output_tokens, so reasoning isn't
+  // surfaced separately; totalReasoningTokens stays 0 and the slot
+  // hides naturally via the > 0 guard below.
   var tokLabel = stats.hasOTel ? t('sessions.kpi_tokens') : t('sessions.kpi_tokens') + ' ~';
-  html += '<div class="sess-kpi"><span class="sess-kpi-label">' + tokLabel + '</span><span class="sess-kpi-value" style="font-size:14px">' + fmtTokens(stats.totalInputTokens) + ' ' + t('sessions.token_in') + ' / ' + fmtTokens(stats.totalOutputTokens) + ' ' + t('sessions.token_out') + '</span></div>';
+  var tokText = fmtTokens(stats.totalInputTokens) + ' ' + t('sessions.token_in') + ' / ' + fmtTokens(stats.totalOutputTokens) + ' ' + t('sessions.token_out');
+  if (stats.totalReasoningTokens > 0) tokText += ' / ' + fmtTokens(stats.totalReasoningTokens) + ' ' + t('sessions.token_reasoning');
+  html += '<div class="sess-kpi"><span class="sess-kpi-label">' + tokLabel + '</span><span class="sess-kpi-value" style="font-size:14px">' + tokText + '</span></div>';
 
   // Cache KPI (only if OTel data available and cache > 0).
   if (stats.hasOTel && stats.totalCacheTokens > 0) {
