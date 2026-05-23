@@ -527,6 +527,77 @@ func TestProcessCodexResponseItemEmitsReasoningSummary(t *testing.T) {
 	}
 }
 
+// TestProcessCodexTokenCountWritesUsageRow locks in the Codex
+// `event_msg.token_count` → tma1_messages projection that lets the
+// sessions.js Codex fallback derive apiCalls from messages when
+// OTel data isn't available. Without this row, reasoning_tokens
+// has no writer on the JSONL path and the dashboard's reasoning
+// column would always show zero for Codex sessions that aren't
+// reporting OTel.
+func TestProcessCodexTokenCountWritesUsageRow(t *testing.T) {
+	sqlCh := make(chan string, 1)
+	ts := httptest.NewServer(httpTestHandler(sqlCh))
+	defer ts.Close()
+
+	oldClient := httpClient
+	httpClient = ts.Client()
+	defer func() { httpClient = oldClient }()
+
+	w := &Watcher{
+		sqlURL: ts.URL,
+		logger: slog.New(slog.NewTextHandler(io.Discard, nil)),
+	}
+	seen := make(map[string]struct{})
+	fctx := &codexFileContext{model: "gpt-5.5", conversationID: "conv-usage"}
+
+	w.processCodexLine("rollout-2026-05-20T15-51-00",
+		`{"timestamp":"2026-05-20T22:51:41.859Z","type":"event_msg","payload":{"type":"token_count","info":{"last_token_usage":{"input_tokens":37347,"cached_input_tokens":34688,"output_tokens":1549,"reasoning_output_tokens":516,"total_tokens":39412}}}}`,
+		seen, fctx)
+
+	sql := waitForSQL(t, sqlCh)
+	for _, want := range []string{
+		"tma1_messages",
+		"'assistant', 'assistant'",
+		"'gpt-5.5'",
+		"37347", "1549", "34688", "516",
+	} {
+		if !strings.Contains(sql, want) {
+			t.Fatalf("expected SQL to contain %q, got %s", want, sql)
+		}
+	}
+}
+
+// TestProcessCodexTokenCountSkipsEmptyUsage pins down the zero-skip
+// behaviour: Codex emits a token_count immediately after session
+// handshake where every counter is 0; persisting those would add
+// noise to the apiCalls fallback (zero-cost zero-token rows).
+func TestProcessCodexTokenCountSkipsEmptyUsage(t *testing.T) {
+	sqlCh := make(chan string, 1)
+	ts := httptest.NewServer(httpTestHandler(sqlCh))
+	defer ts.Close()
+
+	oldClient := httpClient
+	httpClient = ts.Client()
+	defer func() { httpClient = oldClient }()
+
+	w := &Watcher{
+		sqlURL: ts.URL,
+		logger: slog.New(slog.NewTextHandler(io.Discard, nil)),
+	}
+	seen := make(map[string]struct{})
+	fctx := &codexFileContext{model: "gpt-5.5"}
+
+	w.processCodexLine("rollout-2026-05-20T15-51-00",
+		`{"timestamp":"2026-05-20T22:51:00.000Z","type":"event_msg","payload":{"type":"token_count","info":{"last_token_usage":{"input_tokens":0,"cached_input_tokens":0,"output_tokens":0,"reasoning_output_tokens":0,"total_tokens":0}}}}`,
+		seen, fctx)
+
+	select {
+	case sql := <-sqlCh:
+		t.Fatalf("expected no insert for zero usage, got %s", sql)
+	case <-time.After(150 * time.Millisecond):
+	}
+}
+
 func assertAnySQLContains(t *testing.T, sqls []string, wants ...string) {
 	t.Helper()
 	for _, sql := range sqls {

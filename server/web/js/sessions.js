@@ -324,7 +324,9 @@ async function sess_loadDetail(sessionId, agentSource) {
   var apiErrors = [];
 
   if (agentSource === 'codex') {
-    // Codex: query OTel logs by conversation_id.
+    // Codex: prefer OTel logs (richer + cost_usd via app billing)
+    // and fall back to assistant rows written by the JSONL parser
+    // from event_msg.token_count when OTel data isn't present.
     var conversationIds = sess_collectConversationIds(hookEvents);
     if (conversationIds.length > 0 && timeline.length > 0) {
       var tsBetween = "timestamp BETWEEN '" + new Date(timeline[0].ts - 60000).toISOString() + "' AND '" + new Date(timeline[timeline.length - 1].ts + 60000).toISOString() + "'";
@@ -338,12 +340,37 @@ async function sess_loadDetail(sessionId, agentSource) {
         apiCalls = sess_parseCodexOTel(otelRows, conversationIds);
       }
     }
+    if (apiCalls.length === 0) {
+      // JSONL fallback. insertCodexUsageMessage writes one row per
+      // Codex token_count event with input/output/cache/reasoning
+      // populated; insertCodexModelMessage writes a model-only row
+      // with every token column NULL. The > 0 guard below skips
+      // the latter so model-only rows never become spurious calls.
+      for (var ci = 0; ci < messages.length; ci++) {
+        var cm = messages[ci];
+        if (cm.message_type !== 'assistant') continue;
+        var cIn = Number(cm.input_tokens) || 0;
+        var cOut = Number(cm.output_tokens) || 0;
+        var cReasoning = Number(cm.reasoning_tokens) || 0;
+        if (cIn === 0 && cOut === 0 && cReasoning === 0) continue;
+        var cCache = Number(cm.cache_read_tokens) || 0;
+        var cPrice = sess_lookupPrice(cm.model);
+        apiCalls.push({
+          ts: tsToMs(cm.ts), model: cm.model || '',
+          inputTokens: cIn, outputTokens: cOut,
+          reasoningTokens: cReasoning,
+          cacheTokens: cCache, cacheCreationTokens: 0,
+          // OpenAI o-series bills reasoning at the output rate, so
+          // mirror the cost shape sess_parseCodexOTel uses.
+          cost: cIn * cPrice.input / 1000000 + (cOut + cReasoning) * cPrice.output / 1000000,
+          durationMs: Number(cm.duration_ms) || 0, toolUseIds: [],
+        });
+      }
+    }
   } else if (agentSource === 'openclaw') {
     // OpenClaw: usage + duration data is already in tma1_messages (parsed from JSONL transcript).
     // OpenClaw fronts Anthropic models, which fold thinking tokens
-    // into output_tokens — surface reasoning_tokens when present
-    // (some upstream channels do split them out) but don't add to
-    // cost or it would double-count.
+    // into output_tokens — reasoning is not surfaced here.
     for (var oi = 0; oi < messages.length; oi++) {
       var om = messages[oi];
       if (om.message_type !== 'assistant') continue;
@@ -352,12 +379,10 @@ async function sess_loadDetail(sessionId, agentSource) {
       if (oIn === 0 && oOut === 0) continue;
       var oCacheR = Number(om.cache_read_tokens) || 0;
       var oCacheW = Number(om.cache_creation_tokens) || 0;
-      var oReasoning = Number(om.reasoning_tokens) || 0;
       var oPrice = sess_lookupPrice(om.model);
       apiCalls.push({
         ts: tsToMs(om.ts), model: om.model || '',
         inputTokens: oIn, outputTokens: oOut,
-        reasoningTokens: oReasoning,
         cacheTokens: oCacheR, cacheCreationTokens: oCacheW,
         cost: oIn * oPrice.input / 1000000 + oOut * oPrice.output / 1000000,
         durationMs: Number(om.duration_ms) || 0, toolUseIds: [],
@@ -370,6 +395,9 @@ async function sess_loadDetail(sessionId, agentSource) {
     });
 
     if (hasUsageInMessages) {
+      // CC fronts Anthropic models; thinking is already inside
+      // output_tokens, so reasoning is not surfaced as a separate
+      // column on the dashboard.
       for (var ui = 0; ui < messages.length; ui++) {
         var um = messages[ui];
         if (um.message_type !== 'assistant') continue;
@@ -378,15 +406,10 @@ async function sess_loadDetail(sessionId, agentSource) {
         if (inTok === 0 && outTok === 0) continue;
         var cacheRead = Number(um.cache_read_tokens) || 0;
         var cacheCreate = Number(um.cache_creation_tokens) || 0;
-        // Anthropic counts thinking inside output_tokens already.
-        // Surface reasoning_tokens for display when the row carries
-        // it, but don't add to cost — that's already in outTok.
-        var reasoningTok = Number(um.reasoning_tokens) || 0;
         var mPrice = sess_lookupPrice(um.model);
         apiCalls.push({
           ts: tsToMs(um.ts), model: um.model || '',
           inputTokens: inTok, outputTokens: outTok,
-          reasoningTokens: reasoningTok,
           cacheTokens: cacheRead, cacheCreationTokens: cacheCreate,
           cost: inTok * mPrice.input / 1000000 + outTok * mPrice.output / 1000000,
           durationMs: 0, toolUseIds: [],

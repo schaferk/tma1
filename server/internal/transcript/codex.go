@@ -480,6 +480,35 @@ func (w *Watcher) processCodexLine(sessionID, line string, seen map[string]struc
 			w.insertCodexTypedMessage(sid, ts, "tool_use", "assistant", toolInput, fctx.model, "web_search", eventMsg.CallID, seen)
 			w.insertCodexHookEvent(sid, ts, "PostToolUse", "web_search", "", eventMsg.CallID, toolInput, fctx)
 			w.insertCodexTypedMessage(sid, ts, "tool_result", "user", toolInput, fctx.model, "web_search", eventMsg.CallID, seen)
+		case "token_count":
+			// Codex emits token_count after each response with the
+			// per-call usage in info.last_token_usage. This is the
+			// only place reasoning_output_tokens surfaces from
+			// JSONL, so we persist it as a synthetic assistant row
+			// whose token columns light up the message-derived
+			// apiCalls fallback in sessions.js (used when Codex
+			// OTel logs aren't present).
+			var tc struct {
+				Info struct {
+					LastTokenUsage struct {
+						InputTokens           int64 `json:"input_tokens"`
+						CachedInputTokens     int64 `json:"cached_input_tokens"`
+						OutputTokens          int64 `json:"output_tokens"`
+						ReasoningOutputTokens int64 `json:"reasoning_output_tokens"`
+					} `json:"last_token_usage"`
+				} `json:"info"`
+			}
+			if json.Unmarshal(ev.Payload, &tc) == nil {
+				usage := tc.Info.LastTokenUsage
+				// Skip zero-usage events (handshake / no-op turns).
+				// Output OR reasoning > 0 is the marker that the
+				// API actually answered.
+				if usage.OutputTokens > 0 || usage.ReasoningOutputTokens > 0 {
+					w.insertCodexUsageMessage(sid, ts, fctx.model,
+						usage.InputTokens, usage.OutputTokens,
+						usage.CachedInputTokens, usage.ReasoningOutputTokens, seen)
+				}
+			}
 		case "user_message":
 			msg := strings.TrimSpace(eventMsg.Message)
 			if msg != "" {
@@ -832,6 +861,61 @@ func (w *Watcher) insertCodexTypedMessage(sessionID string, ts time.Time, messag
 		escapeSQLString(model),
 		escapeSQLString(toolName),
 		escapeSQLString(toolUseID),
+	)
+	go func() {
+		insertSem <- struct{}{}
+		defer func() { <-insertSem }()
+		w.execSQL(sql)
+	}()
+}
+
+// insertCodexUsageMessage writes a per-call usage row sourced from
+// Codex JSONL's `event_msg.token_count` payload. The row is shaped
+// like the existing `insertCodexModelMessage` row (assistant /
+// assistant, empty content) but additionally populates the token
+// columns. The sessions.js Codex fallback path scans assistant rows
+// where at least one token column is > 0 to build apiCalls, so the
+// model-only rows insertCodexModelMessage writes are NOT picked up
+// here — only these usage rows are.
+//
+// Dedup key includes the timestamp + every token field so a JSONL
+// replay on restart resolves to the same key and is skipped.
+//
+// NOT gated by codexLiveGate — tma1_messages is never written by
+// the live hook handler, so there's no double-write to suppress.
+func (w *Watcher) insertCodexUsageMessage(sessionID string, ts time.Time, model string, input, output, cachedInput, reasoning int64, seen map[string]struct{}) {
+	key := fmt.Sprintf("usage:%d:%d:%d:%d:%d", ts.UnixMilli(), input, output, cachedInput, reasoning)
+	if seen != nil {
+		if _, ok := seen[key]; ok {
+			return
+		}
+		seen[key] = struct{}{}
+	}
+
+	msTs := ts.UnixMilli()
+	for {
+		prev := lastInsertTS.Load()
+		next := msTs
+		if next <= prev {
+			next = prev + 1
+		}
+		if lastInsertTS.CompareAndSwap(prev, next) {
+			msTs = next
+			break
+		}
+	}
+
+	sql := fmt.Sprintf(
+		"INSERT INTO tma1_messages (ts, session_id, message_type, \"role\", content, model, tool_name, tool_use_id, "+
+			"input_tokens, output_tokens, cache_read_tokens, reasoning_tokens) "+
+			"VALUES (%d, '%s', 'assistant', 'assistant', '', '%s', '', '', %d, %d, %d, %d)",
+		msTs,
+		escapeSQLString(sessionID),
+		escapeSQLString(model),
+		input,
+		output,
+		cachedInput,
+		reasoning,
 	)
 	go func() {
 		insertSem <- struct{}{}

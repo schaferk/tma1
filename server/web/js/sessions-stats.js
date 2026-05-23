@@ -282,10 +282,6 @@ function sess_parseCCOTel(rows, sessionId) {
       model: a.model || '',
       inputTokens: Number(a.input_tokens) || 0,
       outputTokens: Number(a.output_tokens) || 0,
-      // Anthropic counts thinking inside output_tokens — surface
-      // reasoning_tokens if CC ever emits the attribute, but DON'T
-      // add it to cost (would double-count against output_tokens).
-      reasoningTokens: Number(a.reasoning_tokens) || 0,
       cacheTokens: Number(a.cache_read_tokens) || 0,
       cacheCreationTokens: Number(a.cache_creation_tokens) || 0,
       cost: parseFloat(a.cost_usd) || 0,
