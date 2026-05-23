@@ -25,9 +25,14 @@ function renderSessionDetail(timeline, stats) {
   var costLabel = stats.costSource === 'otel' ? t('sessions.kpi_cost') : t('sessions.kpi_cost') + ' ~';
   html += '<div class="sess-kpi"><span class="sess-kpi-label">' + costLabel + '</span><span class="sess-kpi-value cost">' + (stats.cost > 0 ? fmtCost(stats.cost) : '\u2014') + '</span></div>';
 
-  // Tokens KPI. Reasoning tokens get a separate trailing slot so the
-  // displayed total stays consistent with the cost calc (which prices
-  // reasoning at output rate but reports it as its own bucket).
+  // Tokens KPI. Reasoning tokens get a separate trailing slot.
+  // Display convention follows what the source provider exposes:
+  //   - Codex / OpenAI o-series: reasoning is a separate bucket from
+  //     output_tokens and is BILLED at the output rate, so the cost
+  //     calc in sess_parseCodexOTel adds it in.
+  //   - Anthropic CC / OpenClaw: thinking is already counted inside
+  //     output_tokens, so reasoning is shown for transparency but
+  //     never added to cost (would double-count).
   var tokLabel = stats.hasOTel ? t('sessions.kpi_tokens') : t('sessions.kpi_tokens') + ' ~';
   var tokText = fmtTokens(stats.totalInputTokens) + ' ' + t('sessions.token_in') + ' / ' + fmtTokens(stats.totalOutputTokens) + ' ' + t('sessions.token_out');
   if (stats.totalReasoningTokens > 0) tokText += ' / ' + fmtTokens(stats.totalReasoningTokens) + ' ' + t('sessions.token_reasoning');

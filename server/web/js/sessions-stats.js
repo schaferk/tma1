@@ -282,6 +282,10 @@ function sess_parseCCOTel(rows, sessionId) {
       model: a.model || '',
       inputTokens: Number(a.input_tokens) || 0,
       outputTokens: Number(a.output_tokens) || 0,
+      // Anthropic counts thinking inside output_tokens — surface
+      // reasoning_tokens if CC ever emits the attribute, but DON'T
+      // add it to cost (would double-count against output_tokens).
+      reasoningTokens: Number(a.reasoning_tokens) || 0,
       cacheTokens: Number(a.cache_read_tokens) || 0,
       cacheCreationTokens: Number(a.cache_creation_tokens) || 0,
       cost: parseFloat(a.cost_usd) || 0,
@@ -312,6 +316,10 @@ function sess_parseCodexOTel(rows, conversationIds) {
     }
     var inputTok = Number(a.input_token_count) || 0;
     var outputTok = Number(a.output_token_count) || 0;
+    // OpenAI's o-series reports reasoning_token_count as a SEPARATE
+    // bucket from output_token_count, and bills it at the output
+    // rate. Include it in cost so the dashboard matches the bill.
+    var reasoningTok = Number(a.reasoning_token_count) || 0;
     var model = a.model || '';
     var price = sess_lookupPrice(model);
     calls.push({
@@ -319,9 +327,10 @@ function sess_parseCodexOTel(rows, conversationIds) {
       model: model,
       inputTokens: inputTok,
       outputTokens: outputTok,
+      reasoningTokens: reasoningTok,
       cacheTokens: Number(a.cached_token_count) || 0,
       cacheCreationTokens: 0,
-      cost: inputTok * price.input / 1000000 + outputTok * price.output / 1000000,
+      cost: inputTok * price.input / 1000000 + (outputTok + reasoningTok) * price.output / 1000000,
       durationMs: parseFloat(a.duration_ms) || 0,
     });
   }

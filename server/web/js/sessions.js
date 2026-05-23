@@ -340,6 +340,10 @@ async function sess_loadDetail(sessionId, agentSource) {
     }
   } else if (agentSource === 'openclaw') {
     // OpenClaw: usage + duration data is already in tma1_messages (parsed from JSONL transcript).
+    // OpenClaw fronts Anthropic models, which fold thinking tokens
+    // into output_tokens — surface reasoning_tokens when present
+    // (some upstream channels do split them out) but don't add to
+    // cost or it would double-count.
     for (var oi = 0; oi < messages.length; oi++) {
       var om = messages[oi];
       if (om.message_type !== 'assistant') continue;
@@ -348,10 +352,12 @@ async function sess_loadDetail(sessionId, agentSource) {
       if (oIn === 0 && oOut === 0) continue;
       var oCacheR = Number(om.cache_read_tokens) || 0;
       var oCacheW = Number(om.cache_creation_tokens) || 0;
+      var oReasoning = Number(om.reasoning_tokens) || 0;
       var oPrice = sess_lookupPrice(om.model);
       apiCalls.push({
         ts: tsToMs(om.ts), model: om.model || '',
         inputTokens: oIn, outputTokens: oOut,
+        reasoningTokens: oReasoning,
         cacheTokens: oCacheR, cacheCreationTokens: oCacheW,
         cost: oIn * oPrice.input / 1000000 + oOut * oPrice.output / 1000000,
         durationMs: Number(om.duration_ms) || 0, toolUseIds: [],
@@ -372,10 +378,15 @@ async function sess_loadDetail(sessionId, agentSource) {
         if (inTok === 0 && outTok === 0) continue;
         var cacheRead = Number(um.cache_read_tokens) || 0;
         var cacheCreate = Number(um.cache_creation_tokens) || 0;
+        // Anthropic counts thinking inside output_tokens already.
+        // Surface reasoning_tokens for display when the row carries
+        // it, but don't add to cost — that's already in outTok.
+        var reasoningTok = Number(um.reasoning_tokens) || 0;
         var mPrice = sess_lookupPrice(um.model);
         apiCalls.push({
           ts: tsToMs(um.ts), model: um.model || '',
           inputTokens: inTok, outputTokens: outTok,
+          reasoningTokens: reasoningTok,
           cacheTokens: cacheRead, cacheCreationTokens: cacheCreate,
           cost: inTok * mPrice.input / 1000000 + outTok * mPrice.output / 1000000,
           durationMs: 0, toolUseIds: [],
