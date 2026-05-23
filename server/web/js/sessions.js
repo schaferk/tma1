@@ -30,8 +30,15 @@ function ganttColor(toolName) {
 
 async function sess_loadCards() {
   var iv = intervalSQL();
+  // Filter out "ghost" sessions that only fired infrastructure events
+  // (e.g., SessionEnd from plugin-install subprocesses). A real session
+  // must have at least one UserPromptSubmit or PreToolUse.
+  var realSessionWhere =
+    "ts > NOW() - INTERVAL '" + iv + "' " +
+    "GROUP BY session_id " +
+    "HAVING SUM(CASE WHEN event_type IN ('UserPromptSubmit','PreToolUse') THEN 1 ELSE 0 END) > 0";
   var results = await Promise.all([
-    query("SELECT COUNT(DISTINCT session_id) AS v FROM tma1_hook_events WHERE ts > NOW() - INTERVAL '" + iv + "'"),
+    query("SELECT COUNT(*) AS v FROM (SELECT session_id FROM tma1_hook_events WHERE " + realSessionWhere + ") t"),
     query("SELECT COUNT(*) AS v FROM tma1_hook_events WHERE event_type = 'PreToolUse' AND ts > NOW() - INTERVAL '" + iv + "'"),
     query("SELECT COUNT(*) AS v FROM tma1_hook_events WHERE event_type = 'SubagentStart' AND ts > NOW() - INTERVAL '" + iv + "'"),
   ]);
@@ -49,8 +56,8 @@ async function sess_loadCards() {
       // Two-step: fetch active session IDs (capped) then aggregate with a literal IN list,
       // avoiding GreptimeDB subquery planner memory issues (cf. prompts.js pr_sourceSessionIDs).
       var idsRes = await query(
-        "SELECT session_id FROM tma1_hook_events WHERE ts > NOW() - INTERVAL '" + iv +
-        "' GROUP BY session_id ORDER BY MAX(ts) DESC LIMIT 500"
+        "SELECT session_id FROM tma1_hook_events WHERE " + realSessionWhere +
+        " ORDER BY MAX(ts) DESC LIMIT 500"
       );
       var idRows = rowsToObjects(idsRes);
       if (idRows.length === 0) return total > 0;
@@ -93,7 +100,9 @@ async function sess_loadList() {
   }
   var idsRes = await query(
     "SELECT session_id FROM tma1_hook_events WHERE " + activeWhere +
-    " GROUP BY session_id ORDER BY MAX(ts) DESC LIMIT 500"
+    " GROUP BY session_id " +
+    " HAVING SUM(CASE WHEN event_type IN ('UserPromptSubmit','PreToolUse') THEN 1 ELSE 0 END) > 0" +
+    " ORDER BY MAX(ts) DESC LIMIT 500"
   );
   var idRows = rowsToObjects(idsRes);
 
