@@ -96,6 +96,25 @@ func NewDetector(httpPort int, logger *slog.Logger) *Detector {
 //     re-run every SQL
 //   - Per-session "emit history" so the Suppression layer can decide
 //     whether a candidate anomaly is worth re-telling the agent
+//
+// IMPORTANT: Detect is NON-IDEMPOTENT. Every call:
+//   - Advances per-rule suppression state (`LastEmittedAt = now`)
+//   - INSERTs a row into tma1_anomaly_emits
+//   - Consumes the 10-minute silence window for any kept anomaly
+//
+// Only call Detect from PUSH-CHANNEL paths (hook handlers driving
+// UserPromptSubmit / Stop / PreCompact / etc.). Pull-channel paths
+// must use one of two side-effect-free alternatives, picked by intent:
+//   - Current active anomalies ("what would the next hook surface?") →
+//     DetectPreview. Runs the rules + resolvers but never writes
+//     sessHistory or the emit log. Used by MCP `get_anomalies`.
+//   - Past emitted history ("what has been told to agents already?") →
+//     Bundler.ListEmittedAnomalies. Reads tma1_anomaly_emits directly.
+//     Used by the dashboard `/api/anomalies` endpoint.
+//
+// Calling Detect from a pull path consumes suppression silently and
+// weakens the next real Stop block — that's the bug both alternatives
+// exist to prevent.
 func (d *Detector) Detect(ctx context.Context, sessionID string) []Anomaly {
 	if strings.TrimSpace(sessionID) == "" {
 		return nil
@@ -174,6 +193,85 @@ func (d *Detector) DetectByChannel(ctx context.Context, sessionID, channel strin
 // invalidations so suppression survives a cache wipe.
 func (d *Detector) Invalidate(sessionID string) {
 	d.cache.invalidate(sessionID)
+}
+
+// DetectPreview returns the anomalies a push-channel Detect() WOULD
+// surface right now, without mutating any state. Use this from
+// pull-channel paths (MCP get_anomalies) where calling Detect() would
+// silently consume the 10-minute suppression window and weaken the
+// very next real Stop block.
+//
+// Differences vs Detect:
+//   - No 30s result cache lookup: each call re-runs the rules. Pull
+//     paths are LLM-initiated and infrequent — caching would confuse
+//     the "current state" semantics for the agent.
+//   - Suppression decisions are read-only (sessHistory is read but not
+//     written). EmitCount and LastEmittedAt are never advanced.
+//   - No emit log row is INSERTed into tma1_anomaly_emits.
+//   - Returned anomalies carry FirstEmittedAt ONLY when the key has
+//     existing emit history; fresh candidates leave it zero so the
+//     consumer can tell "agent has been told about this before" from
+//     "agent has not seen this yet".
+//
+// Resolvers run as part of the preview (they're pure SQL reads). A
+// resolved-since-last-emit candidate surfaces in the preview exactly
+// as it would surface to the next real Detect.
+func (d *Detector) DetectPreview(ctx context.Context, sessionID string) ([]Anomaly, error) {
+	if strings.TrimSpace(sessionID) == "" {
+		return nil, nil
+	}
+
+	type ruleResult struct {
+		hits []Anomaly
+		err  error
+		name string
+	}
+	rules := d.rules()
+	resCh := make(chan ruleResult, len(rules))
+	var wg sync.WaitGroup
+	for name, rule := range rules {
+		wg.Add(1)
+		go func(name string, rule ruleFunc) {
+			defer wg.Done()
+			hits, err := rule(ctx, sessionID)
+			resCh <- ruleResult{hits: hits, err: err, name: name}
+		}(name, rule)
+	}
+	wg.Wait()
+	close(resCh)
+
+	var candidates []Anomaly
+	for r := range resCh {
+		if r.err != nil {
+			d.logger.Debug("anomaly rule failed (preview)", "rule", r.name, "session", sessionID, "err", r.err)
+			continue
+		}
+		candidates = append(candidates, r.hits...)
+	}
+	if len(candidates) == 0 {
+		return nil, nil
+	}
+
+	// Build resolved map exactly like suppressWithResolvers does, but
+	// route through the *Preview suppression so sessHistory stays
+	// untouched. Resolvers are SQL reads against tma1_hook_events; they
+	// don't write any state.
+	resolved := make(map[string]bool, len(candidates))
+	for _, a := range candidates {
+		key := a.stableKey()
+		st, ok := d.cache.lastEmittedFor(sessionID, key)
+		if !ok {
+			continue
+		}
+		r := d.resolverFor(a.Kind)
+		if r == nil {
+			continue
+		}
+		if r(ctx, sessionID, a, st.LastEmittedAt) {
+			resolved[key] = true
+		}
+	}
+	return d.cache.suppressWithResolutionPreview(sessionID, candidates, resolved), nil
 }
 
 type ruleFunc func(ctx context.Context, sessionID string) ([]Anomaly, error)
@@ -1100,12 +1198,69 @@ func (c *anomalyCache) lastEmittedFor(sessionID, key string) (emitState, bool) {
 	return st, ok
 }
 
+// suppressWithResolutionPreview applies the same per-key suppression
+// decision as suppressWithResolution, but is fully read-only:
+//   - sessHistory entries are inspected but NEVER written.
+//   - eviction is skipped (eviction would also be a mutation).
+//   - the returned slice has FirstEmittedAt populated from existing
+//     history where present; otherwise zero. The preview path never
+//     materialises a new emit timestamp.
+//
+// This is the path pull-channel callers (MCP get_anomalies, dashboards
+// that need "what would the next hook see") MUST use. Calling
+// suppressWithResolution from a pull path advances LastEmittedAt for
+// the agent's benefit and silently consumes the 10-minute window,
+// weakening the very next push-channel Stop block.
+func (c *anomalyCache) suppressWithResolutionPreview(sessionID string, candidates []Anomaly, resolved map[string]bool) []Anomaly {
+	if len(candidates) == 0 {
+		return candidates
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	// nil-map reads are safe; sessHistory absence simply means no key was
+	// ever emitted for this session.
+	sessHistory := c.history[sessionID]
+
+	now := time.Now()
+	kept := make([]Anomaly, 0, len(candidates))
+	for _, a := range candidates {
+		key := a.stableKey()
+		st, seen := sessHistory[key]
+		if seen && resolved[key] {
+			// Mirror real suppression: a resolved key behaves as if never
+			// emitted — agent should see it again right away.
+			st = emitState{}
+			seen = false
+		}
+		if seen && now.Sub(st.LastEmittedAt) < suppressionWindow {
+			continue
+		}
+		// Surface the prior FirstEmittedAt when this anomaly already has
+		// emit history — consumers reading "outstanding since X" should
+		// still see the original surfacing time. Fresh anomalies leave
+		// FirstEmittedAt zero; the preview path deliberately does NOT
+		// invent a new emit moment.
+		if seen {
+			a.FirstEmittedAt = st.FirstEmittedAt
+		}
+		kept = append(kept, a)
+	}
+	return kept
+}
+
 // suppressWithResolution is the full suppression decision: like suppress,
 // but a `resolved[stableKey]` entry skips the silence window and resets
 // the emit state so the anomaly re-emits with a fresh FirstEmittedAt.
 //
 // resolved == nil collapses to the original suppression behaviour, which
 // keeps callers that don't have rule-specific resolvers unchanged.
+//
+// NOTE: this MUTATES sessHistory (records LastEmittedAt = now and bumps
+// EmitCount) and triggers eviction. Only push-channel callers (real
+// hooks invoking Detector.Detect) should reach this. Pull-channel
+// callers (MCP get_anomalies, dashboard polls) MUST use
+// suppressWithResolutionPreview instead.
 func (c *anomalyCache) suppressWithResolution(sessionID string, candidates []Anomaly, resolved map[string]bool) []Anomaly {
 	if len(candidates) == 0 {
 		return candidates

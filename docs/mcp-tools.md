@@ -108,17 +108,36 @@ command, and where the test files live.
 
 ## get_peer_sessions
 
-Recent sessions on the same project from peer coding agents (Codex,
-OpenClaw, Copilot CLI). The caller is assumed to be Claude Code;
-`claude_code` is excluded from the result set.
+Recent sessions on the same project from peer coding agents (Claude
+Code, Codex, OpenClaw, Copilot CLI).
+
+**Caller-aware exclusion.** The calling agent is identified by the
+`TMA1_MCP_CALLER` env var (set by each adapter's installer:
+`claude_code`, `codex`, etc.) and is automatically excluded from
+results — Codex calling with empty `agent_source` sees the other three
+peers; Claude Code sees the other three. The explicit-agent path also
+rejects requests where `agent_source == TMA1_MCP_CALLER` to prevent
+echo chambers via the slash command.
 
 | Arg | Type | Default | Description |
 |-----|------|---------|-------------|
-| `agent_source` | string | "" (all peers) | `codex` / `openclaw` / `copilot_cli` |
-| `project` | string | derived from cwd | Absolute path = prefix match; bare name = legacy basename LIKE |
-| `limit` | integer | 1 | Sessions per agent (1-5). With empty `agent_source`, applied per peer agent, not globally |
-| `message_limit` | integer | 20 | Messages per session (1-100) |
+| `agent_source` | string | "" (all peers except caller) | `claude_code` / `codex` / `openclaw` / `copilot_cli`. Aliases accepted: `cc` / `claude` → `claude_code`, `copilot` → `copilot_cli` |
+| `project` | string | derived from cwd | POSIX absolute (`/foo/bar`) or Windows absolute (`C:\foo`, `C:/foo`, `\\server\share`) = prefix match. Bare name = legacy basename LIKE, matched against either separator style |
+| `limit` | integer | 1 | Sessions per agent, clamped to `[1, 5]`. With empty `agent_source`, applied per peer agent, not globally |
+| `message_limit` | integer | 20 | Messages per session, clamped to `[1, 100]` |
 | `since_min` | integer | 1440 | Lookback window in minutes (default 24h) |
+
+### Response shape
+
+| Field | Type | Notes |
+|-------|------|-------|
+| `project` | string | Resolved project root used for scoping |
+| `agent_filter` | string | Echoes the normalized `agent_source` argument |
+| `count` | integer | Length of `sessions` |
+| `sessions` | array | Per-session metadata + messages, most-recent first |
+| `most_recent_session` | object | Top-level shortcut: `agent_source`, `session_id`, `last_activity_at`, `last_activity_ago` for the freshest session. Present when `count > 0` |
+| `partial_failures` | object | `agent → error` map. Present **only** when the all-peers fan-out hit a per-agent SQL error. Consumers must read this before treating empty `sessions` as "no activity" |
+| `note` | string | Present only when `sessions` is empty and `partial_failures` is absent — "no peer sessions found for this project in the time window" |
 
 The slash command `/tma1-peer [agent] [count]` is a thin wrapper around
 this tool. See `claude-plugin/skills/tma1-peer/SKILL.md` for the full

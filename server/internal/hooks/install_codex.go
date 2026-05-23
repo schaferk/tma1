@@ -152,11 +152,12 @@ func (i *CodexInstaller) Install() (InstallReport, error) {
 	// AGENTS.md block so a project with both adapters installed gets
 	// one block, not two).
 	if i.ProjectDir != "" {
-		// Codex reads AGENTS.md as its primary instructions file (it
-		// pre-dates CLAUDE.md in the AGENTS.md convention and is the
-		// name Codex actually scans for). When a project has only
-		// CLAUDE.md, the shared chooser falls back to it so the
-		// instructions still land somewhere readable.
+		// Codex's primary instructions file is AGENTS.md. The shared
+		// chooser (chooseInstructionsFile) creates AGENTS.md if it
+		// doesn't exist — there is deliberately NO fallback to
+		// CLAUDE.md, because Codex doesn't scan CLAUDE.md and the
+		// block would be invisible there. See
+		// install_shared.go::chooseInstructionsFile for the full rule.
 		instrPath, changed, err := installInstructions(i, i.ProjectDir, "AGENTS.md")
 		if err != nil {
 			errs = append(errs, fmt.Errorf("instructions: %w", err))

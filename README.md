@@ -1,259 +1,293 @@
 # TMA1
 
-> *"Your agent runs. TMA1 remembers."*
+> A monolith for your agent's loop. Silent until it talks back.
 
-Local-first observability for AI agents, with a built-in dashboard.
-See what your agents cost, how long they take, and whether they're doing anything weird. All data stays on your machine.
-One binary, no cloud account, no Docker, no Grafana.
+TMA1 is local-first observability for LLM agents, powered by GreptimeDB.
+It records every LLM call on your machine, then routes what it sees back
+into the agent's next turn through hooks and MCP tools.
 
-Named after TMA-1 (Tycho Magnetic Anomaly-1) from *2001: A Space Odyssey*:
-the monolith buried on the moon, silently recording everything until you dig it out.
+One binary. No Docker. No Grafana. No cloud account.
 
 ![TMA1 Dashboard](site/public/screenshots/hero-dark.webp)
 
-## What's in it
+The name comes from TMA-1 (Tycho Magnetic Anomaly-1) in *2001: A Space
+Odyssey*: the monolith buried on the moon, silently recording everything
+until you dig it out.
 
-Six dashboard views, picked automatically from whatever data shows up:
+## What TMA1 Does
 
-| View | Tabs | Data Source |
-|------|------|-------------|
-| **Claude Code** | Overview, Tools, Cost, Anomalies, Sessions→ | OTel metrics + logs |
-| **Codex** | Overview, Tools, Cost, Anomalies, Sessions→ | OTel logs + metrics |
-| **Copilot CLI** | Overview, Tools, Cost, Sessions→ | JSONL transcripts (`~/.copilot/session-state/`) |
-| **OpenClaw** | Overview, Sessions, Traces, Cost, Security | OTel traces + metrics |
-| **OTel GenAI** | Overview, Traces, Cost, Security, Search | OTel traces (gen_ai semantic conventions) |
-| **Sessions** | Sessions, Search | Hooks + JSONL transcripts (Claude Code, Codex, Copilot CLI) |
-| **Prompts** | Overview, Prompts, Patterns | Heuristic scoring + optional LLM-as-judge |
+TMA1 has two jobs:
 
-Sessions→ links in Claude Code, Codex, and Copilot CLI views navigate to the unified Sessions view.
+1. Show the human what happened.
+2. Tell the agent what it should notice before the next step.
 
-Each view gives you:
-- Token counts, cost, and burn rate per model
-- p50/p95 latency per model
-- Activity heatmap over time
-- Anomalies tab that flags expensive requests, errors, and slow tools
-- Session replay with full conversation timeline
-- Search across all sessions by keyword
-- Prompt evaluation with heuristic scoring and optional LLM-as-judge
-- SQL access on port 14002, or the built-in query API
-- Settings panel to configure LLM API key and server options at runtime
+The dashboard gives you token usage, cost, latency, tool activity, full
+conversation replay, anomaly history, prompt evaluation, and SQL access to
+the underlying data.
 
-OpenClaw and OTel GenAI views also have a Security tab (shell commands, prompt injection, webhook errors).
+The agent loop gives Claude Code and Codex a compact `<tma1-context>` block
+before each turn, can block `Stop` when a HIGH-severity issue is still
+unresolved, and exposes seven MCP tools the agent can call on demand.
 
-## Closing the agent loop
+## Supported Sources
 
-Observability is one half; the other half is feeding what TMA1 sees back into the agent's reasoning loop so it can do better work next turn. v2 ships two channels for this:
+| Source | How TMA1 reads it | What you get |
+|--------|-------------------|--------------|
+| Claude Code | OTel metrics/logs/traces, hooks, JSONL transcripts | Cost, tools, traces, sessions, anomalies, injected context |
+| Codex | OTel logs/metrics, hooks, JSONL sessions | Cost, tools, sessions, anomalies, injected context |
+| Copilot CLI | JSONL sessions from `~/.copilot/session-state/` | Sessions, tools, cost where available |
+| OpenClaw | OTel traces/metrics, JSONL sessions | Traces, cost, sessions, security signals |
+| Any GenAI app | OTel traces using GenAI semantic conventions | Traces, latency, cost aggregation |
 
-**Push channel — hooks inject context into the agent's prompt stream.** Five hook events are wired to TMA1 — `UserPromptSubmit` prepends a session digest before each turn, `SessionStart` orients a fresh session with prior state and external changes, `PreCompact` carries critical state through context compaction, `PostToolUse` appends per-tool anomaly notes when needed, and `Stop` blocks termination on unresolved high-severity issues. **Claude Code** (`tma1-server install --adapter claude-code`) wires all five into `~/.claude/settings.json`. **Codex** (`tma1-server install --adapter codex`) wires the four that exist in Codex's hook catalogue — `PreCompact` is CC-only — into `~/.codex/hooks.json`. Reverse with `tma1-server uninstall --adapter <name>` whenever you want to back out — surgical removal of hooks, MCP entry, skills, and the `<!-- tma1:start -->` block; user-owned siblings stay intact. The hook script is request–response: it POSTs the event, and whatever the server returns becomes the injection content (raw stdout for CC; wrapped in Codex's `hookSpecificOutput.additionalContext` shape for Codex). Fail-safe: 500 ms client timeout on Unix and 1 s on Windows — both sit above the server-side `hookInjectionTimeout = 300 ms` cap, so a slow path falls back to empty stdout. The agent never blocks on TMA1.
+All data is stored locally under `~/.tma1/`.
 
-**Pull channel — seven MCP stdio tools the agent can call on demand.** `get_context_bundle` is the aggregate entry point; `get_session_state` returns the full action history; `get_anomalies` lists currently-active issues; `get_external_changes` shows what changed on disk outside the agent; `get_build_status` reports the last build watcher state; `get_project_state` is the static index of the project's structure; `get_peer_sessions` lets one agent read recent sessions from the other agents on the same project (Claude Code ↔ Codex ↔ OpenClaw ↔ Copilot CLI — symmetric). The MCP server is registered in each agent's own config (`~/.claude.json` for CC, `~/.codex/config.toml` `[mcp_servers.tma1]` for Codex) by the adapter installer.
+## Install
 
-**Anomaly engine.** Six rules run on every Detect, with a per-session 10-minute suppression layer plus resolution checks (e.g. R-stale-view auto-clears when the agent re-reads the modified file). Each anomaly routes to a specific channel — `stop_block` for HIGH-severity build/test issues, `user_prompt_submit` for stale views and human-modified-during-session — so the same finding never injects twice. Three validation gates ship: `/api/anomalies/budget` (≤ 5 emits/kind/day target), `/api/anomalies/follow-rate` (≥ 30% target), and offline precision via the `tma1_anomaly_emits` table.
-
-**Cross-agent collaboration.** Inside Claude Code, `/tma1-peer codex` pulls Codex's most recent session content on the current project and feeds it directly into Claude's context — no copy-paste between terminals. `/tma1-peer copilot 2` works the same way for Copilot CLI; `/tma1-peer` alone returns the latest session from every peer agent.
-
-Setup is one command per agent — both are idempotent:
+macOS / Linux:
 
 ```bash
-# Claude Code: writes hooks + MCP + /tma1-peer skill + CLAUDE.md/AGENTS.md block.
-curl -fsSL https://tma1.ai/install.sh | TMA1_ADAPTER=claude-code bash
-
-# Codex: writes hooks + MCP + tma1-peer skill + AGENTS.md block in Codex's
-# native config shape (~/.codex/hooks.json, ~/.codex/config.toml,
-# ~/.agents/skills/tma1-peer/).
-curl -fsSL https://tma1.ai/install.sh | TMA1_ADAPTER=codex bash
+curl -fsSL https://tma1.ai/install.sh | bash
 ```
 
-Stale-sweep is scoped to a `tma1-` owner prefix on both adapters, so personal skills + commands sitting alongside ours in `~/.claude/{skills,commands}/` or `~/.agents/skills/` are never touched. Re-running install only updates files that drifted.
+Windows PowerShell:
 
-See [docs/mcp-tools.md](docs/mcp-tools.md), [docs/hooks.md](docs/hooks.md), and [docs/anomalies.md](docs/anomalies.md) for the deeper reference.
-
-![Session Detail](site/public/screenshots/sessions-dark.webp)
-
-![Cost & Burn Rate](site/public/screenshots/cost-dark.webp)
-
-## Quick Install
-
-```bash
-# macOS / Linux
-curl -fsSL https://tma1.ai/install.sh | bash
-
-# Windows (PowerShell)
+```powershell
 irm https://tma1.ai/install.ps1 | iex
 ```
 
-To wire TMA1 into Claude Code (hooks + MCP server + `/tma1-peer` skill) in the same step:
+Start the server:
 
 ```bash
-# macOS / Linux
-curl -fsSL https://tma1.ai/install.sh | TMA1_ADAPTER=claude-code bash
-
-# Windows
-$env:TMA1_ADAPTER = 'claude-code'; irm https://tma1.ai/install.ps1 | iex
-```
-
-Or build from source:
-
-```bash
-git clone https://github.com/tma1-ai/tma1.git
-cd tma1
-make build
-```
-
-## Agent Install
-
-Ask your agent:
-
-> Read https://tma1.ai/SKILL.md and follow the instructions to install and configure TMA1 for your AI agent
-
-## Quick Start
-
-```bash
-# Start TMA1
 tma1-server
+```
 
-# Configure your agent to send OTel data (protobuf required):
+Open the dashboard:
 
-# Claude Code — add to ~/.claude/settings.json:
-#   "env": {
-#     "OTEL_EXPORTER_OTLP_ENDPOINT": "http://localhost:14318/v1/otlp",
-#     "OTEL_EXPORTER_OTLP_PROTOCOL": "http/protobuf",
-#     "OTEL_METRICS_EXPORTER": "otlp",
-#     "OTEL_LOGS_EXPORTER": "otlp"
-#   }
-
-# OpenClaw (sends traces)
-openclaw config set diagnostics.otel.endpoint http://localhost:14318/v1/otlp
-
-# GitHub Copilot CLI — zero config!
-# TMA1 auto-discovers session data from ~/.copilot/session-state/
-# Just start tma1-server and use Copilot CLI as usual.
-
-# Codex — add to ~/.codex/config.toml:
-#   [otel]
-#   log_user_prompt = true
-#
-#   [otel.exporter.otlp-http]
-#   endpoint = "http://localhost:14318/v1/logs"
-#   protocol = "binary"
-#
-#   [otel.trace_exporter.otlp-http]
-#   endpoint = "http://localhost:14318/v1/traces"
-#   protocol = "binary"
-#
-#   [otel.metrics_exporter.otlp-http]
-#   endpoint = "http://localhost:14318/v1/metrics"
-#   protocol = "binary"
-#
-#   Then restart Codex.
-
-# Any OTel SDK
-OTEL_EXPORTER_OTLP_ENDPOINT=http://localhost:14318/v1/otlp \
-OTEL_EXPORTER_OTLP_PROTOCOL=http/protobuf \
-your-agent
-
-# Open the dashboard
+```bash
 open http://localhost:14318
 ```
 
-## How It Works
+On first start, TMA1 writes a GreptimeDB config into `~/.tma1/config/`,
+downloads the GreptimeDB binary if needed, starts it as a child process, and
+serves the dashboard from the same `tma1-server` process.
 
-```
-Agent (Claude Code / Codex / Copilot CLI / OpenClaw / any GenAI app)
-    │  OTLP/HTTP + JSONL transcripts
-    ▼
-tma1-server  (port 14318)
-    │  receives + stores OTel data
-    │  watches JSONL session files
-    │  derives per-minute aggregations
-    │  serves dashboard UI
-    ▼
-Browser dashboard (embedded in the binary)
+## Wire An Agent
+
+The easiest path is to let the agent read the setup skill:
+
+```text
+Read https://tma1.ai/SKILL.md and follow the instructions to install or upgrade TMA1 for your AI agent
 ```
 
-One process, one binary. First start creates `~/.tma1/` and you're good to go. By default, nothing leaves your machine. If you enable optional LLM prompt evaluation (via Settings or `TMA1_LLM_API_KEY`), prompt content is sent to the configured provider (Anthropic/OpenAI) for scoring.
+To wire adapters during install:
 
-Settings configured in the dashboard are saved to `~/.tma1/settings.json`. Environment variables always take priority over the settings file.
+```bash
+# Claude Code
+curl -fsSL https://tma1.ai/install.sh | TMA1_ADAPTER=claude-code bash
+
+# Codex
+curl -fsSL https://tma1.ai/install.sh | TMA1_ADAPTER=codex bash
+
+# Both
+curl -fsSL https://tma1.ai/install.sh | TMA1_ADAPTER=all bash
+```
+
+The curl installer writes global files only: hook scripts, MCP config, and
+the `/tma1-peer` skill. It does not edit project-local `AGENTS.md` or
+`CLAUDE.md`, because curl-pipe can run from any directory.
+
+To seed project-local instructions, run from the project root:
+
+```bash
+tma1-server install --adapter claude-code --project .
+tma1-server install --adapter codex --project .
+```
+
+Uninstall adapter wiring:
+
+```bash
+tma1-server uninstall --adapter claude-code --project .
+tma1-server uninstall --adapter codex --project .
+```
+
+## Closing The Agent Loop
+
+TMA1 pushes and pulls context.
+
+**Hooks push context into the next agent turn.**
+
+Claude Code gets five injection events: `SessionStart`, `UserPromptSubmit`,
+`PostToolUse`, `Stop`, and `PreCompact`. Codex gets the four it supports;
+Codex has no `PreCompact` hook.
+
+The hook script POSTs to `http://127.0.0.1:14318/api/hooks`. The response
+body becomes agent context. If TMA1 is down or slow, the hook returns empty
+stdout and lets the agent continue.
+
+**MCP lets the agent ask for context on demand.**
+
+The MCP server is the same binary:
+
+```bash
+tma1-server mcp-serve
+```
+
+It exposes:
+
+| Tool | Purpose |
+|------|---------|
+| `get_context_bundle` | One compact view of session state, anomalies, build status, external changes, and project structure |
+| `get_session_state` | Tool history, token totals, current focus, recent files |
+| `get_anomalies` | Active anomalies for the session |
+| `get_build_status` | Last captured build/dev output |
+| `get_external_changes` | Files changed outside the agent loop |
+| `get_project_state` | Cached project language, build system, key files, top-level dirs |
+| `get_peer_sessions` | Recent work left by peer agents on the same project |
+
+`/tma1-peer codex` is a thin skill wrapper around `get_peer_sessions`: it
+lets Claude Code read what Codex just did on the same project, verbatim. The
+Codex-side skill works the other direction.
+
+## How It Fits Together
+
+```text
+Agent -- OTLP/HTTP --+
+       -- /api/hooks +--> tma1-server (port 14318)
+       -- MCP stdio --+        |
+                              v
+                        GreptimeDB (port 14000)
+                              |
+                              v
+                        Embedded dashboard
+```
+
+TMA1 reverse-proxies OTLP to GreptimeDB, ingests hook events and JSONL
+transcripts, runs the perception layer, stores everything in GreptimeDB, and
+serves the dashboard.
+
+Traces, metrics, and logs are kept as queryable data. Session data and
+anomaly emits live in `tma1_*` tables. You can query through the dashboard,
+the HTTP SQL API, or MySQL protocol on port `14002`.
+
+## Build Sensor
+
+Use the build wrapper when you want TMA1 to capture dev/test output and feed
+fresh failures back to the agent:
+
+```bash
+tma1 build --tag npm -- npm run dev
+tma1 build --watch --tag test -- make test
+tma1 build --filter-regex '^error|FAIL' -- pytest -v
+```
+
+The build sensor writes to `tma1_build_events`. Anomaly rules
+(`repeated_failed_build`, `build_broken_after_my_edit`) read this table
+to tell the agent to stop retrying the same failing command and fix the
+current error first.
+
+Supported flags:
+
+| Flag | Purpose |
+|------|---------|
+| `--watch` | Re-run the wrapped command when files change |
+| `--debounce DUR` | Coalesce filesystem events while watching (default `2s`) |
+| `--tag NAME` | Tag this build run so the dashboard can group it (e.g. `npm`, `pytest`) |
+| `--filter-regex PAT` | Only capture lines matching the pattern |
+| `--filter-invert` | Invert the filter — capture lines NOT matching the pattern |
+| `--no-color` | Strip ANSI color codes from captured output |
+| `--project DIR` | Override the project directory used for scoping (default: cwd) |
 
 ## OTLP Endpoints
 
-Agents send OTLP data to tma1-server:
+Use the wildcard endpoint when the agent or SDK supports it:
 
 ```text
-http://localhost:14318/v1/otlp          # Wildcard OTLP (recommended)
-http://localhost:14318/v1/traces        # Direct signal: traces
-http://localhost:14318/v1/metrics       # Direct signal: metrics
-http://localhost:14318/v1/logs          # Direct signal: logs
+http://localhost:14318/v1/otlp
 ```
 
-Codex requires separate per-signal endpoints; other agents can use the single `/v1/otlp` base.
+Direct signal endpoints are also accepted:
 
-## API Endpoints
+```text
+http://localhost:14318/v1/traces
+http://localhost:14318/v1/metrics
+http://localhost:14318/v1/logs
+```
 
-| Endpoint | Method | Description |
-|----------|--------|-------------|
-| `/health` | GET | Liveness check |
-| `/status` | GET | Backend reachability |
-| `/api/query` | POST | SQL proxy (`{"sql": "SELECT ..."}`) |
-| `/api/prom/*` | GET/POST | Prometheus API proxy (PromQL) |
-| `/api/evaluate` | GET/POST | LLM prompt evaluation (availability check / single prompt) |
-| `/api/evaluate/summary` | POST | LLM batch summary (sampled prompts) |
-| `/api/settings` | GET/POST | Read/write server settings (LLM config, log level, TTL) |
-| `/api/hooks` | POST | Hook event ingest from agent adapters (Claude Code) — request-response, returns injection content |
-| `/api/hooks/stream` | GET | SSE feed of hook events for the live agent canvas |
-| `/api/anomalies` | GET | Recent anomalies across sessions (`?session_id=` to scope) |
-| `/api/anomalies/budget` | GET | Daily emit count per Kind. 1.7 gate: ≤ 5 / Kind / day |
-| `/api/anomalies/follow-rate` | GET | Did the agent take the suggested action within N tool calls? 1.7 gate: ≥ 30% |
+Codex commonly uses separate per-signal endpoints; most OTel SDKs can use
+the single `/v1/otlp` base.
 
 ## Configuration
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `TMA1_HOST` | `127.0.0.1` | Address tma1-server binds to |
-| `TMA1_PORT` | `14318` | HTTP port for tma1-server |
-| `TMA1_DATA_DIR` | `~/.tma1` | Local data and binary directory |
-| `TMA1_GREPTIMEDB_VERSION` | `latest` | GreptimeDB version to download |
-| `TMA1_GREPTIMEDB_HTTP_PORT` | `14000` | GreptimeDB HTTP API + OTLP port |
+| `TMA1_HOST` | `127.0.0.1` | Address `tma1-server` binds to |
+| `TMA1_PORT` | `14318` | HTTP port for `tma1-server` |
+| `TMA1_DATA_DIR` | `~/.tma1` | Data, config, and binary directory |
+| `TMA1_GREPTIMEDB_VERSION` | `latest` | GreptimeDB version to install |
+| `TMA1_GREPTIMEDB_HTTP_PORT` | `14000` | GreptimeDB HTTP and OTLP port |
 | `TMA1_GREPTIMEDB_GRPC_PORT` | `14001` | GreptimeDB gRPC port |
 | `TMA1_GREPTIMEDB_MYSQL_PORT` | `14002` | GreptimeDB MySQL protocol port |
-| `TMA1_LOG_LEVEL` | `info` | Log level: debug/info/warn/error |
+| `TMA1_LOG_LEVEL` | `info` | `debug`, `info`, `warn`, or `error` |
 | `TMA1_DATA_TTL` | `60d` | Default TTL for auto-created tables |
-| `TMA1_LLM_API_KEY` | (empty) | API key for LLM provider (enables prompt evaluation) |
-| `TMA1_LLM_PROVIDER` | `anthropic` | LLM provider: `anthropic` or `openai` |
-| `TMA1_LLM_MODEL` | (auto) | Model override for LLM evaluation |
-| `TMA1_ADAPTER` | (empty) | Set during install to wire an agent (`claude-code`). Idempotent. |
-| `TMA1_DISABLE_INJECTION` | (unset) | When `1`, hook handlers return empty bodies — agent runs without TMA1's push channel |
-| `TMA1_CONTEXT_PRESSURE_THRESHOLD` | `100000` | Token threshold for the `context_pressure` anomaly (default ≈ 50% of Sonnet's 200k window) |
+| `TMA1_LLM_API_KEY` | empty | API key for optional prompt evaluation |
+| `TMA1_LLM_PROVIDER` | `anthropic` | `anthropic` or `openai` |
+| `TMA1_LLM_MODEL` | auto | Model override for prompt evaluation |
+| `TMA1_QUERY_CONCURRENCY` | `4` | Max concurrent SQL queries from the dashboard |
+| `TMA1_ADAPTER` | empty | Install-time adapter list: `claude-code`, `codex`, comma-separated, or `all` |
+| `TMA1_MCP_CALLER` | empty | Set by adapter installers so peer-session queries exclude the caller |
+| `TMA1_DISABLE_INJECTION` | unset | Set to `1` to record hooks but return no injected context |
+| `TMA1_ENABLE_FILE_CALLBACK` | unset | Set to `1` to write `.tma1-context.md` for non-MCP agents |
+| `TMA1_CONTEXT_PRESSURE_THRESHOLD` | `100000` | Input-token threshold for context-pressure anomalies |
+| `OPENCLAW_STATE_DIR` | `~/.openclaw` | Override the OpenClaw session directory |
+
+Settings changed in the dashboard are saved to `~/.tma1/settings.json`.
+Environment variables take priority.
 
 ## Development
 
 ```bash
-make build           # Build the binary → server/bin/tma1-server
-make build-linux     # Cross-compile for Linux amd64
-make build-windows   # Cross-compile for Windows amd64
-make vet             # Run go vet
-make lint            # Run golangci-lint (requires golangci-lint v2)
-make lint-js         # Run ESLint on dashboard JS (requires Node.js)
-make test            # Run tests with race detector
-make check           # Run all CI checks locally (vet + lint + test + lint-js)
-make install-hooks   # Install git pre-push hook that runs `make check`
-make clean           # Remove built binaries
+make build           # Build server/bin/tma1-server
 make run             # Build and run locally
-make dev             # Watch mode: rebuild + restart on file changes (requires fswatch)
+make dev             # Auto-rebuild and restart on server file changes (requires fswatch)
+make install         # Install dev build to ~/.tma1/bin
+make sync-plugin     # Mirror plugin skills/commands into embedded server files
+make vet             # go vet ./cmd/... ./internal/... ./web
+make lint            # golangci-lint v2
+make lint-js         # ESLint for dashboard JS
+make test            # go test -race -count=1
+make check           # vet + lint + test + lint-js
+make build-linux     # Cross-compile Linux amd64
+make build-windows   # Cross-compile Windows amd64
 ```
 
-### Pre-push hook
-
-Run CI's checks locally before every push:
+Build from source:
 
 ```bash
-go install github.com/golangci/golangci-lint/v2/cmd/golangci-lint@v2.11.3
-make install-hooks
+git clone https://github.com/tma1-ai/tma1.git
+cd tma1
+make build
+./server/bin/tma1-server
 ```
 
-This sets `core.hooksPath=.githooks`. On push, `.githooks/pre-push` runs `go vet`,
-`golangci-lint`, `go test`, and `eslint` (if `server/web/node_modules` exists).
-Bypass once with `GIT_PUSH_SKIP_HOOKS=1 git push`.
+CI also runs ShellCheck for `site/public/install.sh` and PSScriptAnalyzer
+for `site/public/install.ps1`.
+
+## Docs
+
+- [Architecture](docs/architecture.md): module layout, data flow, tables,
+  env vars, file index
+- [Hooks](docs/hooks.md): hook protocol, adapter registration, uninstall
+- [MCP tools](docs/mcp-tools.md): tool schemas and behavior
+- [Anomalies](docs/anomalies.md): rules, channels, suppression, validation
+
+## Explicitly Absent
+
+- No cloud service
+- No OTel Collector requirement
+- No Grafana dependency
+- No memory or RAG system
+- No multi-tenant mode
+- No authentication; TMA1 is a local-only tool
 
 ## License
 

@@ -57,7 +57,44 @@ func NewBundler(httpPort int, logger *slog.Logger) *Bundler {
 
 // Detector returns the bundler's anomaly detector. The handler layer needs
 // it directly to invalidate the cache when new hook events arrive.
+//
+// Pull-channel callers (MCP tools, dashboard polls) MUST NOT call
+// Detector.Detect — that mutates the suppression window and writes to
+// the emit log, which silently weakens the Stop-block guarantee for
+// the next hook. Use one of:
+//   - DetectPreview for "current active anomalies" (MCP get_anomalies)
+//   - ListEmittedAnomalies for "past emitted history" (dashboard
+//     /api/anomalies and any other history surface)
 func (b *Bundler) Detector() *Detector { return b.detector }
+
+// DetectPreview returns the current active anomaly set for sessionID
+// without consuming the suppression window. This is the read-only
+// counterpart to Detector.Detect — pull-channel MCP / dashboard
+// callers MUST use this instead.
+//
+// Semantically equivalent to "what would the next push-channel hook
+// surface right now". See Detector.DetectPreview for the full
+// behaviour contract.
+func (b *Bundler) DetectPreview(ctx context.Context, sessionID string) ([]Anomaly, error) {
+	if b == nil || b.detector == nil {
+		return nil, nil
+	}
+	return b.detector.DetectPreview(ctx, sessionID)
+}
+
+// ListEmittedAnomalies is the read-only path into the anomaly emit log
+// (tma1_anomaly_emits). Distinct from DetectPreview: this returns what
+// has ALREADY been emitted to agents, not what would surface next.
+// Useful for "show history" surfaces (dashboard's /api/anomalies).
+//
+// MCP get_anomalies must NOT use this — its semantic is current active,
+// not past emitted. Use DetectPreview there.
+func (b *Bundler) ListEmittedAnomalies(ctx context.Context, sessionID string, limit int) ([]Anomaly, error) {
+	if b == nil || b.detector == nil {
+		return nil, nil
+	}
+	return b.detector.ListEmittedAnomalies(ctx, sessionID, limit)
+}
 
 // BuildBundle assembles a bundle for the given session_id and/or cwd.
 //

@@ -7,19 +7,27 @@ interface Props {
 
 const { t } = Astro.props;
 const lang = t.lang;
-const onboardingCmd = 'Read https://tma1.ai/SKILL.md and follow the instructions to install and configure TMA1 for your AI agent';
+const onboardingCmd = 'Read https://tma1.ai/SKILL.md and follow the instructions to install or upgrade TMA1 for your AI agent';
 const curlCmd = 'curl -fsSL https://tma1.ai/install.sh | bash';
 const psCmd = 'irm https://tma1.ai/install.ps1 | iex';
 
-// Screenshot pairs for showcase rows (cards 01-06)
-const showcase = [
-  { dark: '/screenshots/cost-dark.webp', light: '/screenshots/cost-light.webp', w: 3024, h: 1704 },
-  { dark: '/screenshots/anomaly-dark.webp', light: '/screenshots/anomaly-light.webp', w: 3024, h: 1706 },
-  { video: '/screenshots/session-live.mp4', dark: '/screenshots/sessions-dark.webp', light: '/screenshots/sessions-light.webp', w: 3024, h: 1704 },
-  { dark: '/screenshots/tools-dark.webp', light: '/screenshots/tools-light.webp', w: 3010, h: 1706 },
-  { dark: '/screenshots/security-dark.webp', light: '/screenshots/security-light.webp', w: 3010, h: 1154 },
-  { dark: '/screenshots/search-dark.webp', light: '/screenshots/search-light.webp', w: 3024, h: 1354 },
+// Showcase row layouts. First two rows are custom (loop scenarios, peer terminal);
+// remaining rows are standard screenshot showcases.
+type ShowcaseEntry =
+  | { kind: 'loop' }
+  | { kind: 'peer' }
+  | { kind: 'image'; dark: string; light: string; w: number; h: number; video?: string };
+
+const showcase: ShowcaseEntry[] = [
+  { kind: 'loop' },                                                                                                                                              // 01 closes-loop
+  { kind: 'peer' },                                                                                                                                              // 02 cross-agent peer
+  { kind: 'image', dark: '/screenshots/anomaly-dark.webp',  light: '/screenshots/anomaly-light.webp',  w: 3024, h: 1706 },                                      // 03 anomalies
+  { kind: 'image', dark: '/screenshots/sessions-dark.webp', light: '/screenshots/sessions-light.webp', w: 3024, h: 1704, video: '/screenshots/session-live.mp4' }, // 04 sessions
+  { kind: 'image', dark: '/screenshots/tools-dark.webp',    light: '/screenshots/tools-light.webp',    w: 3010, h: 1706 },                                      // 05 tools
+  { kind: 'image', dark: '/screenshots/cost-dark.webp',     light: '/screenshots/cost-light.webp',     w: 3024, h: 1704 },                                      // 06 cost
+  { kind: 'image', dark: '/screenshots/security-dark.webp', light: '/screenshots/security-light.webp', w: 3010, h: 1154 },                                      // 07 security
 ];
+// 08 search → renders as feature-standalone below the showcase rows.
 ---
 
 <div class="container">
@@ -67,12 +75,34 @@ const showcase = [
       <span class="muted">{t.hero.h1_2}</span>
     </h1>
     <p class="subtitle" set:html={t.hero.subtitle} />
-    <p class="hook"><span class="hook-text" data-text={t.hero.hook}></span><span class="hook-cursor">_</span></p>
+    <p class="hook"><span class="hook-text" data-hooks={JSON.stringify(t.hero.hooks)}>{t.hero.hooks[0]}</span><span class="hook-cursor">_</span></p>
+
+    <div class="loop-moment terminal">
+      <div class="terminal-header">
+        <span class="dot red"></span>
+        <span class="dot yellow"></span>
+        <span class="dot green"></span>
+        <span class="terminal-title">{t.hero.loop_moment.title_bar}</span>
+      </div>
+      <div class="loop-moment-body">
+        {t.hero.loop_moment.lines.map(line => (
+          line.kind === 'blank' ? (
+            <div class="loop-line"><span>&nbsp;</span></div>
+          ) : line.kind === 'comment' ? (
+            <div class="loop-line loop-comment"><span class="prompt">$</span><span># {line.text}</span></div>
+          ) : line.kind === 'cmd' ? (
+            <div class="loop-line"><span class="prompt">$</span><span>{line.text}</span></div>
+          ) : (
+            <div class="loop-line loop-tma1"><span class="tma1-tag">[tma1]</span><span>{line.text}</span></div>
+          )
+        ))}
+      </div>
+    </div>
 
     <div class="onboarding-card">
       <p class="onboarding-label">{t.onboarding.label}</p>
       <div class="onboarding-body">
-        <p class="onboarding-text">Read <a href="https://tma1.ai/SKILL.md">https://tma1.ai/SKILL.md</a> and follow the instructions to install and configure TMA1 for your AI agent</p>
+        <p class="onboarding-text">Read <a href="https://tma1.ai/SKILL.md">https://tma1.ai/SKILL.md</a> and follow the instructions to install or upgrade TMA1 for your AI agent</p>
         <button class="copy-btn"
           onclick={`navigator.clipboard.writeText('${onboardingCmd}').then(()=>{this.textContent='${t.ui.copied}';setTimeout(()=>this.textContent='${t.ui.copy}',1500)})`}>
           {t.ui.copy}
@@ -105,21 +135,6 @@ const showcase = [
       </div>
     </details>
 
-    <div class="hero-screenshot">
-      <div class="browser-chrome">
-        <span class="dot red"></span>
-        <span class="dot yellow"></span>
-        <span class="dot green"></span>
-        <span class="browser-url">localhost:14318</span>
-      </div>
-      <img class="theme-img"
-        data-dark-src="/screenshots/hero-dark.webp"
-        data-light-src="/screenshots/hero-light.webp"
-        src="/screenshots/hero-dark.webp"
-        alt="TMA1 Dashboard — Claude Code Overview"
-        loading="eager" width="3010" height="1706" />
-    </div>
-
     <div class="highlights">
       {t.highlights.map(h => (
         <div class="highlight-card">
@@ -135,54 +150,99 @@ const showcase = [
     <h2 class="section-title">{t.features.title}</h2>
     <p class="section-desc">{t.features.desc}</p>
     <div class="showcase">
-      {t.features.cards.slice(0, 6).map((c, i) => (
-        <div class={`showcase-row${i % 2 === 1 ? ' flip' : ''}`}>
-          <div class="showcase-text">
-            <div class="feature-icon">{c.num}</div>
-            <h3>{c.title}</h3>
-            <p set:html={c.desc} />
-          </div>
-          <div class="showcase-image">
-            <div class={`showcase-frame${showcase[i].padded ? ' showcase-frame--padded' : ''}`}>
-              <div class="browser-chrome">
-                <span class="dot red"></span>
-                <span class="dot yellow"></span>
-                <span class="dot green"></span>
-                <span class="browser-url">localhost:14318</span>
-              </div>
-              <div class="showcase-frame__body">
-                {showcase[i].video ? (
-                  <div class="showcase-media-stack">
-                    <img class="theme-img showcase-still"
-                      data-dark-src={showcase[i].dark}
-                      data-light-src={showcase[i].light}
-                      src={showcase[i].dark}
-                      alt={`TMA1 Dashboard — ${c.title}`}
-                      loading="lazy" width={showcase[i].w} height={showcase[i].h} />
-                    <video class="showcase-video" muted playsinline
-                      width={showcase[i].w} height={showcase[i].h}>
-                      <source src={showcase[i].video} type="video/mp4" />
-                    </video>
+      {t.features.cards.slice(0, 7).map((c, i) => {
+        const entry = showcase[i];
+        return (
+          <div class={`showcase-row showcase-row--${entry.kind}${i % 2 === 1 ? ' flip' : ''}`}>
+            <div class="showcase-text">
+              <div class="feature-icon">{c.num}</div>
+              <h3>{c.title}</h3>
+              <p set:html={c.desc} />
+            </div>
+            <div class="showcase-image">
+              {entry.kind === 'loop' ? (
+                <div class="loop-scenarios" aria-label="Anomaly scenarios">
+                  <p class="loop-scenarios-intro" set:html={t.loop_scenarios.intro} />
+                  <div class="loop-scenarios-grid">
+                    {t.loop_scenarios.items.map(item => (
+                      <article class="scenario-card">
+                        <div class="scenario-head">
+                          <span class="scenario-kind">{item.kind}</span>
+                          <span class={`scenario-severity scenario-severity--${item.severity.toLowerCase()}`}>{item.severity}</span>
+                        </div>
+                        <p class="scenario-narrative">{item.narrative}</p>
+                        <pre class="scenario-suggestion">{item.suggestion}</pre>
+                        <p class="scenario-footer">{item.footer}</p>
+                      </article>
+                    ))}
                   </div>
-                ) : (
-                  <img class="theme-img"
-                    data-dark-src={showcase[i].dark}
-                    data-light-src={showcase[i].light}
-                    src={showcase[i].dark}
-                    alt={`TMA1 Dashboard — ${c.title}`}
-                    loading="lazy" width={showcase[i].w} height={showcase[i].h} />
-                )}
-              </div>
+                </div>
+              ) : entry.kind === 'peer' ? (
+                <div class="peer-snippet">
+                  <p class="peer-snippet-intro" set:html={t.peer_demo.intro} />
+                  <div class="terminal">
+                    <div class="terminal-header">
+                      <span class="dot red"></span>
+                      <span class="dot yellow"></span>
+                      <span class="dot green"></span>
+                      <span class="terminal-title">{t.peer_demo.title_bar}</span>
+                    </div>
+                    <div class="terminal-body peer-body">
+                      {t.peer_demo.lines.map(line => (
+                        line.kind === 'blank' ? (
+                          <div class="line"><span>&nbsp;</span></div>
+                        ) : line.kind === 'prompt' ? (
+                          <div class="line"><span class="prompt">$</span><span class="peer-prompt">{line.text}</span></div>
+                        ) : (
+                          <div class="line peer-output"><span>{line.text}</span></div>
+                        )
+                      ))}
+                    </div>
+                  </div>
+                </div>
+              ) : (
+                <div class="showcase-frame">
+                  <div class="browser-chrome">
+                    <span class="dot red"></span>
+                    <span class="dot yellow"></span>
+                    <span class="dot green"></span>
+                    <span class="browser-url">localhost:14318</span>
+                  </div>
+                  <div class="showcase-frame__body">
+                    {entry.video ? (
+                      <div class="showcase-media-stack">
+                        <img class="theme-img showcase-still"
+                          data-dark-src={entry.dark}
+                          data-light-src={entry.light}
+                          src={entry.dark}
+                          alt={`TMA1 Dashboard — ${c.title}`}
+                          loading="lazy" width={entry.w} height={entry.h} />
+                        <video class="showcase-video" muted playsinline
+                          width={entry.w} height={entry.h}>
+                          <source src={entry.video} type="video/mp4" />
+                        </video>
+                      </div>
+                    ) : (
+                      <img class="theme-img"
+                        data-dark-src={entry.dark}
+                        data-light-src={entry.light}
+                        src={entry.dark}
+                        alt={`TMA1 Dashboard — ${c.title}`}
+                        loading="lazy" width={entry.w} height={entry.h} />
+                    )}
+                  </div>
+                </div>
+              )}
             </div>
           </div>
-        </div>
-      ))}
+        );
+      })}
     </div>
-    {t.features.cards[6] && (
+    {t.features.cards[7] && (
       <div class="feature-standalone">
-        <div class="feature-icon">{t.features.cards[6].num}</div>
-        <h3>{t.features.cards[6].title}</h3>
-        <p set:html={t.features.cards[6].desc} />
+        <div class="feature-icon">{t.features.cards[7].num}</div>
+        <h3>{t.features.cards[7].title}</h3>
+        <p set:html={t.features.cards[7].desc} />
       </div>
     )}
   </section>
@@ -236,52 +296,6 @@ const showcase = [
         </article>
       ))}
     </div>
-  </section>
-
-  <section class="quickstart">
-    <p class="section-kicker">{t.quickstart.kicker}</p>
-    <h2 class="section-title">{t.quickstart.title}</h2>
-    <p class="section-desc">{t.quickstart.desc}</p>
-    <div class="onboarding-card quickstart-card">
-      <p class="onboarding-label">{t.onboarding.label}</p>
-      <div class="onboarding-body">
-        <p class="onboarding-text">Read <a href="https://tma1.ai/SKILL.md">https://tma1.ai/SKILL.md</a> and follow the instructions to install and configure TMA1 for your AI agent</p>
-        <button class="copy-btn"
-          onclick={`navigator.clipboard.writeText('${onboardingCmd}').then(()=>{this.textContent='${t.ui.copied}';setTimeout(()=>this.textContent='${t.ui.copy}',1500)})`}>
-          {t.ui.copy}
-        </button>
-      </div>
-    </div>
-    <details class="manual-install">
-      <summary>{t.quickstart.manual}</summary>
-      <div class="terminal quickstart-terminal">
-        <div class="terminal-header">
-          <span class="dot red"></span>
-          <span class="dot yellow"></span>
-          <span class="dot green"></span>
-          <span class="terminal-title">terminal</span>
-        </div>
-        <div class="terminal-body">
-          <div class="line comment"># Install TMA1 (macOS / Linux)</div>
-          <div class="line"><span class="prompt">$</span> <span class="cmd">curl -fsSL https://tma1.ai/install.sh | bash</span></div>
-          <div class="line">&nbsp;</div>
-          <div class="line comment"># Install TMA1 (Windows PowerShell)</div>
-          <div class="line"><span class="prompt">&gt;</span> <span class="cmd">irm https://tma1.ai/install.ps1 | iex</span></div>
-          <div class="line">&nbsp;</div>
-          <div class="line comment"># Start TMA1</div>
-          <div class="line"><span class="prompt">$</span> <span class="cmd">tma1-server</span></div>
-          <div class="line">&nbsp;</div>
-          <div class="line comment"># Configure your agent (example: OpenClaw)</div>
-          <div class="line"><span class="prompt">$</span> <span class="cmd">openclaw config set diagnostics.otel.endpoint <span class="url">http://localhost:14318/v1/otlp</span></span></div>
-          <div class="line">&nbsp;</div>
-          <div class="line comment"># Or any OTel SDK</div>
-          <div class="line"><span class="prompt">$</span> <span class="cmd">export <span class="arg">OTEL_EXPORTER_OTLP_ENDPOINT</span>=<span class="url">http://localhost:14318/v1/otlp</span></span></div>
-          <div class="line">&nbsp;</div>
-          <div class="line comment"># Open dashboard</div>
-          <div class="line"><span class="prompt">$</span> <span class="cmd">open <span class="url">http://localhost:14318</span></span></div>
-        </div>
-      </div>
-    </details>
   </section>
 
   <div class="lightbox" id="lightbox"><img src="" alt="" /></div>
@@ -390,7 +404,7 @@ const showcase = [
     font-family: "SF Mono", "Fira Code", monospace;
     font-size: 14px; color: var(--text-muted);
     max-width: 560px; line-height: 1.6;
-    margin-bottom: 32px; min-height: 1.6em;
+    margin-bottom: 32px; min-height: 3.2em;
   }
   .hero .hook-cursor {
     color: var(--accent);
@@ -479,8 +493,113 @@ const showcase = [
   .terminal-body .url { color: var(--blue); }
   .terminal-body .comment { color: var(--comment); font-style: italic; }
 
-  .quickstart-terminal { max-width: 720px; }
-  .quickstart-card { max-width: 720px; }
+  /* Hero loop-moment terminal — the "this is what TMA1 does" demo */
+  .loop-moment {
+    max-width: 720px;
+    margin: 8px 0 32px;
+  }
+  .loop-moment-body {
+    padding: 16px 20px;
+    font-family: "SF Mono", "Fira Code", monospace;
+    font-size: 14px; line-height: 1.7;
+  }
+  .loop-moment .loop-line {
+    display: flex; align-items: baseline; gap: 8px;
+    white-space: normal;
+    min-height: 1.7em;
+  }
+  .loop-moment .loop-line .prompt {
+    color: var(--comment);
+    user-select: none;
+    flex-shrink: 0;
+  }
+  .loop-moment .loop-comment { color: var(--comment); font-style: italic; }
+  .loop-moment .loop-tma1 { color: var(--text); }
+  .loop-moment .loop-tma1 .tma1-tag {
+    color: var(--accent); font-weight: 600;
+    flex-shrink: 0; user-select: none;
+  }
+  @media (prefers-reduced-motion: no-preference) {
+    .loop-moment .loop-line {
+      opacity: 0; transform: translateY(2px);
+      transition: opacity 0.4s ease-out, transform 0.4s ease-out;
+    }
+    .loop-moment.revealed .loop-line { opacity: 1; transform: none; }
+  }
+
+  /* Loop scenarios (inside feature row 01 — closes-loop) */
+  .loop-scenarios { display: flex; flex-direction: column; gap: 16px; }
+  .loop-scenarios-intro {
+    font-size: 14px; color: var(--text-muted);
+    line-height: 1.6; margin: 0;
+  }
+  .loop-scenarios-grid { display: flex; flex-direction: column; gap: 16px; }
+  .scenario-card {
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    padding: 20px;
+    background: var(--bg-card);
+    transition: border-color 0.2s, box-shadow 0.2s;
+  }
+  .scenario-card:hover {
+    border-color: var(--accent-border);
+    box-shadow: 0 0 12px var(--accent-shadow);
+  }
+  .scenario-head {
+    display: flex; justify-content: space-between; align-items: center;
+    margin-bottom: 10px; gap: 12px;
+  }
+  .scenario-kind {
+    font-family: "SF Mono", "Fira Code", monospace;
+    font-size: 12px; color: var(--text-muted);
+    letter-spacing: 0.04em; word-break: break-all;
+  }
+  .scenario-severity {
+    font-family: "SF Mono", "Fira Code", monospace;
+    font-size: 10px; font-weight: 700; letter-spacing: 0.12em;
+    padding: 2px 8px; border-radius: 4px;
+    border: 1px solid var(--border);
+    flex-shrink: 0;
+  }
+  .scenario-severity--high { color: var(--accent); border-color: var(--accent-border); }
+  .scenario-severity--medium { color: var(--text-muted); }
+  .scenario-narrative {
+    font-size: 14px; color: var(--text);
+    line-height: 1.5; margin: 0 0 12px;
+  }
+  .scenario-suggestion {
+    font-family: "SF Mono", "Fira Code", monospace;
+    font-size: 13px;
+    background: var(--code-bg);
+    border-left: 2px solid var(--accent);
+    padding: 12px 14px;
+    margin: 0 0 12px;
+    color: var(--text);
+    line-height: 1.55;
+    white-space: pre-wrap;
+    word-break: break-word;
+    border-radius: 0 4px 4px 0;
+    overflow-x: auto;
+  }
+  .scenario-footer {
+    font-family: "SF Mono", "Fira Code", monospace;
+    font-size: 11px; color: var(--text-muted);
+    margin: 0; letter-spacing: 0.04em;
+  }
+
+  /* Peer-sessions snippet (inside feature row 02 — cross-agent peer) */
+  .peer-snippet { display: flex; flex-direction: column; gap: 16px; }
+  .peer-snippet-intro {
+    font-size: 14px; color: var(--text-muted);
+    line-height: 1.6; margin: 0;
+  }
+  .peer-body .line { white-space: normal; }
+  .peer-body .peer-prompt { color: var(--accent); font-weight: 500; }
+  .peer-body .peer-output { color: var(--text); }
+
+  /* Custom showcase rows align top (skip default text padding) */
+  .showcase-row--loop .showcase-text,
+  .showcase-row--peer .showcase-text { padding-top: 0; }
 
   /* Highlights */
   .highlights { display: grid; grid-template-columns: repeat(3, 1fr); gap: 16px; }
@@ -513,26 +632,7 @@ const showcase = [
     line-height: 1.6; max-width: 640px; margin-bottom: 32px;
   }
 
-  /* Hero Screenshot */
-  .hero-screenshot {
-    position: relative;
-    margin: 40px 0 48px;
-    border-radius: 12px;
-    overflow: hidden;
-    border: 1px solid var(--border);
-    box-shadow:
-      0 2px 4px rgba(0,0,0,0.04),
-      0 8px 24px rgba(0,0,0,0.12),
-      0 24px 48px rgba(0,0,0,0.16);
-  }
-  .hero-screenshot::before {
-    content: '';
-    position: absolute;
-    inset: -40%;
-    background: radial-gradient(ellipse at 50% 40%, var(--accent-glow) 0%, transparent 70%);
-    z-index: -1;
-    pointer-events: none;
-  }
+  /* Browser-chrome shared by showcase frames */
   .browser-chrome {
     display: flex;
     align-items: center;
@@ -550,11 +650,6 @@ const showcase = [
     padding: 2px 10px;
     border-radius: 4px;
     border: 1px solid var(--border);
-  }
-  .hero-screenshot img {
-    width: 100%;
-    height: auto;
-    display: block;
   }
 
   /* Features */
@@ -695,9 +790,6 @@ const showcase = [
   .faq-question { font-size: 16px; font-weight: 700; margin-bottom: 8px; letter-spacing: -0.02em; }
   .faq-answer { font-size: 15px; color: var(--text-muted); line-height: 1.65; }
 
-  /* Quickstart */
-  .quickstart { padding: 60px 0; border-top: 1px solid var(--border); }
-
   /* Lightbox */
   .lightbox {
     position: fixed; inset: 0; z-index: 1000;
@@ -714,7 +806,7 @@ const showcase = [
     border-radius: 8px;
     box-shadow: 0 8px 32px rgba(0, 0, 0, 0.5);
   }
-  .showcase-frame img, .hero-screenshot img { cursor: zoom-in; }
+  .showcase-frame img { cursor: zoom-in; }
 
   /* Footer */
   footer {
@@ -750,7 +842,6 @@ const showcase = [
     .onboarding-card { max-width: 100%; }
     .onboarding-body { flex-direction: column; gap: 12px; }
     .manual-install { max-width: 100%; }
-    .quickstart-terminal { max-width: 100%; }
     .terminal-body { overflow-x: auto; }
     .terminal-body .line { min-width: 0; }
     nav { flex-wrap: wrap; }
@@ -838,9 +929,29 @@ const showcase = [
     lightbox.classList.remove('active');
     document.body.style.overflow = '';
   }
-  document.querySelectorAll('.showcase-frame img, .hero-screenshot img').forEach(function(img) {
+  document.querySelectorAll('.showcase-frame img').forEach(function(img) {
     img.addEventListener('click', function() { openLightbox(this.src, this.alt); });
   });
+
+  // Reveal hero loop-moment lines sequentially when scrolled into view.
+  var loopMoment = document.querySelector('.loop-moment');
+  if (loopMoment) {
+    var loopLines = loopMoment.querySelectorAll('.loop-line');
+    if (window.matchMedia('(prefers-reduced-motion: reduce)').matches) {
+      loopMoment.classList.add('revealed');
+    } else {
+      loopLines.forEach(function(line, idx) {
+        line.style.transitionDelay = (120 * idx) + 'ms';
+      });
+      var loopObserver = new IntersectionObserver(function(entries) {
+        if (entries[0].isIntersecting) {
+          loopMoment.classList.add('revealed');
+          loopObserver.disconnect();
+        }
+      }, { threshold: 0.25 });
+      loopObserver.observe(loopMoment);
+    }
+  }
   lightbox.addEventListener('click', closeLightbox);
   document.addEventListener('keydown', function(e) {
     if (e.key === 'Escape') closeLightbox();
@@ -873,22 +984,55 @@ const showcase = [
     observer.observe(stack);
   });
 
-  // Typing effect for hero hook
+  // Typing effect for hero hook — cycles through hooks[] indefinitely.
+  // Each cycle: type → hold → erase → next. Cursor stays visible (no
+  // fade-out) because the cycle never finishes. prefers-reduced-motion
+  // skips the animation and shows the first hook statically.
   var hookText = document.querySelector('.hook-text');
   if (hookText) {
-    var full = hookText.getAttribute('data-text') || '';
+    var hooks;
+    try { hooks = JSON.parse(hookText.getAttribute('data-hooks') || '[]'); } catch (e) { hooks = []; }
+    if (!hooks.length) { hooks = [hookText.textContent || '']; }
+
     if (window.matchMedia('(prefers-reduced-motion: reduce)').matches) {
-      hookText.textContent = full;
+      hookText.textContent = hooks[0];
     } else {
-      var i = 0;
-      var cursor = document.querySelector('.hook-cursor');
-      setTimeout(function() { var id = setInterval(function() {
-        hookText.textContent = full.slice(0, ++i);
-        if (i >= full.length) {
-          clearInterval(id);
-          if (cursor) setTimeout(function() { cursor.style.opacity = '0'; cursor.style.transition = 'opacity 1s'; }, 2000);
-        }
-      }, 70); }, 1000);
+      var typeSpeed = 60;
+      var eraseSpeed = 25;
+      var holdAfterType = 3500;
+      var holdBeforeErase = 400;
+      var initialDelay = 800;
+      var idx = 0;
+      hookText.textContent = '';
+
+      function typeNext() {
+        var text = hooks[idx];
+        var i = 0;
+        var typeId = setInterval(function () {
+          hookText.textContent = text.slice(0, ++i);
+          if (i >= text.length) {
+            clearInterval(typeId);
+            setTimeout(function () {
+              eraseAndAdvance(text);
+            }, holdAfterType);
+          }
+        }, typeSpeed);
+      }
+
+      function eraseAndAdvance(text) {
+        var len = text.length;
+        var eraseId = setInterval(function () {
+          len--;
+          hookText.textContent = text.slice(0, len);
+          if (len <= 0) {
+            clearInterval(eraseId);
+            idx = (idx + 1) % hooks.length;
+            setTimeout(typeNext, holdBeforeErase);
+          }
+        }, eraseSpeed);
+      }
+
+      setTimeout(typeNext, initialDelay);
     }
   }
 })();

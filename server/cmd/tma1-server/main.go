@@ -451,6 +451,7 @@ func runInstall(args []string) error {
 	adapter := "claude-code"
 	project, _ := os.Getwd()
 	dryRun := false
+	skipProjectFiles := false
 
 	for i := 0; i < len(args); i++ {
 		switch args[i] {
@@ -466,14 +467,27 @@ func runInstall(args []string) error {
 			}
 			project = args[i+1]
 			i++
+		case "--skip-project-files":
+			// Skip project-local writes (CLAUDE.md / AGENTS.md instructions
+			// block and .gitignore). Hooks, MCP, and skills still install
+			// globally. Used by install.sh / install.ps1 because the curl-pipe
+			// cwd is unpredictable — writing a block to a random directory's
+			// CLAUDE.md is worse than not writing it at all. Users wire
+			// project-local files later by `cd <project> && tma1-server
+			// install --adapter <name>` without this flag.
+			skipProjectFiles = true
 		case "--dry-run", "-n":
 			dryRun = true
 		case "-h", "--help":
-			fmt.Println("usage: tma1-server install [--adapter claude-code|codex] [--project DIR] [--dry-run]")
+			fmt.Println("usage: tma1-server install [--adapter claude-code|codex] [--project DIR] [--skip-project-files] [--dry-run]")
 			return nil
 		default:
 			return fmt.Errorf("unknown flag %q", args[i])
 		}
+	}
+
+	if skipProjectFiles {
+		project = "" // empty triggers the existing ProjectDir != "" guard in both installers
 	}
 
 	cfg, err := config.Load()

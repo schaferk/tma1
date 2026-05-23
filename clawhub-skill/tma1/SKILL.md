@@ -3,9 +3,9 @@ name: tma1
 version: 0.3.0
 description: |
   Local-first LLM agent observability that closes the loop:
-  records every LLM call on the user's machine, then feeds what
-  it sees back into the agent's next turn via hooks, MCP tools,
-  and anomaly detection.
+  records agent work on the user's machine, then feeds the useful
+  parts back into the next turn via hooks, MCP tools, and anomaly
+  detection.
 
   Use when users say:
   - "install tma1"
@@ -62,7 +62,7 @@ metadata:
 │      ██║   ██║ ╚═╝ ██║██║  ██║ ███████╗                      │
 │      ╚═╝   ╚═╝     ╚═╝╚═╝  ╚═╝ ╚══════╝                      │
 │                                                              │
-│   your agent runs. tma1 remembers.                           │
+│   close the loop around your agent.                           │
 │                                                              │
 └──────────────────────────────────────────────────────────────┘
 ```
@@ -70,7 +70,7 @@ metadata:
 # TMA1
 
 TMA1 gives you local-first observability for your AI agent.
-Token usage, cost, latency — stored locally, queryable with plain SQL.
+Agent work, token usage, cost, latency — stored locally, queryable with plain SQL.
 No cloud account. No Docker. No Grafana setup.
 Works with Claude Code, Codex, GitHub Copilot CLI, OpenClaw, or any OTel-enabled agent.
 
@@ -114,7 +114,7 @@ Dashboard: **http://localhost:14318**
 
 ## Agent loop (v2)
 
-Beyond passive recording, TMA1 v2 routes what it sees back into the
+Beyond passive recording, TMA1 v2 feeds useful context back into the
 agent's reasoning loop. Currently wired for **Claude Code** and
 **Codex**; the surface is adapter-shaped, so any future agent that
 exposes hook + MCP integration points can plug in the same way.
