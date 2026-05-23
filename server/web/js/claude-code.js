@@ -1096,19 +1096,27 @@ async function cc_loadTraceCardsExistence() {
   }
   ccTraceExistenceInflightIv = iv;
   ccTraceExistenceInflight = (async () => {
+    var myIv = iv;
     try {
       var countRes = await query(
         "SELECT COUNT(*) AS v FROM opentelemetry_traces " +
         "WHERE span_name = 'claude_code.llm_request' " +
-        "AND timestamp > NOW() - INTERVAL '" + iv + "'"
+        "AND timestamp > NOW() - INTERVAL '" + myIv + "'"
       );
       var cnt = Number(rows(countRes)?.[0]?.[0]) || 0;
-      cc_setCachedTraceDetection(iv, cnt > 0);
-      ccHasTraces = cnt > 0;
-      cc_applyTracesTabVisibility(ccHasTraces);
+      // Cache is per-iv and always valid; UI state is global, so only
+      // apply it if a newer call hasn't superseded us in the meantime
+      // (e.g., user changed the time range mid-query).
+      cc_setCachedTraceDetection(myIv, cnt > 0);
+      if (ccTraceExistenceInflightIv === myIv) {
+        ccHasTraces = cnt > 0;
+        cc_applyTracesTabVisibility(ccHasTraces);
+      }
     } catch {
-      ccHasTraces = false;
-      cc_applyTracesTabVisibility(false);
+      if (ccTraceExistenceInflightIv === myIv) {
+        ccHasTraces = false;
+        cc_applyTracesTabVisibility(false);
+      }
     }
   })();
   try {
