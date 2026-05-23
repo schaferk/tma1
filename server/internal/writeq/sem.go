@@ -17,6 +17,7 @@ package writeq
 
 import (
 	"log/slog"
+	"sync"
 	"sync/atomic"
 )
 
@@ -24,6 +25,7 @@ import (
 // concurrent use.
 type Sem struct {
 	ch       chan struct{}
+	wg       sync.WaitGroup
 	dropped  atomic.Uint64
 	panicked atomic.Uint64
 	logger   *slog.Logger
@@ -61,7 +63,11 @@ func (s *Sem) Go(fn func()) bool {
 	}
 	select {
 	case s.ch <- struct{}{}:
+		s.wg.Add(1)
 		go func() {
+			// Outermost defer (last to run): mark this job done so
+			// Wait can unblock once the in-flight count is zero.
+			defer s.wg.Done()
 			// Slot release must run even on panic, otherwise a
 			// single misbehaving fn() would starve the semaphore.
 			defer func() { <-s.ch }()
@@ -85,6 +91,15 @@ func (s *Sem) Go(fn func()) bool {
 		s.dropped.Add(1)
 		return false
 	}
+}
+
+// Wait blocks until every job dispatched by Go has finished. Intended
+// for graceful shutdown: callers must stop submitting (e.g. close the
+// HTTP server) before calling Wait, otherwise a steady arrival rate
+// keeps the in-flight counter non-zero forever. Pair with a
+// caller-side timeout if you want a bounded drain.
+func (s *Sem) Wait() {
+	s.wg.Wait()
 }
 
 // Panicked returns the cumulative number of background fn() invocations

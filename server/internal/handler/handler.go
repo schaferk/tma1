@@ -130,6 +130,28 @@ func (s *Server) StartBackgroundTasks(ctx context.Context) {
 	go s.runFileChangedDedupGC(ctx)
 }
 
+// DrainWrites waits for in-flight background writes (hook event inserts,
+// anomaly emits) to land in GreptimeDB, up to the given timeout. Returns
+// true when the queue drained cleanly. Must be called AFTER the HTTP
+// server has stopped accepting new requests — otherwise fresh inserts
+// keep the queue non-empty and Drain times out trivially.
+func (s *Server) DrainWrites(timeout time.Duration) bool {
+	if s.writeSem == nil {
+		return true
+	}
+	done := make(chan struct{})
+	go func() {
+		s.writeSem.Wait()
+		close(done)
+	}()
+	select {
+	case <-done:
+		return true
+	case <-time.After(timeout):
+		return false
+	}
+}
+
 // Router returns the chi router with all routes registered.
 func (s *Server) Router() http.Handler {
 	r := chi.NewRouter()
