@@ -25,9 +25,13 @@ function renderSessionDetail(timeline, stats) {
   var costLabel = stats.costSource === 'otel' ? t('sessions.kpi_cost') : t('sessions.kpi_cost') + ' ~';
   html += '<div class="sess-kpi"><span class="sess-kpi-label">' + costLabel + '</span><span class="sess-kpi-value cost">' + (stats.cost > 0 ? fmtCost(stats.cost) : '\u2014') + '</span></div>';
 
-  // Tokens KPI.
+  // Tokens KPI. Reasoning tokens get a separate trailing slot so the
+  // displayed total stays consistent with the cost calc (which prices
+  // reasoning at output rate but reports it as its own bucket).
   var tokLabel = stats.hasOTel ? t('sessions.kpi_tokens') : t('sessions.kpi_tokens') + ' ~';
-  html += '<div class="sess-kpi"><span class="sess-kpi-label">' + tokLabel + '</span><span class="sess-kpi-value" style="font-size:14px">' + fmtTokens(stats.totalInputTokens) + ' ' + t('sessions.token_in') + ' / ' + fmtTokens(stats.totalOutputTokens) + ' ' + t('sessions.token_out') + '</span></div>';
+  var tokText = fmtTokens(stats.totalInputTokens) + ' ' + t('sessions.token_in') + ' / ' + fmtTokens(stats.totalOutputTokens) + ' ' + t('sessions.token_out');
+  if (stats.totalReasoningTokens > 0) tokText += ' / ' + fmtTokens(stats.totalReasoningTokens) + ' ' + t('sessions.token_reasoning');
+  html += '<div class="sess-kpi"><span class="sess-kpi-label">' + tokLabel + '</span><span class="sess-kpi-value" style="font-size:14px">' + tokText + '</span></div>';
 
   // Cache KPI (only if OTel data available and cache > 0).
   if (stats.hasOTel && stats.totalCacheTokens > 0) {

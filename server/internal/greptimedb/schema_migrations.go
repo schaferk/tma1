@@ -105,6 +105,14 @@ var schemaMigrations = []Migration{
 		// instead of wedging the start sequence.
 		IgnoreErr: isIgnorableSchemaUpgradeError,
 	},
+	{
+		Version:     4,
+		Description: "v2.1 — reasoning_tokens column on tma1_messages for Codex thinking/turn usage",
+		SQL: []string{
+			`ALTER TABLE tma1_messages ADD COLUMN reasoning_tokens BIGINT NULL`,
+		},
+		IgnoreErr: isIgnorableSchemaUpgradeError,
+	},
 }
 
 // schemaVersionDDL creates the migration ledger. Append-only so the

@@ -99,6 +99,7 @@ var sessionTableDDLs = []string{
     output_tokens         BIGINT NULL,
     cache_read_tokens     BIGINT NULL,
     cache_creation_tokens BIGINT NULL,
+    reasoning_tokens      BIGINT NULL,
     duration_ms           BIGINT NULL,
     PRIMARY KEY ("role", message_type)
 ) WITH ('append_mode'='true')`,

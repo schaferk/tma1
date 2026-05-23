@@ -245,7 +245,7 @@ async function sess_loadDetail(sessionId, agentSource) {
     ).catch(function() { return null; }),
     query(
       "SELECT ts, session_id, message_type, tool_name, tool_use_id, content, model, " +
-      "input_tokens, output_tokens, cache_read_tokens, cache_creation_tokens, duration_ms " +
+      "input_tokens, output_tokens, cache_read_tokens, cache_creation_tokens, reasoning_tokens, duration_ms " +
       "FROM tma1_messages WHERE session_id = '" + sid + "' ORDER BY ts ASC LIMIT 50000"
     ).catch(function() { return null; }),
   ]);
@@ -254,9 +254,18 @@ async function sess_loadDetail(sessionId, agentSource) {
   var hookEvents = phase1[0] ? rowsToObjects(phase1[0]) : [];
   var messages = phase1[1] ? rowsToObjects(phase1[1]) : [];
 
-  // Infer agent source from hook data when not provided (e.g. search results).
-  if (!agentSource && hookEvents.length > 0) {
-    agentSource = hookEvents[0].agent_source || '';
+  // Infer agent source from hook data when not provided (e.g. search
+  // results pass empty agent_source). Iterate until we find a row with
+  // a non-empty source — early rows may be agent-less SessionStart
+  // pings. Must happen BEFORE the Codex transcript normalisation
+  // (sess_normalizeCodexTranscriptMessages keys off agentSource).
+  if (!agentSource) {
+    for (var srcIdx = 0; srcIdx < hookEvents.length; srcIdx++) {
+      if (hookEvents[srcIdx].agent_source) {
+        agentSource = hookEvents[srcIdx].agent_source;
+        break;
+      }
+    }
   }
 
   // Merge tool pairs from hooks (PostToolUse with matching PreToolUse).

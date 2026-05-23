@@ -313,6 +313,7 @@ type codexResponseItem struct {
 	Name    string          `json:"name"`
 	CallID  string          `json:"call_id"`
 	Content json.RawMessage `json:"content"`
+	Summary json.RawMessage `json:"summary"`
 	Output  string          `json:"output"`
 	Input   string          `json:"input"`
 	// function_call fields
@@ -333,7 +334,14 @@ type codexFileContext struct {
 	// so the filename-prefix grouping that links parent + subagent
 	// rollout files is preserved.
 	sessionID string
-	live      bool // true after initial backfill completes (first EOF)
+	// model is the most recently observed model name from a turn_context
+	// event in this rollout. Stored on the file context so subsequent
+	// response_item / event_msg rows (tool_use, tool_result, reasoning)
+	// can stamp model into tma1_messages alongside the assistant payload
+	// — without it, the dashboard's per-call cost lookup can't price
+	// rollout-derived inference rows.
+	model string
+	live  bool // true after initial backfill completes (first EOF)
 }
 
 // effectiveSessionID returns the conversation UUID once session_meta
@@ -364,90 +372,114 @@ func (w *Watcher) processCodexLine(sessionID, line string, seen map[string]struc
 
 	switch ev.Type {
 	case "session_meta":
-		// Detect subagent from source field: {"subagent": "review"} vs "cli"
-		var meta struct {
-			ID     string          `json:"id"` // conversation ID (= OTel conversation.id)
-			Source json.RawMessage `json:"source"`
-			CWD    string          `json:"cwd"`
+		// Detect subagent from source field. Codex emits either a string
+		// ("cli") or an object — {"subagent":"review"} for the classic
+		// review subagent, and {"subagent":{"other":"guardian"}} for the
+		// auto-review (`codex review`) variant Codex 0.131.0 introduced;
+		// parseCodexSubagentSource normalises both forms and rewrites
+		// guardian → codex-auto-review so the dashboard groups the new
+		// flow together.
+		meta := parseCodexSessionMeta(ev.Payload)
+		if meta.id != "" {
+			fctx.conversationID = meta.id
 		}
-		isSubagent := false
-		if err := json.Unmarshal(ev.Payload, &meta); err == nil {
-			if meta.ID != "" {
-				fctx.conversationID = meta.ID
+		isSubagent := meta.subagent != ""
+		if isSubagent {
+			fctx.agentID = codexSubagentID(fctx.fileID, meta.subagent)
+			fctx.agentType = meta.subagent
+			// Subagent files: try to attribute to the PARENT's
+			// conversation UUID via the Watcher map (keyed on
+			// shared timestamp prefix). If found, the dashboard's
+			// per-session SUM(SubagentStart) attaches under the
+			// parent. If NOT found (e.g. Codex 0.131.0's `code
+			// review` mode spawns a subagent rollout whose
+			// session_meta carries no parent reference AND its
+			// timestamp prefix doesn't match any main session),
+			// fall back to the subagent's OWN conversation UUID —
+			// NOT the filename prefix, which would create a
+			// "rollout-..." pseudo-session_id that mismatches
+			// every hook-derived row and confuses the UI.
+			if parentUUID := w.lookupCodexParentSession(sessionID); parentUUID != "" {
+				fctx.sessionID = parentUUID
+			} else if meta.id != "" {
+				fctx.sessionID = meta.id
 			}
-			var subSource struct {
-				Subagent string `json:"subagent"`
-			}
-			isSubagent = json.Unmarshal(meta.Source, &subSource) == nil && subSource.Subagent != ""
-			if isSubagent {
-				fctx.agentID = codexSubagentID(fctx.fileID, subSource.Subagent)
-				fctx.agentType = subSource.Subagent
-				// Subagent files: try to attribute to the PARENT's
-				// conversation UUID via the Watcher map (keyed on
-				// shared timestamp prefix). If found, the dashboard's
-				// per-session SUM(SubagentStart) attaches under the
-				// parent. If NOT found (e.g. Codex 0.131.0's `code
-				// review` mode spawns a subagent rollout whose
-				// session_meta carries no parent reference AND its
-				// timestamp prefix doesn't match any main session),
-				// fall back to the subagent's OWN conversation UUID —
-				// NOT the filename prefix, which would create a
-				// "rollout-..." pseudo-session_id that mismatches
-				// every hook-derived row and confuses the UI.
-				if parentUUID := w.lookupCodexParentSession(sessionID); parentUUID != "" {
-					fctx.sessionID = parentUUID
-				} else if meta.ID != "" {
-					fctx.sessionID = meta.ID
-				}
-			} else if meta.ID != "" {
-				// Main session: promote conversation UUID to be the
-				// canonical session_id so every JSONL-derived row matches
-				// what the hook handler writes for the same run. Publish
-				// to the parent-session map so subagent goroutines in
-				// the same Codex run can attribute their lifecycle
-				// events to this UUID.
-				fctx.sessionID = meta.ID
-				w.recordCodexParentSession(sessionID, meta.ID)
-			}
+		} else if meta.id != "" {
+			// Main session: promote conversation UUID to be the
+			// canonical session_id so every JSONL-derived row matches
+			// what the hook handler writes for the same run. Publish
+			// to the parent-session map so subagent goroutines in
+			// the same Codex run can attribute their lifecycle
+			// events to this UUID.
+			fctx.sessionID = meta.id
+			w.recordCodexParentSession(sessionID, meta.id)
 		}
 		sid := fctx.effectiveSessionID(sessionID)
 		if isSubagent {
-			w.insertCodexSubagentEvent(sid, ts, fctx.agentID, fctx.agentType, fctx.conversationID, meta.CWD)
+			w.insertCodexSubagentEvent(sid, ts, fctx.agentID, fctx.agentType, fctx.conversationID, meta.cwd)
 			if fctx.live {
 				w.broadcastHookEvent(sid, "SubagentStart", "", "", "", "", fctx.agentID, fctx.agentType)
 			}
 			break
 		}
-		w.insertCodexSessionStart(sid, ts, meta.CWD, fctx.conversationID)
+		w.insertCodexSessionStart(sid, ts, meta.cwd, fctx.conversationID)
 		if fctx.live {
 			w.broadcastHookEvent(sid, "SessionStart", "", "", "", "", "", "")
 		}
 
 	case "turn_context":
-		// Extract model name and store as a message with model field set.
+		// Stash the model on the file context so subsequent
+		// response_item / event_msg rows can stamp model into
+		// tma1_messages alongside the assistant payload. Continue
+		// to insert the synthetic assistant-row so the dashboard's
+		// session KPI / cost lookup still surfaces the model even
+		// when no tool/reasoning rows follow.
 		var turnCtx struct {
 			Model string `json:"model"`
 		}
 		if json.Unmarshal(ev.Payload, &turnCtx) == nil && turnCtx.Model != "" {
+			fctx.model = turnCtx.Model
 			w.insertCodexModelMessage(fctx.effectiveSessionID(sessionID), ts, turnCtx.Model, seen)
 		}
 
 	case "event_msg":
 		var eventMsg struct {
-			Type    string `json:"type"`
-			Message string `json:"message"`
-			Phase   string `json:"phase"`
+			Type    string          `json:"type"`
+			Message string          `json:"message"`
+			Phase   string          `json:"phase"`
+			TurnID  string          `json:"turn_id"`
+			CallID  string          `json:"call_id"`
+			Query   string          `json:"query"`
+			Action  json.RawMessage `json:"action"`
 		}
 		if err := json.Unmarshal(ev.Payload, &eventMsg); err != nil {
 			return
 		}
 		sid := fctx.effectiveSessionID(sessionID)
 		switch eventMsg.Type {
+		case "task_started":
+			// TaskCreated marks the start of a turn. The waterfall
+			// pairs it with TaskCompleted (below) to render a turn
+			// span — without TaskCreated, agentic subagents and LLM
+			// calls have nothing to reparent under and the timeline
+			// renders as a flat list.
+			w.insertCodexHookEvent(sid, ts, "TaskCreated", "", "", eventMsg.TurnID, "", fctx)
 		case "task_complete":
+			w.insertCodexHookEvent(sid, ts, "TaskCompleted", "", "", eventMsg.TurnID, "", fctx)
 			// Emit SubagentStop for subagent files.
 			if fctx.agentID != "" {
 				w.insertCodexHookEvent(sid, ts, "SubagentStop", "", "", "", "", fctx)
 			}
+		case "web_search_end":
+			// Codex emits a single event for the whole search; project
+			// it as a Pre/Post pair AND a tool_use/tool_result message
+			// pair so the existing tool-pair waterfall + transcript
+			// renderers pick it up without a Codex-specific branch.
+			toolInput := codexWebSearchInput(eventMsg.Query, eventMsg.Action)
+			w.insertCodexHookEvent(sid, ts, "PreToolUse", "web_search", toolInput, eventMsg.CallID, "", fctx)
+			w.insertCodexTypedMessage(sid, ts, "tool_use", "assistant", toolInput, fctx.model, "web_search", eventMsg.CallID, seen)
+			w.insertCodexHookEvent(sid, ts, "PostToolUse", "web_search", "", eventMsg.CallID, toolInput, fctx)
+			w.insertCodexTypedMessage(sid, ts, "tool_result", "user", toolInput, fctx.model, "web_search", eventMsg.CallID, seen)
 		case "user_message":
 			msg := strings.TrimSpace(eventMsg.Message)
 			if msg != "" {
@@ -467,6 +499,146 @@ func (w *Watcher) processCodexLine(sessionID, line string, seen map[string]struc
 		}
 		w.processCodexResponseItem(fctx.effectiveSessionID(sessionID), ts, item, seen, fctx)
 	}
+}
+
+type codexSessionMeta struct {
+	id       string
+	cwd      string
+	subagent string
+}
+
+// parseCodexSessionMeta normalises the {id, cwd, source} shape Codex
+// writes at the head of every rollout. The source field carries the
+// subagent identity for review / auto-review subagents; everything
+// else (string "cli", missing, etc.) maps to an empty subagent.
+func parseCodexSessionMeta(raw json.RawMessage) codexSessionMeta {
+	var meta struct {
+		ID     string          `json:"id"`
+		Source json.RawMessage `json:"source"`
+		CWD    string          `json:"cwd"`
+	}
+	if err := json.Unmarshal(raw, &meta); err != nil {
+		return codexSessionMeta{}
+	}
+	return codexSessionMeta{
+		id:       meta.ID,
+		cwd:      meta.CWD,
+		subagent: parseCodexSubagentSource(meta.Source),
+	}
+}
+
+// parseCodexSubagentSource extracts the subagent identity from
+// session_meta.source. Codex emits one of:
+//   - "cli"                            (main session, not a subagent)
+//   - {"subagent":"review"}            (classic review subagent)
+//   - {"subagent":{"other":"guardian"}} (auto-review: `codex review`)
+//
+// Returns "" for the main-session case. The guardian → codex-auto-review
+// rewrite groups the new auto-review flow under a stable agent_type so
+// the dashboard's per-subagent rollups don't fragment.
+func parseCodexSubagentSource(raw json.RawMessage) string {
+	if len(raw) == 0 || string(raw) == "null" {
+		return ""
+	}
+	// "cli" / any plain string → main session, not a subagent.
+	var sourceString string
+	if json.Unmarshal(raw, &sourceString) == nil {
+		return ""
+	}
+	var source struct {
+		Subagent json.RawMessage `json:"subagent"`
+	}
+	if json.Unmarshal(raw, &source) != nil || len(source.Subagent) == 0 || string(source.Subagent) == "null" {
+		return ""
+	}
+	// {"subagent":"review"}
+	var subagent string
+	if json.Unmarshal(source.Subagent, &subagent) == nil {
+		return strings.TrimSpace(subagent)
+	}
+	// {"subagent":{"other":"guardian"}} — Codex 0.131.0 auto-review.
+	var subagentObj map[string]string
+	if json.Unmarshal(source.Subagent, &subagentObj) == nil {
+		if other := strings.TrimSpace(subagentObj["other"]); other != "" {
+			if other == "guardian" {
+				return "codex-auto-review"
+			}
+			return other
+		}
+	}
+	return ""
+}
+
+// extractCodexReasoning pulls the text from a `reasoning` response_item.
+// Codex has shipped two layouts: newer rollouts put text under
+// `content` blocks (`reasoning_text` / `text` / `output_text`), older
+// ones under `summary` blocks (`summary_text` / `text`). Try both so
+// reasoning rows show up regardless of Codex version.
+func extractCodexReasoning(item codexResponseItem) string {
+	if text := extractCodexText(item.Content, "reasoning_text", "text", "output_text"); text != "" {
+		return text
+	}
+	return extractCodexText(item.Summary, "summary_text", "text")
+}
+
+func extractCodexText(raw json.RawMessage, allowedTypes ...string) string {
+	if len(raw) == 0 || string(raw) == "null" {
+		return ""
+	}
+	var s string
+	if err := json.Unmarshal(raw, &s); err == nil {
+		return strings.TrimSpace(s)
+	}
+	allowed := make(map[string]struct{}, len(allowedTypes))
+	for _, typ := range allowedTypes {
+		allowed[typ] = struct{}{}
+	}
+	var blocks []struct {
+		Type string `json:"type"`
+		Text string `json:"text"`
+	}
+	if err := json.Unmarshal(raw, &blocks); err != nil {
+		return ""
+	}
+	var sb strings.Builder
+	for _, b := range blocks {
+		if _, ok := allowed[b.Type]; !ok {
+			continue
+		}
+		text := strings.TrimSpace(b.Text)
+		if text == "" {
+			continue
+		}
+		if sb.Len() > 0 {
+			sb.WriteByte('\n')
+		}
+		sb.WriteString(text)
+	}
+	return sb.String()
+}
+
+// codexWebSearchInput composes the tool_input column for a web_search
+// hook row. Codex emits the query plus an opaque `action` payload; we
+// keep both so downstream can show full intent without parsing JSON
+// twice (the existing tool-pair renderer already escapes string
+// content).
+func codexWebSearchInput(query string, action json.RawMessage) string {
+	query = strings.TrimSpace(query)
+	actionText := strings.TrimSpace(string(action))
+	if query == "" {
+		if actionText == "null" {
+			return ""
+		}
+		return actionText
+	}
+	if actionText == "" || actionText == "null" {
+		return query
+	}
+	queryJSON, err := json.Marshal(query)
+	if err != nil {
+		return actionText
+	}
+	return `{"query":` + string(queryJSON) + `,"action":` + actionText + `}`
 }
 
 func (w *Watcher) processCodexResponseItem(sessionID string, ts time.Time, item codexResponseItem, seen map[string]struct{}, fctx *codexFileContext) {
@@ -495,17 +667,30 @@ func (w *Watcher) processCodexResponseItem(sessionID string, ts time.Time, item 
 			}
 		}
 
+	case "reasoning":
+		// Reasoning items become "thinking" rows so the timeline/waterfall
+		// can render them alongside the assistant payload they precede.
+		// The text may live under either `content` blocks (newer Codex)
+		// or `summary` blocks (older), so try both.
+		if text := extractCodexReasoning(item); text != "" {
+			w.insertCodexTypedMessage(sessionID, ts, "thinking", "assistant", text, fctx.model, "", "", seen)
+		}
+
 	case "function_call":
 		w.insertCodexHookEvent(sessionID, ts, "PreToolUse", item.Name, item.Arguments, item.CallID, "", fctx)
+		w.insertCodexTypedMessage(sessionID, ts, "tool_use", "assistant", item.Arguments, fctx.model, item.Name, item.CallID, seen)
 
 	case "function_call_output":
 		w.insertCodexHookEvent(sessionID, ts, "PostToolUse", "", "", item.CallID, item.Output, fctx)
+		w.insertCodexTypedMessage(sessionID, ts, "tool_result", "user", item.Output, fctx.model, "", item.CallID, seen)
 
 	case "custom_tool_call":
 		w.insertCodexHookEvent(sessionID, ts, "PreToolUse", item.Name, item.Input, item.CallID, "", fctx)
+		w.insertCodexTypedMessage(sessionID, ts, "tool_use", "assistant", item.Input, fctx.model, item.Name, item.CallID, seen)
 
 	case "custom_tool_call_output":
 		w.insertCodexHookEvent(sessionID, ts, "PostToolUse", "", "", item.CallID, item.Output, fctx)
+		w.insertCodexTypedMessage(sessionID, ts, "tool_result", "user", item.Output, fctx.model, "", item.CallID, seen)
 	}
 }
 
@@ -599,6 +784,71 @@ func (w *Watcher) insertCodexMessage(sessionID string, ts time.Time, role, conte
 		defer func() { <-insertSem }()
 		w.execSQL(sql)
 	}()
+}
+
+// insertCodexTypedMessage writes a tma1_messages row with an explicit
+// message_type / role / tool_use_id triple — the path used by tool_use,
+// tool_result, and thinking rows derived from response_item events.
+//
+// NOT gated by codexLiveGate -- same reason as insertCodexMessage /
+// insertCodexModelMessage: writes tma1_messages, never duplicated by
+// the hook handler.
+//
+// Dedup keys on the tool_use_id when present, otherwise on a
+// content-prefix bucket. Codex context replays re-emit identical
+// response_item lines on every prompt, so without the in-process seen
+// map a single 50-turn run accumulates duplicate transcript rows in
+// the hundreds.
+func (w *Watcher) insertCodexTypedMessage(sessionID string, ts time.Time, messageType, role, content, model, toolName, toolUseID string, seen map[string]struct{}) {
+	key := codexMessageSeenKey(messageType, role, content, toolUseID)
+	if seen != nil {
+		if _, ok := seen[key]; ok {
+			return
+		}
+		seen[key] = struct{}{}
+	}
+
+	msTs := ts.UnixMilli()
+	for {
+		prev := lastInsertTS.Load()
+		next := msTs
+		if next <= prev {
+			next = prev + 1
+		}
+		if lastInsertTS.CompareAndSwap(prev, next) {
+			msTs = next
+			break
+		}
+	}
+
+	sql := fmt.Sprintf(
+		"INSERT INTO tma1_messages (ts, session_id, message_type, \"role\", content, model, tool_name, tool_use_id) "+
+			"VALUES (%d, '%s', '%s', '%s', '%s', '%s', '%s', '%s')",
+		msTs,
+		escapeSQLString(sessionID),
+		escapeSQLString(messageType),
+		escapeSQLString(role),
+		escapeSQLString(truncate(content, maxContentLen)),
+		escapeSQLString(model),
+		escapeSQLString(toolName),
+		escapeSQLString(toolUseID),
+	)
+	go func() {
+		insertSem <- struct{}{}
+		defer func() { <-insertSem }()
+		w.execSQL(sql)
+	}()
+}
+
+func codexMessageSeenKey(messageType, role, content, toolUseID string) string {
+	if toolUseID != "" && (messageType == "tool_use" || messageType == "tool_result") {
+		return messageType + ":" + toolUseID
+	}
+	prefix := content
+	if len(prefix) > 200 {
+		prefix = prefix[:200]
+	}
+	return messageType + ":" + role + ":" + prefix
 }
 
 // codexHookCoveredEvents lists the tma1_hook_events.event_type values

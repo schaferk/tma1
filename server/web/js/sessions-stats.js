@@ -20,6 +20,7 @@ function sess_computeStats(hookEvents, messages, timeline, apiCalls, apiErrors) 
     apiCalls: apiCalls || [],
     totalInputTokens: 0,
     totalOutputTokens: 0,
+    totalReasoningTokens: 0,
     totalCacheTokens: 0,
     cacheHitRatio: 0,
     apiErrors: apiErrors || [],
@@ -52,6 +53,19 @@ function sess_computeStats(hookEvents, messages, timeline, apiCalls, apiErrors) 
         stats.context.subagent += Math.round(resultLen / 4 * mult);
       } else {
         stats.context.tools += Math.round(resultLen / 4 * mult);
+      }
+    } else if (item.source === 'message' && item.data && item.data.message_type === 'tool_use') {
+      // Codex transcripts emit tool_use as message rows (no hook-side
+      // PreToolUse on rollout-replay paths) — surface file attention
+      // from those too so the heatmap covers Codex sessions.
+      stats.toolCount++;
+      var mtc = item.data;
+      var mfps = extractAllFilePaths(mtc.tool_name, mtc.content || '');
+      for (var mfi = 0; mfi < mfps.length; mfi++) {
+        var mfp = mfps[mfi];
+        if (!stats.files[mfp]) stats.files[mfp] = { reads: 0, writes: 0 };
+        if (mtc.tool_name === 'Write' || mtc.tool_name === 'Edit' || mtc.tool_name === 'apply_patch') stats.files[mfp].writes++;
+        else stats.files[mfp].reads++;
       }
     }
   }
@@ -153,6 +167,9 @@ function sess_computeStats(hookEvents, messages, timeline, apiCalls, apiErrors) 
     if (msg.message_type === 'user') {
       stats.context.user += tokens;
       estInputTokens += tokens;
+    } else if (msg.message_type === 'system' || msg.message_type === 'developer') {
+      stats.context.system += tokens;
+      estInputTokens += tokens;
     } else if (msg.message_type === 'tool_result') {
       estInputTokens += Math.round(tokens * 0.3);
     } else if (msg.message_type === 'tool_use') {
@@ -166,17 +183,19 @@ function sess_computeStats(hookEvents, messages, timeline, apiCalls, apiErrors) 
   // OTel enrichment: prefer precise data over estimates.
   if (stats.apiCalls.length > 0) {
     stats.hasOTel = true;
-    var totalIn = 0, totalOut = 0, totalCache = 0, totalCost = 0;
+    var totalIn = 0, totalOut = 0, totalReasoning = 0, totalCache = 0, totalCost = 0;
     for (var ac = 0; ac < stats.apiCalls.length; ac++) {
       var call = stats.apiCalls[ac];
       totalIn += call.inputTokens;
       totalOut += call.outputTokens;
+      totalReasoning += call.reasoningTokens || 0;
       totalCache += call.cacheTokens;
       totalCost += call.cost;
       if (!stats.primaryModel && call.model) stats.primaryModel = call.model;
     }
     stats.totalInputTokens = totalIn;
     stats.totalOutputTokens = totalOut;
+    stats.totalReasoningTokens = totalReasoning;
     stats.totalCacheTokens = totalCache;
     stats.cost = totalCost;
     stats.costSource = 'otel';
