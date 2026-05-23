@@ -1072,6 +1072,9 @@ function cc_setCachedTraceDetection(iv, has) {
   try { localStorage.setItem(CC_TRACE_CACHE_KEY, JSON.stringify({ iv: iv, has: has, ts: Date.now() })); } catch (e) { /* quota */ }
 }
 
+var ccTraceExistenceInflight = null;
+var ccTraceExistenceInflightIv = '';
+
 // Detection-only: toggles Traces sub-tab visibility. KPI cards load
 // separately via cc_loadTraceCardsValues when the tab opens.
 async function cc_loadTraceCardsExistence() {
@@ -1080,23 +1083,56 @@ async function cc_loadTraceCardsExistence() {
   var cached = cc_getCachedTraceDetection(iv);
   if (cached !== null) {
     ccHasTraces = cached;
-    document.getElementById('cc-traces-tab').style.display = cached ? '' : 'none';
+    cc_applyTracesTabVisibility(cached);
     return;
   }
 
+  // Coalesce concurrent callers for the SAME iv: switchView, refresh,
+  // and the awaits inside cc_loadTraceCardsValues / cc_loadTracesTab can
+  // all fire near-simultaneously on a cold cache.
+  if (ccTraceExistenceInflight && ccTraceExistenceInflightIv === iv) {
+    await ccTraceExistenceInflight;
+    return;
+  }
+  ccTraceExistenceInflightIv = iv;
+  ccTraceExistenceInflight = (async () => {
+    try {
+      var countRes = await query(
+        "SELECT COUNT(*) AS v FROM opentelemetry_traces " +
+        "WHERE span_name = 'claude_code.llm_request' " +
+        "AND timestamp > NOW() - INTERVAL '" + iv + "'"
+      );
+      var cnt = Number(rows(countRes)?.[0]?.[0]) || 0;
+      cc_setCachedTraceDetection(iv, cnt > 0);
+      ccHasTraces = cnt > 0;
+      cc_applyTracesTabVisibility(ccHasTraces);
+    } catch {
+      ccHasTraces = false;
+      cc_applyTracesTabVisibility(false);
+    }
+  })();
   try {
-    var countRes = await query(
-      "SELECT COUNT(*) AS v FROM opentelemetry_traces " +
-      "WHERE span_name = 'claude_code.llm_request' " +
-      "AND timestamp > NOW() - INTERVAL '" + iv + "'"
-    );
-    var cnt = Number(rows(countRes)?.[0]?.[0]) || 0;
-    cc_setCachedTraceDetection(iv, cnt > 0);
-    ccHasTraces = cnt > 0;
-    document.getElementById('cc-traces-tab').style.display = ccHasTraces ? '' : 'none';
-  } catch {
-    ccHasTraces = false;
-    document.getElementById('cc-traces-tab').style.display = 'none';
+    await ccTraceExistenceInflight;
+  } finally {
+    if (ccTraceExistenceInflightIv === iv) {
+      ccTraceExistenceInflight = null;
+    }
+  }
+}
+
+function cc_applyTracesTabVisibility(visible) {
+  document.getElementById('cc-traces-tab').style.display = visible ? '' : 'none';
+  // Deep-link to `#claude-code/cc-traces/...` (or auto-refresh after the
+  // time range no longer has trace data) can leave the user on the
+  // Performance tab content while the button is hidden — mismatched UI
+  // state. Fall back to Overview so what's visible matches what's
+  // clickable.
+  if (!visible) {
+    var activeTab = document.querySelector('#cc-tabs .tab.active');
+    if (activeTab && activeTab.dataset.cctab === 'cc-traces') {
+      var overviewBtn = document.querySelector('#cc-tabs .tab[data-cctab="cc-overview"]');
+      if (overviewBtn) overviewBtn.click();
+    }
   }
 }
 
