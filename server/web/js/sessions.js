@@ -30,8 +30,18 @@ function ganttColor(toolName) {
 
 async function sess_loadCards() {
   var iv = intervalSQL();
+  // Filter out "ghost" sessions that only fired infrastructure events
+  // (e.g., SessionEnd from plugin-install subprocesses). A real session
+  // must have at least one UserPromptSubmit or PreToolUse.
+  var realSessionWindow = "ts > NOW() - INTERVAL '" + iv + "'";
+  var realSessionGroupHaving =
+    "GROUP BY session_id " +
+    "HAVING SUM(CASE WHEN event_type IN ('UserPromptSubmit','PreToolUse') THEN 1 ELSE 0 END) > 0";
   var results = await Promise.all([
-    query("SELECT COUNT(DISTINCT session_id) AS v FROM tma1_hook_events WHERE ts > NOW() - INTERVAL '" + iv + "'"),
+    query(
+      "SELECT COUNT(*) AS v FROM (SELECT session_id FROM tma1_hook_events" +
+      " WHERE " + realSessionWindow + " " + realSessionGroupHaving + ") t"
+    ),
     query("SELECT COUNT(*) AS v FROM tma1_hook_events WHERE event_type = 'PreToolUse' AND ts > NOW() - INTERVAL '" + iv + "'"),
     query("SELECT COUNT(*) AS v FROM tma1_hook_events WHERE event_type = 'SubagentStart' AND ts > NOW() - INTERVAL '" + iv + "'"),
   ]);
@@ -49,8 +59,9 @@ async function sess_loadCards() {
       // Two-step: fetch active session IDs (capped) then aggregate with a literal IN list,
       // avoiding GreptimeDB subquery planner memory issues (cf. prompts.js pr_sourceSessionIDs).
       var idsRes = await query(
-        "SELECT session_id FROM tma1_hook_events WHERE ts > NOW() - INTERVAL '" + iv +
-        "' GROUP BY session_id ORDER BY MAX(ts) DESC LIMIT 500"
+        "SELECT session_id FROM tma1_hook_events" +
+        " WHERE " + realSessionWindow + " " + realSessionGroupHaving +
+        " ORDER BY MAX(ts) DESC LIMIT 500"
       );
       var idRows = rowsToObjects(idsRes);
       if (idRows.length === 0) return total > 0;
@@ -93,13 +104,15 @@ async function sess_loadList() {
   }
   var idsRes = await query(
     "SELECT session_id FROM tma1_hook_events WHERE " + activeWhere +
-    " GROUP BY session_id ORDER BY MAX(ts) DESC LIMIT 500"
+    " GROUP BY session_id " +
+    " HAVING SUM(CASE WHEN event_type IN ('UserPromptSubmit','PreToolUse') THEN 1 ELSE 0 END) > 0" +
+    " ORDER BY MAX(ts) DESC LIMIT 500"
   );
   var idRows = rowsToObjects(idsRes);
 
   var tbody = document.getElementById('sess-table-body');
   if (!idRows.length) {
-    tbody.innerHTML = '<tr><td colspan="8" class="loading">' + t('empty.no_data') + '</td></tr>';
+    tbody.innerHTML = '<tr><td colspan="9" class="loading">' + t('empty.no_data') + '</td></tr>';
     sessHasNext = false;
     renderSessPagination();
     return;
@@ -107,7 +120,7 @@ async function sess_loadList() {
   var idList = idRows.map(function(r) { return "'" + escapeSQLString(r.session_id) + "'"; }).join(',');
 
   // Step 2: aggregate full-session stats over those IDs (no time predicate so cross-window
-  // sessions report their real MIN/MAX). ORDER BY MIN(ts) DESC matches the displayed "Time" column.
+  // sessions report their real MIN/MAX). ORDER BY MAX(ts) DESC matches the displayed "Last Activity" column.
   var sql =
     "SELECT session_id, agent_source, MIN(ts) AS start_ts, MAX(ts) AS end_ts, " +
     "SUM(CASE WHEN event_type = 'PreToolUse' THEN 1 ELSE 0 END) AS tool_calls, " +
@@ -115,7 +128,7 @@ async function sess_loadList() {
     "MAX(cwd) AS cwd " +
     "FROM tma1_hook_events WHERE session_id IN (" + idList + ") " +
     "GROUP BY session_id, agent_source " +
-    "ORDER BY MIN(ts) DESC " +
+    "ORDER BY MAX(ts) DESC " +
     "LIMIT " + (sessPageSize + 1) + " OFFSET " + (sessPage * sessPageSize);
 
   var res = await query(sql);
@@ -147,7 +160,7 @@ async function sess_loadList() {
   }
 
   if (!data.length) {
-    tbody.innerHTML = '<tr><td colspan="8" class="loading">' + t('empty.no_data') + '</td></tr>';
+    tbody.innerHTML = '<tr><td colspan="9" class="loading">' + t('empty.no_data') + '</td></tr>';
     renderSessPagination();
     return;
   }
@@ -173,6 +186,7 @@ async function sess_loadList() {
     html += '<tr class="sess-row clickable" onclick="sess_openDetail(\x27' + escapeJSString(sid) + '\x27,\x27' + escapeJSString(agentSrc) + '\x27)">';
     html += '<td><code title="' + escapeHTML(sid) + '" style="font-size:11px;color:var(--text-dim)">' + escapeHTML(shortSid) + '</code></td>';
     html += '<td>' + (startMs ? new Date(startMs).toLocaleString() : '\u2014') + '</td>';
+    html += '<td>' + (endMs ? new Date(endMs).toLocaleString() : '\u2014') + '</td>';
     html += '<td>' + sourceBadge + '</td>';
     html += '<td>' + fmtDurSec(durSec) + '</td>';
     html += '<td>' + fmtNum(Number(d.tool_calls) || 0) + '</td>';

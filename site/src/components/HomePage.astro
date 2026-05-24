@@ -158,6 +158,24 @@ const showcase: ShowcaseEntry[] = [
               <div class="feature-icon">{c.num}</div>
               <h3>{c.title}</h3>
               <p set:html={c.desc} />
+              {entry.kind === 'loop' && (
+                <div class="loop-preview showcase-frame">
+                  <div class="browser-chrome">
+                    <span class="dot red"></span>
+                    <span class="dot yellow"></span>
+                    <span class="dot green"></span>
+                    <span class="browser-url">localhost:14318</span>
+                  </div>
+                  <div class="showcase-frame__body">
+                    <img class="theme-img"
+                      data-dark-src="/screenshots/performance-dark.webp"
+                      data-light-src="/screenshots/performance-light.webp"
+                      src="/screenshots/performance-dark.webp"
+                      alt="TMA1 dashboard — Performance tab preview"
+                      loading="lazy" width={2586} height={1700} />
+                  </div>
+                </div>
+              )}
             </div>
             <div class="showcase-image">
               {entry.kind === 'loop' ? (
@@ -682,6 +700,10 @@ const showcase: ShowcaseEntry[] = [
   .showcase-text p {
     font-size: 15px; color: var(--text-muted); line-height: 1.65;
   }
+  /* Dashboard preview tucked under the row-01 description, filling the
+     empty left half that would otherwise leave the loop-scenarios on
+     the right looking unbalanced. */
+  .loop-preview { margin-top: 28px; }
 
   /* Screenshot frame */
   .showcase-frame {

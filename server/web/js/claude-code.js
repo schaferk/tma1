@@ -1072,41 +1072,85 @@ function cc_setCachedTraceDetection(iv, has) {
   try { localStorage.setItem(CC_TRACE_CACHE_KEY, JSON.stringify({ iv: iv, has: has, ts: Date.now() })); } catch (e) { /* quota */ }
 }
 
-// Detect CC trace data and load trace KPI cards.
-async function cc_loadTraceCards() {
+var ccTraceExistenceInflight = null;
+var ccTraceExistenceInflightIv = '';
+
+// Detection-only: toggles Traces sub-tab visibility. KPI cards load
+// separately via cc_loadTraceCardsValues when the tab opens.
+async function cc_loadTraceCardsExistence() {
   var iv = intervalSQL();
 
-  // Fast path: use cached detection result.
   var cached = cc_getCachedTraceDetection(iv);
-  if (cached === false) {
-    ccHasTraces = false;
-    document.getElementById('cc-trace-cards').style.display = 'none';
-    document.getElementById('cc-traces-tab').style.display = 'none';
+  if (cached !== null) {
+    ccHasTraces = cached;
+    cc_applyTracesTabVisibility(cached);
     return;
   }
 
-  try {
-    // Skip detection query if cache says traces exist.
-    var cnt = 1;
-    if (cached !== true) {
+  // Coalesce concurrent callers for the SAME iv: switchView, refresh,
+  // and the awaits inside cc_loadTraceCardsValues / cc_loadTracesTab can
+  // all fire near-simultaneously on a cold cache.
+  if (ccTraceExistenceInflight && ccTraceExistenceInflightIv === iv) {
+    await ccTraceExistenceInflight;
+    return;
+  }
+  ccTraceExistenceInflightIv = iv;
+  ccTraceExistenceInflight = (async () => {
+    var myIv = iv;
+    try {
       var countRes = await query(
         "SELECT COUNT(*) AS v FROM opentelemetry_traces " +
         "WHERE span_name = 'claude_code.llm_request' " +
-        "AND timestamp > NOW() - INTERVAL '" + iv + "'"
+        "AND timestamp > NOW() - INTERVAL '" + myIv + "'"
       );
-      cnt = Number(rows(countRes)?.[0]?.[0]) || 0;
+      var cnt = Number(rows(countRes)?.[0]?.[0]) || 0;
+      // Cache write is per-iv (TTL-bounded — see cc_getCachedTraceDetection).
+      // UI state is global, so only apply it if a newer call hasn't
+      // superseded us (e.g., user changed the time range mid-query).
+      cc_setCachedTraceDetection(myIv, cnt > 0);
+      if (ccTraceExistenceInflightIv === myIv) {
+        ccHasTraces = cnt > 0;
+        cc_applyTracesTabVisibility(ccHasTraces);
+      }
+    } catch {
+      if (ccTraceExistenceInflightIv === myIv) {
+        ccHasTraces = false;
+        cc_applyTracesTabVisibility(false);
+      }
     }
-    cc_setCachedTraceDetection(iv, cnt > 0);
-    if (cnt === 0) {
-      ccHasTraces = false;
-      document.getElementById('cc-trace-cards').style.display = 'none';
-      document.getElementById('cc-traces-tab').style.display = 'none';
-      return;
+  })();
+  try {
+    await ccTraceExistenceInflight;
+  } finally {
+    if (ccTraceExistenceInflightIv === iv) {
+      ccTraceExistenceInflight = null;
     }
-    ccHasTraces = true;
-    document.getElementById('cc-trace-cards').style.display = '';
-    document.getElementById('cc-traces-tab').style.display = '';
+  }
+}
 
+function cc_applyTracesTabVisibility(visible) {
+  document.getElementById('cc-traces-tab').style.display = visible ? '' : 'none';
+  // Deep-link to `#claude-code/cc-traces/...` (or auto-refresh after the
+  // time range no longer has trace data) can leave the user on the
+  // Performance tab content while the button is hidden — mismatched UI
+  // state. Fall back to Overview so what's visible matches what's
+  // clickable.
+  if (!visible) {
+    var activeTab = document.querySelector('#cc-tabs .tab.active');
+    if (activeTab && activeTab.dataset.cctab === 'cc-traces') {
+      var overviewBtn = document.querySelector('#cc-tabs .tab[data-cctab="cc-overview"]');
+      if (overviewBtn) overviewBtn.click();
+    }
+  }
+}
+
+async function cc_loadTraceCardsValues() {
+  // Cold-cache deep-link: detection may still be in flight. Cached
+  // hits resolve synchronously.
+  await cc_loadTraceCardsExistence();
+  if (!ccHasTraces) return;
+  var iv = intervalSQL();
+  try {
     var results = await Promise.all([
       // Avg TTFT
       query("SELECT ROUND(AVG(\"span_attributes.ttft_ms\"), 0) FROM opentelemetry_traces WHERE span_name = 'claude_code.llm_request' AND \"span_attributes.ttft_ms\" IS NOT NULL AND timestamp > NOW() - INTERVAL '" + iv + "'"),
@@ -1132,9 +1176,7 @@ async function cc_loadTraceCards() {
     document.getElementById('cc-val-perm-wait').textContent = permWait > 0 ? fmtDurMs(permWait) : '\u2014';
     document.getElementById('cc-val-llm-latency').textContent = llmLat > 0 ? fmtDurMs(llmLat) : '\u2014';
   } catch {
-    ccHasTraces = false;
-    document.getElementById('cc-trace-cards').style.display = 'none';
-    document.getElementById('cc-traces-tab').style.display = 'none';
+    // Keep previous values on transient failure.
   }
 }
 
@@ -1142,6 +1184,8 @@ async function cc_loadTraceCards() {
 // Traces tab — 4 charts
 // ===================================================================
 async function cc_loadTracesTab() {
+  // Same cold-cache deep-link race as cc_loadTraceCardsValues.
+  await cc_loadTraceCardsExistence();
   if (!ccHasTraces) return;
   await Promise.all([
     cc_loadTTFTChart(),
