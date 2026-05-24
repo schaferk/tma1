@@ -1104,9 +1104,9 @@ async function cc_loadTraceCardsExistence() {
         "AND timestamp > NOW() - INTERVAL '" + myIv + "'"
       );
       var cnt = Number(rows(countRes)?.[0]?.[0]) || 0;
-      // Cache is per-iv and always valid; UI state is global, so only
-      // apply it if a newer call hasn't superseded us in the meantime
-      // (e.g., user changed the time range mid-query).
+      // Cache write is per-iv (TTL-bounded — see cc_getCachedTraceDetection).
+      // UI state is global, so only apply it if a newer call hasn't
+      // superseded us (e.g., user changed the time range mid-query).
       cc_setCachedTraceDetection(myIv, cnt > 0);
       if (ccTraceExistenceInflightIv === myIv) {
         ccHasTraces = cnt > 0;

@@ -33,12 +33,15 @@ async function sess_loadCards() {
   // Filter out "ghost" sessions that only fired infrastructure events
   // (e.g., SessionEnd from plugin-install subprocesses). A real session
   // must have at least one UserPromptSubmit or PreToolUse.
-  var realSessionWhere =
-    "ts > NOW() - INTERVAL '" + iv + "' " +
+  var realSessionWindow = "ts > NOW() - INTERVAL '" + iv + "'";
+  var realSessionGroupHaving =
     "GROUP BY session_id " +
     "HAVING SUM(CASE WHEN event_type IN ('UserPromptSubmit','PreToolUse') THEN 1 ELSE 0 END) > 0";
   var results = await Promise.all([
-    query("SELECT COUNT(*) AS v FROM (SELECT session_id FROM tma1_hook_events WHERE " + realSessionWhere + ") t"),
+    query(
+      "SELECT COUNT(*) AS v FROM (SELECT session_id FROM tma1_hook_events" +
+      " WHERE " + realSessionWindow + " " + realSessionGroupHaving + ") t"
+    ),
     query("SELECT COUNT(*) AS v FROM tma1_hook_events WHERE event_type = 'PreToolUse' AND ts > NOW() - INTERVAL '" + iv + "'"),
     query("SELECT COUNT(*) AS v FROM tma1_hook_events WHERE event_type = 'SubagentStart' AND ts > NOW() - INTERVAL '" + iv + "'"),
   ]);
@@ -56,7 +59,8 @@ async function sess_loadCards() {
       // Two-step: fetch active session IDs (capped) then aggregate with a literal IN list,
       // avoiding GreptimeDB subquery planner memory issues (cf. prompts.js pr_sourceSessionIDs).
       var idsRes = await query(
-        "SELECT session_id FROM tma1_hook_events WHERE " + realSessionWhere +
+        "SELECT session_id FROM tma1_hook_events" +
+        " WHERE " + realSessionWindow + " " + realSessionGroupHaving +
         " ORDER BY MAX(ts) DESC LIMIT 500"
       );
       var idRows = rowsToObjects(idsRes);
@@ -116,7 +120,7 @@ async function sess_loadList() {
   var idList = idRows.map(function(r) { return "'" + escapeSQLString(r.session_id) + "'"; }).join(',');
 
   // Step 2: aggregate full-session stats over those IDs (no time predicate so cross-window
-  // sessions report their real MIN/MAX). ORDER BY MIN(ts) DESC matches the displayed "Time" column.
+  // sessions report their real MIN/MAX). ORDER BY MAX(ts) DESC matches the displayed "Last Activity" column.
   var sql =
     "SELECT session_id, agent_source, MIN(ts) AS start_ts, MAX(ts) AS end_ts, " +
     "SUM(CASE WHEN event_type = 'PreToolUse' THEN 1 ELSE 0 END) AS tool_calls, " +
