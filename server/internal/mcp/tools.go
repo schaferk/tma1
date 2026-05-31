@@ -194,6 +194,11 @@ func (t PeerSessionsTool) Call(ctx context.Context, args map[string]any) (CallTo
 	if t.Bundler == nil {
 		return errorResult("bundler not configured"), nil
 	}
+
+	// The overall fan-out deadline (cwd lookup → session list → per-session
+	// enrichment, across peers) is applied once at the MCP dispatch boundary
+	// (toolCallTimeout in server.go), so every tool is bounded uniformly.
+
 	agent, _ := args["agent_source"].(string)
 	limit := intArg(args, "limit", 1)
 	msgLimit := intArg(args, "message_limit", 20)
@@ -223,9 +228,9 @@ func (t PeerSessionsTool) Call(ctx context.Context, args map[string]any) (CallTo
 		// Surface the freshest session's age at the top so the agent can
 		// decide quickly whether the peer work is current.
 		payload["most_recent_session"] = map[string]any{
-			"agent_source":     sessions[0].AgentSource,
-			"session_id":       sessions[0].SessionID,
-			"last_activity":    sessions[0].LastActivityAt,
+			"agent_source":      sessions[0].AgentSource,
+			"session_id":        sessions[0].SessionID,
+			"last_activity":     sessions[0].LastActivityAt,
 			"last_activity_ago": sessions[0].LastActivityAgo,
 		}
 	} else {

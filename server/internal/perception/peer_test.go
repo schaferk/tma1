@@ -19,9 +19,9 @@ func TestNormalizePeerAgent(t *testing.T) {
 		{"codex", "codex"},
 		{"CODEX", "codex"},
 		{"openclaw", "openclaw"},
-		{"copilot", "copilot_cli"},       // alias
-		{"Copilot", "copilot_cli"},       // case-insensitive alias
-		{"copilot-cli", "copilot_cli"},   // hyphen alias
+		{"copilot", "copilot_cli"},     // alias
+		{"Copilot", "copilot_cli"},     // case-insensitive alias
+		{"copilot-cli", "copilot_cli"}, // hyphen alias
 		{"github-copilot", "copilot_cli"},
 		{"copilot_cli", "copilot_cli"},
 		// CC aliases — the Codex skill table documents these as valid
@@ -333,4 +333,65 @@ func TestDedupPeerMessages(t *testing.T) {
 			t.Errorf("order broken: %+v", got)
 		}
 	})
+}
+
+func TestBuildPeerSessionListSQL(t *testing.T) {
+	sids := []string{"'a'", "'b'"}
+	got := buildPeerSessionListSQL(sids, 3, 90)
+
+	// Ranking and started/last must use the activity-event set so an
+	// exited/resumed shell (newest event is infra) can't outrank real work.
+	if !strings.Contains(got, "MAX(CASE WHEN event_type IN ("+activityEventsSQL+") THEN ts END)") {
+		t.Errorf("last_ms not computed over activity events:\n%s", got)
+	}
+	if !strings.Contains(got, "MIN(CASE WHEN event_type IN ("+activityEventsSQL+") THEN ts END)") {
+		t.Errorf("started_ms not computed over activity events:\n%s", got)
+	}
+	// Infra-only / exit shells must be dropped.
+	if !strings.Contains(got, "HAVING SUM(CASE WHEN event_type IN ("+activityEventsSQL+") THEN 1 ELSE 0 END) > 0") {
+		t.Errorf("missing HAVING activity > 0:\n%s", got)
+	}
+	// tool_call_count stays on the narrower tool-event set.
+	if !strings.Contains(got, "SUM(CASE WHEN event_type IN ("+toolEventsSQL+") THEN 1 ELSE 0 END) AS tool_call_count") {
+		t.Errorf("tool_call_count not on tool events:\n%s", got)
+	}
+	if !strings.Contains(got, "ORDER BY last_ms DESC") {
+		t.Errorf("not ordered by last_ms DESC:\n%s", got)
+	}
+	if !strings.Contains(got, "session_id IN ('a','b')") {
+		t.Errorf("session_id IN list missing:\n%s", got)
+	}
+	if !strings.Contains(got, "ts > now() - INTERVAL '90 minutes'") {
+		t.Errorf("since_min activity window missing:\n%s", got)
+	}
+	if !strings.Contains(got, "LIMIT 3") {
+		t.Errorf("limit not applied:\n%s", got)
+	}
+}
+
+func TestBuildLatestSessionForCWDSQL(t *testing.T) {
+	got := buildLatestSessionForCWDSQL("/Users/dennis/tma1")
+
+	// cwd match runs as a subquery over ALL events (Codex sets cwd only on
+	// SessionStart), but the winner is ranked by its newest ACTIVITY event.
+	if !strings.Contains(got, "WHERE cwd = '/Users/dennis/tma1'") {
+		t.Errorf("cwd subquery filter missing:\n%s", got)
+	}
+	if !strings.Contains(got, "AND event_type IN ("+activityEventsSQL+")") {
+		t.Errorf("activity filter on outer query missing:\n%s", got)
+	}
+	if strings.Count(got, "ts > now() - INTERVAL '6 hours'") != 2 {
+		t.Errorf("cwd and activity windows should both be bounded:\n%s", got)
+	}
+	if !strings.Contains(got, "ORDER BY MAX(ts) DESC") || !strings.Contains(got, "LIMIT 1") {
+		t.Errorf("not ranked by MAX(ts) DESC LIMIT 1:\n%s", got)
+	}
+}
+
+func TestBuildLatestSessionForCWDSQLEscapesQuote(t *testing.T) {
+	// A cwd with an apostrophe must not break out of the string literal.
+	got := buildLatestSessionForCWDSQL("/Users/o'brien/tma1")
+	if !strings.Contains(got, "/Users/o''brien/tma1") {
+		t.Errorf("single quote not escaped:\n%s", got)
+	}
 }
