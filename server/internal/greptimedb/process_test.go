@@ -4,6 +4,7 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 )
@@ -235,5 +236,59 @@ func TestStartArgsIncludeConfigFile(t *testing.T) {
 		if args[i] != want[i] {
 			t.Fatalf("args[%d] = %q, want %q", i, args[i], want[i])
 		}
+	}
+}
+
+// TestWriteSpotlightExcludeMarker exercises the OS-independent marker logic so
+// the create + idempotency behavior is verified on every CI runner, not just
+// Darwin (the OS gate is tested separately in TestExcludeFromSpotlightOSGate).
+func TestWriteSpotlightExcludeMarker(t *testing.T) {
+	t.Parallel()
+
+	dataPath := t.TempDir()
+	marker := filepath.Join(dataPath, ".metadata_never_index")
+
+	// First call creates the marker.
+	if created := writeSpotlightExcludeMarker(dataPath, testLogger); !created {
+		t.Fatal("first call should report created=true")
+	}
+	if _, err := os.Stat(marker); err != nil {
+		t.Fatalf("expected marker created, stat err = %v", err)
+	}
+
+	// Second call is idempotent: reports not-created and must not rewrite.
+	// Seed sentinel content and assert it survives.
+	if err := os.WriteFile(marker, []byte("sentinel"), 0o644); err != nil {
+		t.Fatalf("seed marker: %v", err)
+	}
+	if created := writeSpotlightExcludeMarker(dataPath, testLogger); created {
+		t.Fatal("second call should report created=false for an existing marker")
+	}
+	got, err := os.ReadFile(marker)
+	if err != nil {
+		t.Fatalf("read marker: %v", err)
+	}
+	if string(got) != "sentinel" {
+		t.Fatalf("marker was rewritten; content = %q, want %q", got, "sentinel")
+	}
+}
+
+// TestExcludeFromSpotlightOSGate verifies the platform gate: a marker is
+// created on Darwin and the call is a no-op everywhere else.
+func TestExcludeFromSpotlightOSGate(t *testing.T) {
+	t.Parallel()
+
+	dataPath := t.TempDir()
+	marker := filepath.Join(dataPath, ".metadata_never_index")
+
+	excludeFromSpotlight(dataPath, testLogger)
+
+	_, err := os.Stat(marker)
+	if runtime.GOOS == "darwin" {
+		if err != nil {
+			t.Fatalf("expected marker on macOS, stat err = %v", err)
+		}
+	} else if !os.IsNotExist(err) {
+		t.Fatalf("expected no marker off macOS, stat err = %v", err)
 	}
 }

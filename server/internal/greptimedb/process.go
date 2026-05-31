@@ -10,6 +10,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"time"
 )
 
@@ -37,6 +38,7 @@ func Start(cfg Config) (*Process, error) {
 	if err := os.MkdirAll(dataPath, 0755); err != nil {
 		return nil, fmt.Errorf("greptimedb: create data dir: %w", err)
 	}
+	excludeFromSpotlight(dataPath, cfg.Logger)
 
 	configPath, err := ensureDefaultConfigFile(cfg.DataDir, cfg.Logger)
 	if err != nil {
@@ -69,6 +71,43 @@ func Start(cfg Config) (*Process, error) {
 
 	cfg.Logger.Info("greptimedb healthy", "http_port", cfg.HTTPPort)
 	return p, nil
+}
+
+// excludeFromSpotlight drops a `.metadata_never_index` marker in the data dir
+// on macOS so Spotlight (mds/mdworker) skips it. GreptimeDB constantly rewrites
+// SST/WAL files here; without the marker Spotlight re-indexes them on every
+// change, and on a busy or freshly-OS-upgraded machine that mdworker churn can
+// pull system load high enough to starve the DB and slow every query.
+//
+// No-op off macOS. The OS-independent marker logic lives in
+// writeSpotlightExcludeMarker so it can be unit-tested on any CI runner, not
+// just Darwin.
+func excludeFromSpotlight(dataPath string, logger *slog.Logger) {
+	if runtime.GOOS != "darwin" {
+		return
+	}
+	writeSpotlightExcludeMarker(dataPath, logger)
+}
+
+// writeSpotlightExcludeMarker creates the `.metadata_never_index` marker in
+// dataPath if it doesn't already exist, returning true only when it created a
+// new marker (false when one was already present or the write failed). The OS
+// gate lives in the caller so this stays platform-independent and testable.
+// Best-effort: a write failure only forfeits the optimization, it never blocks
+// startup.
+func writeSpotlightExcludeMarker(dataPath string, logger *slog.Logger) bool {
+	marker := filepath.Join(dataPath, ".metadata_never_index")
+	if _, err := os.Stat(marker); err == nil {
+		return false
+	}
+	if err := os.WriteFile(marker, nil, 0o644); err != nil {
+		if logger != nil {
+			logger.Warn("greptimedb: could not write Spotlight exclusion marker",
+				"path", marker, "err", err)
+		}
+		return false
+	}
+	return true
 }
 
 // Stop sends an interrupt signal to the GreptimeDB process and waits for it to exit.
