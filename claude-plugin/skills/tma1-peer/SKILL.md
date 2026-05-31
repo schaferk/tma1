@@ -26,17 +26,23 @@ copy-pasting it manually.
 ## How to handle the invocation
 
 1. **Parse the user's arguments** after `/tma1-peer`:
-   - First token (optional): agent name
-   - Second token (optional): count (integer 1-5)
+   - First token (optional): agent name.
+   - **If the first token is a bare integer** (e.g. `/tma1-peer 3`), it is the
+     count, not an agent — use `agent_source: ""` (all peers) and that integer
+     as the count. Do NOT reject it as an unknown agent.
+   - Second token (optional): count (integer 1-5).
 2. **Normalize the agent name**:
    - `codex` → `codex`
    - `openclaw` → `openclaw`
    - `copilot` or `copilot_cli` → `copilot_cli`
    - `all`, `*`, or empty → `""` (means all peers, excludes Claude Code)
+   - a bare integer → treat as count (see step 1), `agent_source: ""`
    - **Anything else** → reply to the user: `unknown peer agent "<X>"; available: codex, openclaw, copilot, all` and STOP — do not call the tool with an unrecognized name.
 3. **Call the MCP tool `mcp__tma1__get_peer_sessions`** with:
    - `agent_source`: parsed agent (or empty string)
-   - `limit`: parsed count (default 1, server-side clamp to [1, 5])
+   - `limit`: the parsed count. **When the user gave a count, you MUST pass it**
+     — do not silently fall back to 1. Omit only when no count was supplied
+     (server default 1, clamp to [1, 5]). E.g. `codex 3` → `{agent_source: "codex", limit: 3}`.
    - `message_limit`: 30
 4. **Read the returned conversation messages** and use them as direct input
    for your next reasoning step. **Do not paraphrase** — when acting on

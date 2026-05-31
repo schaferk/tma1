@@ -17,6 +17,8 @@ file carries the essential rules for the explicit-invocation path.
   - `openclaw` → `openclaw`
   - `copilot` / `copilot_cli` → `copilot_cli`
   - `all` / `*` / empty → `""` (all peers, server excludes the caller)
+  - **a bare integer** (e.g. `/tma1-peer 3`) → it's the count, not an agent: use
+    `agent_source: ""` and that integer as the count. Do **not** reject it.
   - **Anything else** → reply `unknown peer agent "<X>"; available: codex, openclaw, copilot, all` and **STOP**.
 - 2nd token (optional) → integer, default `1`, clamped to `[1, 5]` server-side.
 
@@ -24,7 +26,8 @@ file carries the essential rules for the explicit-invocation path.
 
 `mcp__tma1__get_peer_sessions` with:
 - `agent_source`: the normalized name (or `""`)
-- `limit`: parsed count
+- `limit`: parsed count — **when a count was given, you MUST pass it** (don't
+  silently default to 1); e.g. `codex 3` → `limit: 3`
 - `message_limit`: `30`
 
 ## Use the response

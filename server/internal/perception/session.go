@@ -53,14 +53,12 @@ func (b *Bundler) LatestSessionForCWD(ctx context.Context, cwd string) (string, 
 	if cwd == "" {
 		return "", nil
 	}
-	sql := fmt.Sprintf(
-		`SELECT session_id FROM tma1_hook_events
-		 WHERE cwd = '%s' AND session_id != ''
-		   AND ts > now() - INTERVAL '6 hours'
-		 ORDER BY ts DESC LIMIT 1`,
-		escapeSQL(cwd),
-	)
-	_, rows, err := b.client.Query(ctx, sql)
+	// Rank by last *activity* event, not last event: an exited/resumed shell
+	// whose newest event is infra (SessionStart/SessionEnd/ConfigChange) must
+	// not win over a session that actually did work in the same cwd. The cwd
+	// match runs as a subquery over all events so Codex's SessionStart-only
+	// cwd still matches. See buildLatestSessionForCWDSQL.
+	_, rows, err := b.client.Query(ctx, buildLatestSessionForCWDSQL(cwd))
 	if err != nil || len(rows) == 0 {
 		return "", err
 	}

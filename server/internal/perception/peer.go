@@ -16,19 +16,19 @@ import (
 // when Codex invokes, CC is also a peer. The Bundler's Caller field
 // drives that exclusion when `agent_source` is left empty.
 type PeerSession struct {
-	SessionID         string        `json:"session_id"`
-	AgentSource       string        `json:"agent_source"`
-	StartedAt         time.Time     `json:"started_at"`
-	LastActivityAt    time.Time     `json:"last_activity_at"`
-	LastActivityAgo   string        `json:"last_activity_ago"` // human-friendly: "3m ago" / "2h ago"
-	DurationMinutes   int           `json:"duration_minutes"`
-	ToolCallCount     int           `json:"tool_call_count"`
-	TokensInput       int64         `json:"tokens_input"`
-	TokensOutput      int64         `json:"tokens_output"`
-	CWD               string        `json:"cwd,omitempty"`
-	Messages          []PeerMessage `json:"messages,omitempty"`
-	RecentToolNames   []string      `json:"recent_tool_names,omitempty"` // top 5
-	FilesTouched      []string      `json:"files_touched,omitempty"`     // unique paths
+	SessionID       string        `json:"session_id"`
+	AgentSource     string        `json:"agent_source"`
+	StartedAt       time.Time     `json:"started_at"`
+	LastActivityAt  time.Time     `json:"last_activity_at"`
+	LastActivityAgo string        `json:"last_activity_ago"` // human-friendly: "3m ago" / "2h ago"
+	DurationMinutes int           `json:"duration_minutes"`
+	ToolCallCount   int           `json:"tool_call_count"`
+	TokensInput     int64         `json:"tokens_input"`
+	TokensOutput    int64         `json:"tokens_output"`
+	CWD             string        `json:"cwd,omitempty"`
+	Messages        []PeerMessage `json:"messages,omitempty"`
+	RecentToolNames []string      `json:"recent_tool_names,omitempty"` // top 5
+	FilesTouched    []string      `json:"files_touched,omitempty"`     // unique paths
 }
 
 // PeerMessage is one conversation entry. Role is "user" / "assistant" /
@@ -59,6 +59,69 @@ var validPeerAgents = map[string]bool{
 	"codex":       true,
 	"openclaw":    true,
 	"copilot_cli": true,
+}
+
+// toolEventsSQL is the event_type set counted as tool calls (the
+// tool_call_count metric). Quoted, comma-joined for inlining into an IN list.
+const toolEventsSQL = "'PreToolUse','PostToolUse','PostToolUseFailure'"
+
+// activityEventsSQL is the event_type set that proves real agent/user
+// activity, as opposed to infra noise (SessionStart/SessionEnd, ConfigChange,
+// Notification, CwdChanged, InstructionsLoaded, ...). Ranking and the
+// "has-this-session-done-anything" filter use this set so an exited/resumed
+// shell whose newest event is a SessionStart/SessionEnd can't outrank a
+// session that actually did work.
+//
+// UserPromptSubmit is INCLUDED on purpose: a session where the user typed a
+// prompt but no tool has fired yet is genuine, current activity worth
+// surfacing — such a session is KEPT even though tool_call_count == 0. This
+// is deliberately NOT "drop tool_call_count == 0".
+const activityEventsSQL = "'PreToolUse','PostToolUse','PostToolUseFailure','UserPromptSubmit'"
+
+// buildPeerSessionListSQL builds the pass-2 aggregate query for peer sessions.
+// `sids` are already SQL-quoted session_id literals. cwd uses MAX(cwd) (not an
+// activity filter) because some agents — notably Codex — only set cwd on
+// SessionStart; started/last/ordering use activity events only. The HAVING
+// drops infra-only/exit shells (see activityEventsSQL).
+func buildPeerSessionListSQL(sids []string, limit, sinceMin int) string {
+	return fmt.Sprintf(
+		`SELECT session_id,
+		        MAX(agent_source) AS agent_source,
+		        MAX(cwd)          AS cwd,
+		        CAST(MIN(CASE WHEN event_type IN (%[1]s) THEN ts END) AS BIGINT) AS started_ms,
+		        CAST(MAX(CASE WHEN event_type IN (%[1]s) THEN ts END) AS BIGINT) AS last_ms,
+		        SUM(CASE WHEN event_type IN (%[2]s) THEN 1 ELSE 0 END) AS tool_call_count
+		 FROM tma1_hook_events
+		 WHERE session_id IN (%[3]s)
+		   AND ts > now() - INTERVAL '%[5]d minutes'
+		 GROUP BY session_id
+		 HAVING SUM(CASE WHEN event_type IN (%[1]s) THEN 1 ELSE 0 END) > 0
+		 ORDER BY last_ms DESC
+		 LIMIT %[4]d`,
+		activityEventsSQL, toolEventsSQL, strings.Join(sids, ","), limit, sinceMin,
+	)
+}
+
+// buildLatestSessionForCWDSQL builds the query that finds the most recent
+// session for a cwd, ranked by last *activity* event. The cwd match runs as an
+// inner subquery over all events (preserving Codex's SessionStart-only cwd);
+// the outer query keeps only sessions with activity and ranks by their newest
+// activity event. `cwd` must be unescaped — it is escaped here.
+func buildLatestSessionForCWDSQL(cwd string) string {
+	return fmt.Sprintf(
+		`SELECT session_id FROM tma1_hook_events
+		 WHERE session_id IN (
+		     SELECT session_id FROM tma1_hook_events
+		     WHERE cwd = '%s' AND session_id != ''
+		       AND ts > now() - INTERVAL '6 hours'
+		 )
+		   AND event_type IN (%s)
+		   AND ts > now() - INTERVAL '6 hours'
+		 GROUP BY session_id
+		 ORDER BY MAX(ts) DESC
+		 LIMIT 1`,
+		escapeSQL(cwd), activityEventsSQL,
+	)
 }
 
 // GetPeerSessions returns the N most recent sessions for `agentSource`
@@ -214,29 +277,20 @@ func (b *Bundler) getPeerSessionsOneAgent(
 		return nil, nil
 	}
 
-	// Step 2: aggregate metadata over the matched session_ids. event_type
-	// filter scopes the tool_call_count to actual tool events but the row
-	// is included even if there are 0 (SessionStart-only sessions still
-	// surface so the caller learns they exist).
-	listSQL := fmt.Sprintf(
-		`SELECT session_id,
-		        MAX(agent_source)             AS agent_source,
-		        MAX(cwd)                      AS cwd,
-		        CAST(MIN(ts) AS BIGINT)       AS started_ms,
-		        CAST(MAX(ts) AS BIGINT)       AS last_ms,
-		        SUM(CASE WHEN event_type IN ('PreToolUse','PostToolUse','PostToolUseFailure') THEN 1 ELSE 0 END) AS tool_call_count
-		 FROM tma1_hook_events
-		 WHERE session_id IN (%s)
-		 GROUP BY session_id
-		 ORDER BY last_ms DESC
-		 LIMIT %d`,
-		strings.Join(sids, ","), limit,
-	)
-	_, rows, err := b.client.Query(ctx, listSQL)
+	// Step 2: aggregate metadata over the matched session_ids, ranking by
+	// last *activity* event so an exited/resumed shell whose newest event is
+	// infra (SessionStart/SessionEnd/ConfigChange) can't outrank a session
+	// that actually did work. Infra-only sessions are dropped by the HAVING.
+	_, rows, err := b.client.Query(ctx, buildPeerSessionListSQL(sids, limit, sinceMin))
 	if err != nil {
 		return nil, fmt.Errorf("list peer sessions: %w", err)
 	}
 
+	// Build the session skeletons first (cheap, no I/O), then enrich them
+	// concurrently. enrichPeerSession is several HTTP roundtrips per session;
+	// running them serially made a limit=5 fetch ~5x slower than necessary
+	// against a loaded GreptimeDB. Enrich into pre-sized slots so the
+	// ORDER BY last_ms DESC order from the query is preserved.
 	out := make([]PeerSession, 0, len(rows))
 	for _, r := range rows {
 		sid := stringAt(r, 0)
@@ -260,9 +314,18 @@ func (b *Bundler) getPeerSessionsOneAgent(
 		// "3m ago" string matches the format the agent already sees in
 		// `<tma1-context>`. Empty when no LastActivityAt.
 		ps.LastActivityAgo = relativeAge(ps.LastActivityAt)
-		b.enrichPeerSession(ctx, &ps, messageLimit)
 		out = append(out, ps)
 	}
+
+	var wg sync.WaitGroup
+	for i := range out {
+		wg.Add(1)
+		go func(ps *PeerSession) {
+			defer wg.Done()
+			b.enrichPeerSession(ctx, ps, messageLimit)
+		}(&out[i])
+	}
+	wg.Wait()
 	return out, nil
 }
 

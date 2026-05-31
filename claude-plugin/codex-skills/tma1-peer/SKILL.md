@@ -17,7 +17,10 @@ output on the current project, or when they explicitly type
 `/tma1-peer [agent] [count]`. Parse:
 
 - First positional arg (optional): peer agent name (`claude` / `claude_code`
-  / `openclaw` / `copilot` / `copilot_cli` / `all`).
+  / `openclaw` / `copilot` / `copilot_cli` / `all`). **If this arg is a bare
+  integer** (e.g. `/tma1-peer 3`), it is the count, not an agent — use
+  `agent_source: ""` (all peers) and that integer as the count. Do not reject
+  it as an unknown agent.
 - Second positional arg (optional): count of recent sessions to pull,
   integer 1-5, default 1.
 
@@ -46,7 +49,7 @@ the `get_peer_sessions` tool on that server with:
 | Argument        | Value                                                  |
 | --------------- | ------------------------------------------------------ |
 | `agent_source`  | the canonical name from the table above (or `""`)      |
-| `limit`         | the parsed count, default `1`, server-side clamp to `[1, 5]` |
+| `limit`         | the parsed count — **when the user gave a count you MUST pass it** (don't default to 1); omit only when none was given (server default `1`, clamp `[1, 5]`) |
 | `message_limit` | `30`                                                   |
 
 If your runtime addresses MCP tools by a prefixed name (for example
