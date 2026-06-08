@@ -120,6 +120,39 @@ func TestSensorObserveDetectsRealFileWrite(t *testing.T) {
 	}
 }
 
+func TestResolveProjectRootRejectsUnmarked(t *testing.T) {
+	// A markerless directory must not become a watch root. This is the fix
+	// for the fd-exhaustion bug: a hook CWD of "/" (or ~/Downloads) used to
+	// fall back to itself and get watched recursively, opening one fd per
+	// file under /Applications, /Library, ... until the process hit
+	// kern.maxfilesperproc and the HTTP listener died with EMFILE.
+	if got := resolveProjectRoot(t.TempDir()); got != "" {
+		t.Errorf("bare dir: resolveProjectRoot = %q, want \"\"", got)
+	}
+	if got := resolveProjectRoot("/"); got != "" {
+		t.Errorf(`resolveProjectRoot("/") = %q, want ""`, got)
+	}
+	if got := resolveProjectRoot(""); got != "" {
+		t.Errorf(`resolveProjectRoot("") = %q, want ""`, got)
+	}
+
+	withGit := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(withGit, ".git"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if got := resolveProjectRoot(withGit); got != withGit {
+		t.Errorf(".git dir: resolveProjectRoot = %q, want %q", got, withGit)
+	}
+
+	withGoMod := t.TempDir()
+	if err := os.WriteFile(filepath.Join(withGoMod, "go.mod"), []byte("module x"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if got := resolveProjectRoot(withGoMod); got != withGoMod {
+		t.Errorf("go.mod: resolveProjectRoot = %q, want %q", got, withGoMod)
+	}
+}
+
 func TestResolveProjectRootPrefersGitOverGoMod(t *testing.T) {
 	root := t.TempDir()
 	_ = os.MkdirAll(filepath.Join(root, ".git"), 0o755)

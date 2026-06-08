@@ -121,11 +121,25 @@ func (s *Sensor) Stop(root string) {
 	}
 }
 
-// resolveProjectRoot returns the project root for cwd. It deliberately
-// duplicates the perception package's helper rather than importing it to
-// keep the sensor package's dependency graph tight: perception imports git
-// would be fine, but git importing perception would create a cycle later
-// when perception starts reading external_changes back.
+// resolveProjectRoot returns the project root for cwd, or "" when cwd
+// belongs to no recognisable project. A root is recognised only when cwd or
+// an ancestor holds a .git dir or a language project marker (go.mod,
+// package.json, ...).
+//
+// Returning "" for unmarked directories is deliberate. The previous
+// fallback returned cwd itself, so an agent whose hook CWD was "/" — or any
+// markerless directory like ~/Downloads — made the watcher recursively
+// register fsnotify over that whole tree. On macOS every watched path costs
+// a file descriptor (kqueue opens the dir and its entries), so a single "/"
+// root walked /Applications, /Library and /System and exhausted
+// kern.maxfilesperproc, wedging the HTTP listener with EMFILE. No marker,
+// no watch.
+//
+// It deliberately duplicates the perception package's helper rather than
+// importing it to keep the sensor package's dependency graph tight:
+// perception importing git would be fine, but git importing perception
+// would create a cycle later when perception starts reading
+// external_changes back.
 func resolveProjectRoot(cwd string) string {
 	cwd = strings.TrimSpace(cwd)
 	if cwd == "" {
@@ -153,7 +167,7 @@ func resolveProjectRoot(cwd string) string {
 		}
 		dir = parent
 	}
-	return abs
+	return "" // no project marker found — refuse to watch a bare directory
 }
 
 func findAncestorWith(start, marker string) string {
