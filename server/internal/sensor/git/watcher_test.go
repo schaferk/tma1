@@ -76,12 +76,12 @@ func TestAddRecursiveRespectsCap(t *testing.T) {
 		}
 		defer fsw.Close()
 
-		added, capped, err := addRecursive(fsw, root, 3)
+		added, stopped, err := addRecursive(fsw, root, 3)
 		if err != nil {
 			t.Fatal(err)
 		}
-		if !capped {
-			t.Fatal("capped = false, want true")
+		if !stopped {
+			t.Fatal("stopped = false, want true")
 		}
 		if added != 3 {
 			t.Errorf("added = %d, want 3 (cap reached, 11 dirs available)", added)
@@ -95,12 +95,12 @@ func TestAddRecursiveRespectsCap(t *testing.T) {
 		}
 		defer fsw.Close()
 
-		added, capped, err := addRecursive(fsw, root, 100)
+		added, stopped, err := addRecursive(fsw, root, 100)
 		if err != nil {
 			t.Fatal(err)
 		}
-		if capped {
-			t.Fatal("capped = true, want false")
+		if stopped {
+			t.Fatal("stopped = true, want false")
 		}
 		if added != 11 { // root + 10 subdirs
 			t.Errorf("added = %d, want 11 (root + 10 subdirs)", added)
@@ -116,12 +116,12 @@ func TestAddRecursiveRespectsCap(t *testing.T) {
 			t.Fatal(err)
 		}
 
-		added, capped, err := addRecursive(fsw, root, 3)
+		added, stopped, err := addRecursive(fsw, root, 3)
 		if err != nil {
 			t.Fatal(err)
 		}
-		if !capped {
-			t.Fatal("capped = false, want true")
+		if !stopped {
+			t.Fatal("stopped = false, want true")
 		}
 		if added != 0 {
 			t.Errorf("added = %d, want 0 after watcher is closed", added)

@@ -86,13 +86,13 @@ func (w *projectWatcher) start() error {
 	// Best-effort recursive watch by walking once at start. Subdirectories
 	// created later don't auto-attach — for Phase 1.2 this is acceptable;
 	// most projects have stable directory layouts.
-	added, capped, err := addRecursive(fsw, w.cfg.Root, maxWatchDirs)
+	added, stopped, err := addRecursive(fsw, w.cfg.Root, maxWatchDirs)
 	if err != nil {
 		_ = fsw.Close()
 		return err
 	}
-	if capped {
-		w.logger.Warn("git watcher: hit directory watch cap; deeper subdirs unwatched",
+	if stopped {
+		w.logger.Warn("git watcher: stopped registering watches early (cap or fd limit); deeper subdirs unwatched",
 			"root", w.cfg.Root, "cap", maxWatchDirs, "watched", added)
 	}
 
@@ -366,17 +366,19 @@ func (w *projectWatcher) shouldIgnorePath(p string) bool {
 	return false
 }
 
-// addRecursive walks root and tries to register up to limit directories with
-// the watcher, skipping ignored paths. It returns the number of directories
-// successfully added and whether the limit stopped the walk. Errors on
-// individual descents are logged but not fatal — partial coverage is better
-// than none. Hitting limit stops the walk (caller warns) so one pathological
-// root can't exhaust file descriptors or keep walking after Add starts
-// failing.
+// addRecursive walks root and registers up to limit directories with the
+// watcher, skipping ignored paths. It returns the number of directories
+// successfully added and whether the walk stopped early — either because it
+// hit limit or because fsnotify.Add began failing. Walk errors are non-fatal
+// (partial coverage beats none).
+//
+// Stopping on the first Add failure matters: once Add returns EMFILE/ENOSPC
+// the fd/watch table is full, so every further Add fails too. Continuing the
+// traversal would just burn time and IO on a doomed walk — exactly the cost
+// this watcher cap exists to avoid.
 func addRecursive(fsw *fsnotify.Watcher, root string, limit int) (int, bool, error) {
 	added := 0
-	attempted := 0
-	capped := false
+	stopped := false
 	err := filepath.Walk(root, func(path string, info os.FileInfo, err error) error {
 		if err != nil {
 			return nil
@@ -387,17 +389,18 @@ func addRecursive(fsw *fsnotify.Watcher, root string, limit int) (int, bool, err
 		if staticShouldIgnorePath(path + "/") {
 			return filepath.SkipDir
 		}
-		if attempted >= limit {
-			capped = true
+		if added >= limit {
+			stopped = true // hit the watch cap
 			return filepath.SkipAll
 		}
-		attempted++
-		if fsw.Add(path) == nil {
-			added++
+		if fsw.Add(path) != nil {
+			stopped = true // Add failing (fd/watch exhaustion) — abandon the walk
+			return filepath.SkipAll
 		}
+		added++
 		return nil
 	})
-	return added, capped, err
+	return added, stopped, err
 }
 
 // readGitHead returns the SHA of HEAD or "" on failure. The context lets a
